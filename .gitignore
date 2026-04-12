@@ -1,0 +1,10 @@
+/target/
+/data/
+*.log
+benchmark-results-*.csv
+.env
+*.pem
+*.key
+secrets/
+/sdk/typescript/dist/
+/sdk/typescript/node_modules/
