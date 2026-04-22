@@ -118,3 +118,115 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
     })
 }
 
+fn recover_tail(file: &mut File) -> Result<()> {
+    let file_len = file.metadata()?.len();
+    let mut offset = 0_u64;
+    while offset < file_len {
+        if file_len - offset < HEADER_LEN as u64 {
+            file.set_len(offset)?;
+            file.sync_all()?;
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0; HEADER_LEN];
+        file.read_exact(&mut header)?;
+        if &header[0..4] != MAGIC || header[4] != VERSION {
+            return Err(corrupt_value(offset, "invalid value record header"));
+        }
+        let value_len = read_u32(&header, 13) as usize;
+        if value_len > MAX_VALUE_SIZE {
+            return Err(corrupt_value(offset, "invalid value length"));
+        }
+        let total_len = HEADER_LEN + value_len + FOOTER_LEN;
+        if total_len as u64 > file_len - offset {
+            file.set_len(offset)?;
+            file.sync_all()?;
+            break;
+        }
+        let mut record = vec![0; total_len];
+        record[..HEADER_LEN].copy_from_slice(&header);
+        file.read_exact(&mut record[HEADER_LEN..])?;
+        validate_record(&record, offset)?;
+        offset += total_len as u64;
+    }
+    Ok(())
+}
+
+fn validate_record(record: &[u8], offset: u64) -> Result<()> {
+    if record.len() < HEADER_LEN + FOOTER_LEN || &record[0..4] != MAGIC || record[4] != VERSION {
+        return Err(corrupt_value(offset, "invalid value record header"));
+    }
+    let value_len = read_u32(record, 13) as usize;
+    if value_len > MAX_VALUE_SIZE || record.len() != HEADER_LEN + value_len + FOOTER_LEN {
+        return Err(corrupt_value(offset, "invalid value record length"));
+    }
+    let value = &record[HEADER_LEN..HEADER_LEN + value_len];
+    if read_u32(record, 17) != value_checksum(read_u64(record, 5), value)
+        || read_u32(record, record.len() - FOOTER_LEN) as usize != record.len()
+        || &record[record.len() - 4..] != END
+    {
+        return Err(corrupt_value(offset, "value checksum or footer mismatch"));
+    }
+    Ok(())
+}
+
+fn value_checksum(revision: u64, value: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&[VERSION]);
+    hasher.update(&revision.to_be_bytes());
+    hasher.update(&(value.len() as u32).to_be_bytes());
+    hasher.update(value);
+    hasher.finalize()
+}
+
+fn corrupt_value(offset: u64, reason: impl Into<String>) -> Error {
+    Error::CorruptValue {
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn values_persist_and_incomplete_tail_is_removed() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("values.vlog");
+        let reference = {
+            let mut log = ValueLog::open(&path).unwrap();
+            let reference = log.append(&vec![7; 4096], 11).unwrap();
+            log.sync().unwrap();
+            reference
+        };
+        let original_len = fs::metadata(&path).unwrap().len();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"partial")
+            .unwrap();
+        let log = ValueLog::open(&path).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+        assert_eq!(log.read(&reference).unwrap(), vec![7; 4096]);
+    }
+}
