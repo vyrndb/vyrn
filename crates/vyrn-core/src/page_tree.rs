@@ -398,3 +398,143 @@ impl PageTree {
     ) -> Result<Vec<VersionedRow>> {
         self.scan_with_revisions_excluding_prefix(start, end, limit, None)
     }
+
+    pub(crate) fn changed_since(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        revision: u64,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<bool> {
+        if self.root == 0 {
+            return Ok(false);
+        }
+        self.node_changed_since(self.root, start, end, revision, excluded_prefix)
+    }
+
+    fn scan_with_revisions_excluding_prefix(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<VersionedRow>> {
+        let mut rows = Vec::with_capacity(limit.min(1024));
+        if self.root != 0 && limit != 0 {
+            self.scan_node(self.root, start, end, limit, excluded_prefix, &mut rows)?;
+        }
+        Ok(rows)
+    }
+
+    fn validate_node(
+        &self,
+        page_id: u64,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+        visited: &mut HashSet<u64>,
+    ) -> Result<u64> {
+        if !visited.insert(page_id) {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "tree page is referenced more than once or cyclic".into(),
+            });
+        }
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => {
+                let entries = self.decode_leaf(&page, page_id)?;
+                let mut previous: Option<&[u8]> = None;
+                for entry in &entries {
+                    if previous.is_some_and(|previous| previous >= entry.key.as_slice())
+                        || lower.as_ref().is_some_and(|lower| &entry.key < lower)
+                        || upper.as_ref().is_some_and(|upper| &entry.key >= upper)
+                    {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "leaf keys are not strictly ordered within bounds".into(),
+                        });
+                    }
+                    previous = Some(&entry.key);
+                }
+                Ok(entries.len() as u64)
+            }
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                let separators: Vec<_> = children
+                    .iter()
+                    .skip(1)
+                    .map(|child| child.min_key.clone())
+                    .collect();
+                for pair in separators.windows(2) {
+                    if pair[0] >= pair[1] {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "internal separators are not strictly ordered".into(),
+                        });
+                    }
+                }
+                let mut total = 0;
+                for (index, child) in children.into_iter().enumerate() {
+                    let child_lower = if index == 0 {
+                        lower.clone()
+                    } else {
+                        Some(separators[index - 1].clone())
+                    };
+                    let child_upper = separators.get(index).cloned().or_else(|| upper.clone());
+                    total +=
+                        self.validate_node(child.page_id, child_lower, child_upper, visited)?;
+                }
+                Ok(total)
+            }
+            page_type => Err(unexpected_type(page_id, page_type)),
+        }
+    }
+
+    fn count_node_excluding_prefix(&self, page_id: u64, prefix: &[u8]) -> Result<usize> {
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => Ok(self
+                .decode_leaf(&page, page_id)?
+                .into_iter()
+                .filter(|entry| !entry.key.starts_with(prefix))
+                .count()),
+            INTERNAL => {
+                let mut count = 0;
+                for child in self.decode_internal(&page, page_id)? {
+                    count += self.count_node_excluding_prefix(child.page_id, prefix)?;
+                }
+                Ok(count)
+            }
+            page_type => Err(unexpected_type(page_id, page_type)),
+        }
+    }
+
+    fn node_changed_since(
+        &self,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        revision: u64,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<bool> {
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => Ok(self.decode_leaf(&page, page_id)?.into_iter().any(|entry| {
+                excluded_prefix.is_none_or(|prefix| !entry.key.starts_with(prefix))
+                    && start.is_none_or(|start| entry.key.as_slice() >= start)
+                    && end.is_none_or(|end| entry.key.as_slice() < end)
+                    && entry.revision > revision
+            })),
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                for (index, child) in children.iter().enumerate() {
+                    let child_end = children.get(index + 1).map(|next| next.min_key.as_slice());
+                    if start.is_some_and(|start| child_end.is_some_and(|end| end <= start))
+                        || end.is_some_and(|end| child.min_key.as_slice() >= end)
+                    {
+                        continue;
+                    }
+                    if self.node_changed_since(
+                        child.page_id,
+                        start,
+                        end,
