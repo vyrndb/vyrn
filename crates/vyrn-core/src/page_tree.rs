@@ -258,3 +258,143 @@ impl PageTree {
                 page_id: self.root,
                 reason: format!(
                     "tree contains {count} entries but metadata reports {}",
+                    self.len
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_with_revision(key)
+            .map(|entry| entry.map(|(value, _)| value))
+    }
+
+    pub(crate) fn revision(&self, key: &[u8]) -> Result<Option<u64>> {
+        self.get_with_revision(key)
+            .map(|entry| entry.map(|(_, revision)| revision))
+    }
+
+    fn get_with_revision(&self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        let leaf = self.find_leaf(key, None)?;
+        for entry in self.read_leaf(leaf)? {
+            match entry.key.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some((self.read_value(&entry.value)?, entry.revision)))
+                }
+                std::cmp::Ordering::Greater => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn prepare_put(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        revision: u64,
+    ) -> Result<(u64, u64)> {
+        let value = if value.len() > INLINE_LIMIT {
+            EntryValue::External(self.values.append(value, revision)?)
+        } else {
+            EntryValue::Inline(value.to_vec())
+        };
+        let new_entry = Entry {
+            key: key.to_vec(),
+            value,
+            revision,
+        };
+        if self.root == 0 {
+            let node = self.write_leaf(&[new_entry])?;
+            return Ok((node.page_id, 1));
+        }
+        let mut path = Vec::new();
+        let leaf_id = self.find_leaf(key, Some(&mut path))?;
+        let mut entries = self.read_leaf(leaf_id)?;
+        let (position, existed) = find_entry(&entries, key);
+        if existed {
+            entries[position] = new_entry;
+        } else {
+            entries.insert(position, new_entry);
+        }
+        let mut replacements = self.write_leaf_level(&entries)?;
+        while let Some((parent_id, child_index)) = path.pop() {
+            let mut children = self.read_internal_children(parent_id)?;
+            children.splice(child_index..=child_index, replacements);
+            replacements = self.write_internal_level(&children)?;
+        }
+        let root = if replacements.len() == 1 {
+            replacements[0].page_id
+        } else {
+            self.write_internal(&replacements)?.page_id
+        };
+        Ok((root, self.len + u64::from(!existed)))
+    }
+
+    pub(crate) fn prepare_delete(&mut self, key: &[u8]) -> Result<Option<(u64, u64)>> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        let mut path = Vec::new();
+        let leaf_id = self.find_leaf(key, Some(&mut path))?;
+        let mut entries = self.read_leaf(leaf_id)?;
+        let (position, existed) = find_entry(&entries, key);
+        if !existed {
+            return Ok(None);
+        }
+        entries.remove(position);
+        let mut replacements = if entries.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.write_leaf(&entries)?]
+        };
+        while let Some((parent_id, child_index)) = path.pop() {
+            let mut children = self.read_internal_children(parent_id)?;
+            children.splice(child_index..=child_index, replacements);
+            replacements = if children.is_empty() {
+                Vec::new()
+            } else if path.is_empty() && children.len() == 1 {
+                children
+            } else {
+                self.write_internal_level(&children)?
+            };
+        }
+        let root = replacements.first().map_or(0, |node| node.page_id);
+        Ok(Some((root, self.len - 1)))
+    }
+
+    pub(crate) fn scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_excluding_prefix(start, end, limit, None)
+    }
+
+    pub(crate) fn scan_excluding_prefix(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .scan_with_revisions_excluding_prefix(start, end, limit, excluded_prefix)?
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect())
+    }
+
+    pub(crate) fn scan_with_revisions(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<VersionedRow>> {
+        self.scan_with_revisions_excluding_prefix(start, end, limit, None)
+    }
