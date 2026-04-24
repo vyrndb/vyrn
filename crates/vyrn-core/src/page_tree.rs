@@ -678,3 +678,143 @@ impl PageTree {
             }
             chunks.last_mut().unwrap().push(entry.clone());
             used += size;
+        }
+        chunks
+            .into_iter()
+            .map(|chunk| self.write_leaf(&chunk))
+            .collect()
+    }
+
+    fn write_leaf(&mut self, entries: &[Entry]) -> Result<NodeRef> {
+        let first = entries.first().ok_or_else(|| Error::CorruptPage {
+            page_id: 0,
+            reason: "cannot write an empty leaf".into(),
+        })?;
+        let mut page = new_page(LEAF, 0);
+        write_u32(&mut page, 20, entries.len() as u32);
+        let mut offset = HEADER_SIZE;
+        for entry in entries {
+            offset = self.encode_leaf_cell(&mut page, offset, entry)?;
+        }
+        let page_id = self.pages.append(page)?;
+        Ok(NodeRef {
+            page_id,
+            min_key: first.key.clone(),
+        })
+    }
+
+    fn write_internal_level(&mut self, children: &[NodeRef]) -> Result<Vec<NodeRef>> {
+        let mut chunks: Vec<Vec<NodeRef>> = vec![Vec::new()];
+        let mut used = HEADER_SIZE + 8;
+        for (index, child) in children.iter().enumerate() {
+            let size = if index == 0 {
+                0
+            } else {
+                internal_cell_size(&child.min_key)
+            };
+            if used + size > PAGE_SIZE && !chunks.last().unwrap().is_empty() {
+                chunks.push(Vec::new());
+                used = HEADER_SIZE + 8;
+            }
+            chunks.last_mut().unwrap().push(child.clone());
+            used += if chunks.last().unwrap().len() == 1 {
+                0
+            } else {
+                internal_cell_size(&child.min_key)
+            };
+        }
+        chunks
+            .into_iter()
+            .map(|chunk| self.write_internal(&chunk))
+            .collect()
+    }
+
+    fn write_internal(&mut self, children: &[NodeRef]) -> Result<NodeRef> {
+        let first = children.first().ok_or_else(|| Error::CorruptPage {
+            page_id: 0,
+            reason: "cannot write an empty internal page".into(),
+        })?;
+        let mut page = new_page(INTERNAL, 0);
+        write_u32(&mut page, 20, (children.len() - 1) as u32);
+        write_u64(&mut page, 24, first.page_id);
+        let mut offset = HEADER_SIZE;
+        for child in children.iter().skip(1) {
+            offset = self.encode_internal_cell(&mut page, offset, child)?;
+        }
+        let page_id = self.pages.append(page)?;
+        Ok(NodeRef {
+            page_id,
+            min_key: first.min_key.clone(),
+        })
+    }
+
+    fn encode_leaf_cell(
+        &mut self,
+        page: &mut Page,
+        mut offset: usize,
+        entry: &Entry,
+    ) -> Result<usize> {
+        let key_external = entry.key.len() > INLINE_LIMIT;
+        let value_external = matches!(entry.value, EntryValue::External(_));
+        let value_len = match &entry.value {
+            EntryValue::Inline(value) => value.len(),
+            EntryValue::External(reference) => reference.len as usize,
+        };
+        let flags =
+            (u8::from(key_external) * EXTERNAL_KEY) | (u8::from(value_external) * EXTERNAL_VALUE);
+        page[offset] = flags;
+        write_u32(page, offset + 1, entry.key.len() as u32);
+        write_u32(page, offset + 5, value_len as u32);
+        let key_page = if key_external {
+            self.write_blob(&entry.key)?.0
+        } else {
+            0
+        };
+        let value_offset = match &entry.value {
+            EntryValue::Inline(_) => 0,
+            EntryValue::External(reference) => reference.offset,
+        };
+        write_u64(page, offset + 9, key_page);
+        write_u64(page, offset + 17, value_offset);
+        write_u64(page, offset + 25, entry.revision);
+        offset += LEAF_CELL_HEADER;
+        if !key_external {
+            page[offset..offset + entry.key.len()].copy_from_slice(&entry.key);
+            offset += entry.key.len();
+        }
+        if let EntryValue::Inline(value) = &entry.value {
+            page[offset..offset + value.len()].copy_from_slice(value);
+            offset += value.len();
+        }
+        Ok(offset)
+    }
+
+    fn decode_leaf(&self, page: &Page, page_id: u64) -> Result<Vec<Entry>> {
+        let count = read_u32(page, 20) as usize;
+        let mut offset = HEADER_SIZE;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            require_page(offset, LEAF_CELL_HEADER, page_id)?;
+            let flags = page[offset];
+            let key_len = read_u32(page, offset + 1) as usize;
+            let value_len = read_u32(page, offset + 5) as usize;
+            if key_len == 0
+                || key_len > MAX_STORED_KEY_SIZE
+                || value_len > MAX_VALUE_SIZE
+                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+            {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            let key_page = read_u64(page, offset + 9);
+            let value_offset = read_u64(page, offset + 17);
+            let revision = read_u64(page, offset + 25);
+            offset += LEAF_CELL_HEADER;
+            let key = if flags & EXTERNAL_KEY != 0 {
+                self.read_blob(key_page, key_len)?
+            } else {
+                require_page(offset, key_len, page_id)?;
+                let value = page[offset..offset + key_len].to_vec();
+                offset += key_len;
