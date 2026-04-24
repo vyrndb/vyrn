@@ -538,3 +538,143 @@ impl PageTree {
                         child.page_id,
                         start,
                         end,
+                        revision,
+                        excluded_prefix,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            page_type => Err(unexpected_type(page_id, page_type)),
+        }
+    }
+
+    fn scan_node(
+        &self,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+        rows: &mut Vec<VersionedRow>,
+    ) -> Result<()> {
+        if rows.len() >= limit {
+            return Ok(());
+        }
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => {
+                for entry in self.decode_leaf(&page, page_id)? {
+                    if start.is_some_and(|start| entry.key.as_slice() < start) {
+                        continue;
+                    }
+                    if end.is_some_and(|end| entry.key.as_slice() >= end) {
+                        break;
+                    }
+                    if excluded_prefix.is_some_and(|prefix| entry.key.starts_with(prefix)) {
+                        continue;
+                    }
+                    let value = self.read_value(&entry.value)?;
+                    rows.push((entry.key, value, entry.revision));
+                    if rows.len() == limit {
+                        break;
+                    }
+                }
+            }
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                for (index, child) in children.iter().enumerate() {
+                    let child_end = children.get(index + 1).map(|next| next.min_key.as_slice());
+                    if start.is_some_and(|start| child_end.is_some_and(|end| end <= start))
+                        || end.is_some_and(|end| child.min_key.as_slice() >= end)
+                    {
+                        continue;
+                    }
+                    self.scan_node(child.page_id, start, end, limit, excluded_prefix, rows)?;
+                    if rows.len() == limit {
+                        break;
+                    }
+                }
+            }
+            page_type => return Err(unexpected_type(page_id, page_type)),
+        }
+        Ok(())
+    }
+
+    fn find_leaf(&self, key: &[u8], mut path: Option<&mut Vec<(u64, usize)>>) -> Result<u64> {
+        let mut page_id = self.root;
+        loop {
+            let page = self.pages.read(page_id)?;
+            match page[5] {
+                LEAF => return Ok(page_id),
+                INTERNAL => {
+                    let children = self.decode_internal(&page, page_id)?;
+                    let mut index = 0;
+                    for (child_index, child) in children.iter().enumerate().skip(1) {
+                        if key < child.min_key.as_slice() {
+                            break;
+                        }
+                        index = child_index;
+                    }
+                    if let Some(path) = path.as_deref_mut() {
+                        path.push((page_id, index));
+                    }
+                    page_id = children[index].page_id;
+                }
+                page_type => return Err(unexpected_type(page_id, page_type)),
+            }
+        }
+    }
+
+    fn read_leaf(&self, page_id: u64) -> Result<Vec<Entry>> {
+        let page = self.pages.read(page_id)?;
+        require_type(&page, page_id, LEAF)?;
+        self.decode_leaf(&page, page_id)
+    }
+
+    fn read_internal_children(&self, page_id: u64) -> Result<Vec<NodeRef>> {
+        let page = self.pages.read(page_id)?;
+        require_type(&page, page_id, INTERNAL)?;
+        self.decode_internal(&page, page_id)
+    }
+
+    fn node_ref(&self, page_id: u64) -> Result<NodeRef> {
+        let mut current = page_id;
+        loop {
+            let page = self.pages.read(current)?;
+            match page[5] {
+                LEAF => {
+                    let entries = self.decode_leaf(&page, current)?;
+                    let first = entries.first().ok_or_else(|| Error::CorruptPage {
+                        page_id: current,
+                        reason: "empty leaf is reachable".into(),
+                    })?;
+                    return Ok(NodeRef {
+                        page_id,
+                        min_key: first.key.clone(),
+                    });
+                }
+                INTERNAL => current = self.decode_internal(&page, current)?[0].page_id,
+                page_type => return Err(unexpected_type(current, page_type)),
+            }
+        }
+    }
+
+    fn write_leaf_level(&mut self, entries: &[Entry]) -> Result<Vec<NodeRef>> {
+        let mut chunks: Vec<Vec<Entry>> = vec![Vec::new()];
+        let mut used = HEADER_SIZE;
+        for entry in entries {
+            let size = leaf_cell_size(entry);
+            if size > PAGE_SIZE - HEADER_SIZE {
+                return Err(Error::CorruptPage {
+                    page_id: 0,
+                    reason: "leaf cell exceeds page size".into(),
+                });
+            }
+            if used + size > PAGE_SIZE && !chunks.last().unwrap().is_empty() {
+                chunks.push(Vec::new());
+                used = HEADER_SIZE;
+            }
+            chunks.last_mut().unwrap().push(entry.clone());
+            used += size;
