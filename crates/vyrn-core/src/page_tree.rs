@@ -128,3 +128,133 @@ impl PageManager {
         finalize_page(&mut page);
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&page)?;
+        self.page_count += 1;
+        self.insert_cache(page_id, Arc::new(page))?;
+        Ok(page_id)
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.file.sync_data()?;
+        Ok(())
+    }
+
+    fn page_count(&self) -> u64 {
+        self.page_count
+    }
+
+    fn refresh_page_count(&mut self) -> Result<()> {
+        let file_len = self.file.metadata()?.len();
+        if file_len % PAGE_SIZE as u64 != 0 {
+            return Err(Error::CorruptPage {
+                page_id: 0,
+                reason: "page file length is not page-aligned".into(),
+            });
+        }
+        self.page_count = file_len / PAGE_SIZE as u64;
+        Ok(())
+    }
+
+    fn insert_cache(&self, page_id: u64, page: Arc<Page>) -> Result<()> {
+        let mut cache = self.cache.lock().map_err(|_| Error::Poisoned)?;
+        if cache.pages.insert(page_id, page).is_none() {
+            cache.clock.push_back(page_id);
+        }
+        while cache.pages.len() > self.cache_capacity {
+            if let Some(candidate) = cache.clock.pop_front() {
+                cache.pages.remove(&candidate);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct PageTree {
+    pages: PageManager,
+    values: ValueLog,
+    root: u64,
+    len: u64,
+}
+
+impl PageTree {
+    pub(crate) fn open(path: &Path, value_path: &Path, root: u64, len: u64) -> Result<Self> {
+        let pages = PageManager::open(path, DEFAULT_CACHE_PAGES)?;
+        let values = ValueLog::open(value_path)?;
+        if root != 0 {
+            let page = pages.read(root)?;
+            if page[5] != LEAF && page[5] != INTERNAL {
+                return Err(Error::CorruptPage {
+                    page_id: root,
+                    reason: "root is not a tree node".into(),
+                });
+            }
+        } else if len != 0 {
+            return Err(Error::CorruptManifest(
+                "empty root has a nonzero entry count".into(),
+            ));
+        }
+        Ok(Self {
+            pages,
+            values,
+            root,
+            len,
+        })
+    }
+
+    pub(crate) fn root_id(&self) -> u64 {
+        self.root
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn page_count(&self) -> u64 {
+        self.pages.page_count()
+    }
+
+    pub(crate) fn count_excluding_prefix(&self, prefix: &[u8]) -> Result<usize> {
+        if self.root == 0 {
+            return Ok(0);
+        }
+        self.count_node_excluding_prefix(self.root, prefix)
+    }
+
+    pub(crate) fn publish(&mut self, root: u64, len: u64) {
+        self.root = root;
+        self.len = len;
+    }
+
+    pub(crate) fn refresh(&mut self, root: u64, len: u64) -> Result<()> {
+        self.pages.refresh_page_count()?;
+        self.publish(root, len);
+        Ok(())
+    }
+
+    pub(crate) fn sync(&self) -> Result<()> {
+        self.values.sync()?;
+        self.pages.sync()
+    }
+
+    pub(crate) fn compact_to(&self, path: &Path, value_path: &Path) -> Result<(u64, u64)> {
+        let rows = self.scan_with_revisions(None, None, self.len as usize)?;
+        let mut compact = PageTree::open(path, value_path, 0, 0)?;
+        for (key, value, revision) in rows {
+            let (root, len) = compact.prepare_put(&key, &value, revision)?;
+            compact.publish(root, len);
+        }
+        compact.sync()?;
+        Ok((compact.root, compact.len))
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        let mut visited = HashSet::new();
+        let count = if self.root == 0 {
+            0
+        } else {
+            self.validate_node(self.root, None, None, &mut visited)?
+        };
+        if count != self.len {
+            return Err(Error::CorruptPage {
+                page_id: self.root,
+                reason: format!(
+                    "tree contains {count} entries but metadata reports {}",
