@@ -978,3 +978,185 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
 #[cfg(windows)]
 fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
+    file.seek_read(buffer, offset).and_then(|count| {
+        if count == buffer.len() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ))
+        }
+    })
+}
+
+fn find_entry(entries: &[Entry], key: &[u8]) -> (usize, bool) {
+    match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
+        Ok(index) => (index, true),
+        Err(index) => (index, false),
+    }
+}
+
+fn leaf_cell_size(entry: &Entry) -> usize {
+    LEAF_CELL_HEADER
+        + if entry.key.len() <= INLINE_LIMIT {
+            entry.key.len()
+        } else {
+            0
+        }
+        + match &entry.value {
+            EntryValue::Inline(value) => value.len(),
+            EntryValue::External(_) => 0,
+        }
+}
+
+fn internal_cell_size(key: &[u8]) -> usize {
+    INTERNAL_CELL_HEADER
+        + if key.len() <= INLINE_LIMIT {
+            key.len()
+        } else {
+            0
+        }
+}
+
+fn require_page(offset: usize, length: usize, page_id: u64) -> Result<()> {
+    if offset.checked_add(length).is_none_or(|end| end > PAGE_SIZE) {
+        Err(Error::CorruptPage {
+            page_id,
+            reason: "cell exceeds page boundary".into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn new_page(page_type: u8, page_id: u64) -> Page {
+    let mut page = [0; PAGE_SIZE];
+    page[0..4].copy_from_slice(MAGIC);
+    page[4] = VERSION;
+    page[5] = page_type;
+    write_u64(&mut page, 8, page_id);
+    page
+}
+
+fn finalize_page(page: &mut Page) {
+    write_u32(page, 16, 0);
+    let mut hasher = Hasher::new();
+    hasher.update(page);
+    write_u32(page, 16, hasher.finalize());
+}
+
+fn validate_page(page: &mut Page, page_id: u64) -> Result<()> {
+    if &page[0..4] != MAGIC || page[4] != VERSION || read_u64(page, 8) != page_id {
+        return Err(Error::CorruptPage {
+            page_id,
+            reason: "invalid page header".into(),
+        });
+    }
+    let expected = read_u32(page, 16);
+    write_u32(page, 16, 0);
+    let mut hasher = Hasher::new();
+    hasher.update(page);
+    let actual = hasher.finalize();
+    write_u32(page, 16, expected);
+    if expected != actual {
+        return Err(Error::CorruptPage {
+            page_id,
+            reason: "checksum mismatch".into(),
+        });
+    }
+    Ok(())
+}
+
+fn require_type(page: &Page, page_id: u64, expected: u8) -> Result<()> {
+    if page[5] != expected {
+        Err(unexpected_type(page_id, page[5]))
+    } else {
+        Ok(())
+    }
+}
+
+fn unexpected_type(page_id: u64, page_type: u8) -> Error {
+    Error::CorruptPage {
+        page_id,
+        reason: format!("unexpected page type {page_type}"),
+    }
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn inline_records_split_reopen_and_overflow() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, len, pages) = {
+            let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+            for index in 0..1_500_u32 {
+                let key = format!("key-{index:06}");
+                let value =
+                    vec![(index % 251) as u8; if index == 777 { PAGE_SIZE * 2 } else { 40 }];
+                let (root, len) = tree
+                    .prepare_put(key.as_bytes(), &value, index as u64 + 1)
+                    .unwrap();
+                tree.publish(root, len);
+            }
+            tree.sync().unwrap();
+            assert_eq!(
+                std::fs::metadata(&values).unwrap().len(),
+                (PAGE_SIZE * 2 + crate::value_log::record_overhead()) as u64,
+                "copy-on-write leaf rewrites must preserve value-log references"
+            );
+            assert_eq!(
+                tree.get(b"key-000777").unwrap().unwrap().len(),
+                PAGE_SIZE * 2
+            );
+            (tree.root_id(), tree.len(), tree.page_count())
+        };
+        assert!(
+            pages < 5_000,
+            "inline records should avoid two blob pages per write"
+        );
+        let tree = PageTree::open(&path, &values, root, len).unwrap();
+        tree.validate().unwrap();
+        assert_eq!(
+            tree.scan(Some(b"key-000500"), Some(b"key-000510"), 100)
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn uncommitted_pages_are_not_visible_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+        let (root, len) = tree.prepare_put(b"committed", b"yes", 1).unwrap();
+        tree.sync().unwrap();
+        tree.publish(root, len);
+        let _ = tree.prepare_put(b"uncommitted", b"no", 2).unwrap();
+        tree.sync().unwrap();
+        drop(tree);
+        let tree = PageTree::open(&path, &values, root, len).unwrap();
+        assert_eq!(tree.get(b"committed").unwrap(), Some(b"yes".to_vec()));
+        assert_eq!(tree.get(b"uncommitted").unwrap(), None);
+    }
+}
