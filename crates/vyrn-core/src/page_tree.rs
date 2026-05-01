@@ -818,3 +818,163 @@ impl PageTree {
                 require_page(offset, key_len, page_id)?;
                 let value = page[offset..offset + key_len].to_vec();
                 offset += key_len;
+                value
+            };
+            let value = if flags & EXTERNAL_VALUE != 0 {
+                EntryValue::External(ValueRef {
+                    offset: value_offset,
+                    len: value_len as u32,
+                    revision,
+                })
+            } else {
+                require_page(offset, value_len, page_id)?;
+                let value = page[offset..offset + value_len].to_vec();
+                offset += value_len;
+                EntryValue::Inline(value)
+            };
+            entries.push(Entry {
+                key,
+                value,
+                revision,
+            });
+        }
+        Ok(entries)
+    }
+
+    fn encode_internal_cell(
+        &mut self,
+        page: &mut Page,
+        mut offset: usize,
+        child: &NodeRef,
+    ) -> Result<usize> {
+        let external = child.min_key.len() > INLINE_LIMIT;
+        page[offset] = u8::from(external) * EXTERNAL_KEY;
+        write_u32(page, offset + 1, child.min_key.len() as u32);
+        let key_page = if external {
+            self.write_blob(&child.min_key)?.0
+        } else {
+            0
+        };
+        write_u64(page, offset + 5, key_page);
+        write_u64(page, offset + 13, child.page_id);
+        offset += INTERNAL_CELL_HEADER;
+        if !external {
+            page[offset..offset + child.min_key.len()].copy_from_slice(&child.min_key);
+            offset += child.min_key.len();
+        }
+        Ok(offset)
+    }
+
+    fn decode_internal(&self, page: &Page, page_id: u64) -> Result<Vec<NodeRef>> {
+        let count = read_u32(page, 20) as usize;
+        let first_id = read_u64(page, 24);
+        let first = self.node_ref(first_id)?;
+        let mut children = vec![first];
+        let mut offset = HEADER_SIZE;
+        for _ in 0..count {
+            require_page(offset, INTERNAL_CELL_HEADER, page_id)?;
+            let flags = page[offset];
+            let key_len = read_u32(page, offset + 1) as usize;
+            let key_page = read_u64(page, offset + 5);
+            let child_id = read_u64(page, offset + 13);
+            if key_len == 0 || key_len > MAX_STORED_KEY_SIZE || flags & !EXTERNAL_KEY != 0 {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid internal cell metadata".into(),
+                });
+            }
+            offset += INTERNAL_CELL_HEADER;
+            let min_key = if flags & EXTERNAL_KEY != 0 {
+                self.read_blob(key_page, key_len)?
+            } else {
+                require_page(offset, key_len, page_id)?;
+                let key = page[offset..offset + key_len].to_vec();
+                offset += key_len;
+                key
+            };
+            children.push(NodeRef {
+                page_id: child_id,
+                min_key,
+            });
+        }
+        Ok(children)
+    }
+
+    fn write_blob(&mut self, bytes: &[u8]) -> Result<(u64, u32)> {
+        if bytes.is_empty() {
+            return Ok((0, 0));
+        }
+        let chunks: Vec<&[u8]> = bytes.chunks(PAGE_SIZE - HEADER_SIZE).collect();
+        let first_page = self.pages.page_count();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let page_id = self.pages.page_count();
+            let next = if index + 1 == chunks.len() {
+                0
+            } else {
+                page_id + 1
+            };
+            let mut page = new_page(BLOB, 0);
+            write_u32(&mut page, 20, chunk.len() as u32);
+            write_u64(&mut page, 24, next);
+            page[HEADER_SIZE..HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
+            self.pages.append(page)?;
+        }
+        Ok((first_page, bytes.len() as u32))
+    }
+
+    fn read_blob(&self, first_page: u64, expected_len: usize) -> Result<Vec<u8>> {
+        if expected_len == 0 {
+            return if first_page == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(Error::CorruptPage {
+                    page_id: first_page,
+                    reason: "empty blob has a page reference".into(),
+                })
+            };
+        }
+        let mut result = Vec::with_capacity(expected_len);
+        let mut page_id = first_page;
+        let max_pages = expected_len.div_ceil(PAGE_SIZE - HEADER_SIZE);
+        for _ in 0..max_pages {
+            if page_id == 0 {
+                break;
+            }
+            let page = self.pages.read(page_id)?;
+            require_type(&page, page_id, BLOB)?;
+            let chunk_len = read_u32(page.as_ref(), 20) as usize;
+            if chunk_len > PAGE_SIZE - HEADER_SIZE || result.len() + chunk_len > expected_len {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid blob chunk length".into(),
+                });
+            }
+            result.extend_from_slice(&page[HEADER_SIZE..HEADER_SIZE + chunk_len]);
+            page_id = read_u64(page.as_ref(), 24);
+        }
+        if result.len() != expected_len || page_id != 0 {
+            return Err(Error::CorruptPage {
+                page_id: first_page,
+                reason: "blob length does not match reference".into(),
+            });
+        }
+        Ok(result)
+    }
+
+    fn read_value(&self, value: &EntryValue) -> Result<Vec<u8>> {
+        match value {
+            EntryValue::Inline(value) => Ok(value.clone()),
+            EntryValue::External(reference) => self.values.read(reference),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
