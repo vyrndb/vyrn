@@ -298,3 +298,163 @@ impl Engine {
         let path = path.as_ref();
         let existed = path.exists();
         fs::create_dir_all(path)?;
+        if !existed {
+            sync_directory(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        }
+        let lock = open_lock(path)?;
+        if path.join("data.vwal").exists() {
+            return Err(Error::LegacyFormat);
+        }
+        let wal_directory = path.join("wal");
+        let wal_existed = wal_directory.exists();
+        fs::create_dir_all(&wal_directory)?;
+        if !wal_existed {
+            sync_directory(path)?;
+        }
+
+        let mut state = read_manifest(path)?.unwrap_or(TreeState {
+            root: 0,
+            len: 0,
+            generation: 0,
+            lsn: 0,
+        });
+        let page_path = path.join(page_file_name(state.generation));
+        let value_path = path.join(value_file_name(state.generation));
+        let revision_path = path.join(revision_file_name(state.generation));
+        let revision_value_path = path.join(revision_value_file_name(state.generation));
+        let mut mvcc_values = value_log::ValueLog::open(&revision_value_path)?;
+        let mut mvcc = mvcc::read(&revision_path, state.lsn, &mut mvcc_values)?;
+        let segments = list_segments(&wal_directory)?;
+        for (index, segment_id) in segments.iter().copied().enumerate() {
+            replay_segment(
+                &wal_directory.join(segment_name(segment_id)),
+                segment_id,
+                index + 1 == segments.len(),
+                &mut state,
+                &mut mvcc,
+                &mut mvcc_values,
+            )?;
+        }
+        let tree = PageTree::open(&page_path, &value_path, state.root, state.len)?;
+        tree.validate()?;
+        let indexes = load_indexes(&tree)?;
+        let user_len = tree.count_excluding_prefix(INTERNAL_PREFIX)?;
+        mvcc::collect(&mut mvcc, None, state.lsn);
+        let segment_id = segments.last().copied().unwrap_or(1);
+        let wal_path = wal_directory.join(segment_name(segment_id));
+        let mut wal = if wal_path.exists() {
+            OpenOptions::new().read(true).write(true).open(wal_path)?
+        } else {
+            create_segment(&wal_directory, segment_id, state.lsn + 1)?
+        };
+        wal.seek(SeekFrom::End(0))?;
+
+        Ok(Self {
+            path: path.to_owned(),
+            tree,
+            wal,
+            segment_id,
+            last_lsn: state.lsn,
+            checkpoint_generation: state.generation,
+            lock,
+            poisoned: false,
+            segment_size: options.segment_size.max((SEGMENT_HEADER_LEN + 1) as u64),
+            durability: options.durability,
+            mvcc,
+            mvcc_values,
+            indexes,
+            active_snapshots: BTreeMap::new(),
+            user_len,
+            pending_wal: Vec::new(),
+            failure: None,
+        })
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        validate_user_key(key)?;
+        self.get_internal(key)
+    }
+
+    pub(crate) fn get_internal(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.ensure_healthy()?;
+        validate_key(key)?;
+        self.tree.get(key)
+    }
+
+    pub fn revision(&self, key: &[u8]) -> Result<Option<u64>> {
+        self.ensure_healthy()?;
+        validate_key(key)?;
+        Ok(self
+            .mvcc
+            .histories
+            .get(key)
+            .and_then(|versions| versions.last())
+            .map(|version| version.revision)
+            .or(self.tree.revision(key)?)
+            .or(self.tree.revision(&tombstone_key(key))?))
+    }
+
+    pub fn revisions(&self) -> Result<Vec<(Vec<u8>, u64)>> {
+        self.ensure_healthy()?;
+        let mut revisions: BTreeMap<_, _> = self
+            .tree
+            .scan_with_revisions(None, None, usize::MAX)?
+            .into_iter()
+            .map(
+                |(key, _, revision)| match key.strip_prefix(TOMBSTONE_PREFIX) {
+                    Some(key) => (key.to_vec(), revision),
+                    None => (key, revision),
+                },
+            )
+            .collect();
+        revisions.extend(mvcc::revisions(&self.mvcc));
+        Ok(revisions.into_iter().collect())
+    }
+
+    pub fn set_failure_injector(&mut self, injector: Option<FailureInjector>) {
+        self.failure = injector;
+    }
+
+    pub fn register_snapshot(&mut self) -> u64 {
+        let revision = self.last_lsn;
+        *self.active_snapshots.entry(revision).or_default() += 1;
+        revision
+    }
+
+    pub fn register_snapshot_at(&mut self, revision: u64) -> Result<()> {
+        if revision < self.mvcc.gc_floor || revision > self.last_lsn {
+            return Err(Error::SnapshotTooOld {
+                requested: revision,
+                oldest: self.mvcc.gc_floor,
+            });
+        }
+        *self.active_snapshots.entry(revision).or_default() += 1;
+        Ok(())
+    }
+
+    pub fn release_snapshot(&mut self, revision: u64) {
+        if let Some(count) = self.active_snapshots.get_mut(&revision) {
+            *count -= 1;
+            if *count == 0 {
+                self.active_snapshots.remove(&revision);
+            }
+        }
+    }
+
+    pub fn get_at(&self, key: &[u8], revision: u64) -> Result<Option<Vec<u8>>> {
+        self.ensure_healthy()?;
+        validate_user_key(key)?;
+        if revision < self.mvcc.gc_floor {
+            return Err(Error::SnapshotTooOld {
+                requested: revision,
+                oldest: self.mvcc.gc_floor,
+            });
+        }
+        if self
+            .revision(key)?
+            .is_none_or(|current| current <= revision)
+        {
+            self.tree.get(key)
+        } else {
+            mvcc::get_at(&self.mvcc, &self.mvcc_values, key, revision)
+        }
