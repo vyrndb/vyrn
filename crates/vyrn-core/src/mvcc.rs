@@ -298,3 +298,156 @@ fn read_version(
     })
 }
 
+fn read_legacy_version(
+    bytes: &[u8],
+    offset: &mut usize,
+    maximum_revision: u64,
+    previous: Option<u64>,
+    values: &mut ValueLog,
+) -> Result<Version> {
+    require(bytes, *offset, LEGACY_VERSION_HEADER_LEN)?;
+    let revision = read_u64(bytes, *offset);
+    let present = bytes[*offset + 8];
+    let value_len = read_u32(bytes, *offset + 9) as usize;
+    let expected = read_u32(bytes, *offset + 13);
+    *offset += LEGACY_VERSION_HEADER_LEN;
+    if revision == 0
+        || revision > maximum_revision
+        || previous.is_some_and(|previous| previous >= revision)
+        || present > 1
+        || value_len > MAX_VALUE_SIZE
+        || (present == 0 && value_len != 0)
+    {
+        return Err(Error::CorruptManifest(
+            "invalid MVCC version metadata".into(),
+        ));
+    }
+    require(bytes, *offset, value_len)?;
+    let value = &bytes[*offset..*offset + value_len];
+    if legacy_version_checksum(revision, present, value) != expected {
+        return Err(Error::CorruptManifest(
+            "invalid MVCC version checksum".into(),
+        ));
+    }
+    *offset += value_len;
+    Ok(Version {
+        revision,
+        value: (present == 1)
+            .then(|| values.append(value, revision))
+            .transpose()?,
+    })
+}
+
+fn require(bytes: &[u8], offset: usize, length: usize) -> Result<()> {
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > bytes.len())
+    {
+        Err(Error::CorruptManifest("truncated MVCC history".into()))
+    } else {
+        Ok(())
+    }
+}
+
+fn version_checksum(revision: u64, present: u8, offset: u64, len: u32) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&[VERSION, present]);
+    hasher.update(&revision.to_be_bytes());
+    hasher.update(&offset.to_be_bytes());
+    hasher.update(&len.to_be_bytes());
+    hasher.finalize()
+}
+
+fn legacy_version_checksum(revision: u64, present: u8, value: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&[LEGACY_VERSION, present]);
+    hasher.update(&revision.to_be_bytes());
+    hasher.update(&(value.len() as u32).to_be_bytes());
+    hasher.update(value);
+    hasher.finalize()
+}
+
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize()
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn history_round_trips_reads_and_collects_safely() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.vmvcc");
+        let value_path = directory.path().join("history.vlog");
+        let mut values = ValueLog::open(&value_path).unwrap();
+        let mut state = State::default();
+        append(
+            &mut state,
+            &mut values,
+            b"a".to_vec(),
+            1,
+            Some(b"one".to_vec()),
+        )
+        .unwrap();
+        append(
+            &mut state,
+            &mut values,
+            b"a".to_vec(),
+            3,
+            Some(b"three".to_vec()),
+        )
+        .unwrap();
+        append(&mut state, &mut values, b"a".to_vec(), 5, None).unwrap();
+        append(
+            &mut state,
+            &mut values,
+            b"b".to_vec(),
+            4,
+            Some(b"four".to_vec()),
+        )
+        .unwrap();
+        assert_eq!(
+            get_at(&state, &values, b"a", 2).unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(collect(&mut state, Some(3), 5), 1);
+        assert_eq!(
+            get_at(&state, &values, b"a", 3).unwrap(),
+            Some(b"three".to_vec())
+        );
+        assert!(matches!(
+            get_at(&state, &values, b"a", 2),
+            Err(Error::SnapshotTooOld { .. })
+        ));
+        values.sync().unwrap();
+        write(&path, &state).unwrap();
+        let mut restored_values = ValueLog::open(&value_path).unwrap();
+        let restored = read(&path, 5, &mut restored_values).unwrap();
+        assert_eq!(restored.gc_floor, 3);
+        assert_eq!(get_at(&restored, &restored_values, b"a", 5).unwrap(), None);
+        assert_eq!(
+            get_at(&restored, &restored_values, b"b", 4).unwrap(),
+            Some(b"four".to_vec())
+        );
+    }
+}
