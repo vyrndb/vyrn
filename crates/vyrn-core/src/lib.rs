@@ -618,3 +618,163 @@ impl Engine {
     }
 
     pub fn write_indexed(
+        &mut self,
+        operations: Vec<BatchOperation>,
+        updates: Vec<IndexUpdate>,
+    ) -> Result<Vec<BatchResult>> {
+        for operation in &operations {
+            validate_user_operation(operation)?;
+        }
+        for update in &updates {
+            validate_user_key(&update.primary_key)?;
+            validate_index_value(update.old_value.as_deref())?;
+            validate_index_value(update.new_value.as_deref())?;
+            if !self.indexes.contains_key(&update.index) {
+                return Err(Error::IndexNotFound);
+            }
+        }
+        self.write_indexed_internal(operations, updates)
+    }
+
+    pub(crate) fn write_indexed_internal(
+        &mut self,
+        operations: Vec<BatchOperation>,
+        updates: Vec<IndexUpdate>,
+    ) -> Result<Vec<BatchResult>> {
+        for update in &updates {
+            validate_key(&update.primary_key)?;
+            validate_index_value(update.old_value.as_deref())?;
+            validate_index_value(update.new_value.as_deref())?;
+            if !self.indexes.contains_key(&update.index) {
+                return Err(Error::IndexNotFound);
+            }
+        }
+        let mut index_operations = Vec::new();
+        let mut unique_claims: BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>> = BTreeMap::new();
+        for update in &updates {
+            if update.old_value == update.new_value {
+                continue;
+            }
+            if let Some(old) = &update.old_value {
+                index_operations.push(BatchOperation::Delete(index_entry_key(
+                    &update.index,
+                    old,
+                    &update.primary_key,
+                )));
+            }
+            if let Some(new) = &update.new_value {
+                if self.indexes[&update.index] {
+                    let claim = (update.index.clone(), new.clone());
+                    if unique_claims
+                        .insert(claim, update.primary_key.clone())
+                        .is_some_and(|primary| primary != update.primary_key)
+                    {
+                        return Err(Error::UniqueViolation {
+                            index: update.index.clone(),
+                            value: new.clone(),
+                        });
+                    }
+                    let existing = self.lookup_index(&update.index, new, 2)?;
+                    if existing
+                        .iter()
+                        .any(|primary| primary.as_slice() != update.primary_key)
+                    {
+                        return Err(Error::UniqueViolation {
+                            index: update.index.clone(),
+                            value: new.clone(),
+                        });
+                    }
+                }
+                index_operations.push(BatchOperation::Put(
+                    index_entry_key(&update.index, new, &update.primary_key),
+                    Vec::new(),
+                ));
+            }
+        }
+        let primary_count = operations.len();
+        let mut combined = operations;
+        combined.extend(index_operations);
+        let mut results = self.write_batch_internal(combined)?;
+        results.truncate(primary_count);
+        Ok(results)
+    }
+
+    pub fn lookup_index(&self, name: &[u8], value: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        if !self.indexes.contains_key(name) {
+            return Err(Error::IndexNotFound);
+        }
+        validate_index_value(Some(value))?;
+        let prefix = index_value_prefix(name, value);
+        let end = prefix_end(&prefix);
+        self.tree
+            .scan(Some(&prefix), end.as_deref(), limit)?
+            .into_iter()
+            .map(|(key, _)| decode_index_primary(&key, &prefix))
+            .collect()
+    }
+
+    pub fn lookup_index_at(
+        &self,
+        name: &[u8],
+        value: &[u8],
+        limit: usize,
+        revision: u64,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.ensure_healthy()?;
+        validate_index_name(name)?;
+        validate_index_value(Some(value))?;
+        let definition = index_definition_key(name);
+        if self.value_at_internal(&definition, revision)?.is_none() {
+            return Err(Error::IndexNotFound);
+        }
+        let prefix = index_value_prefix(name, value);
+        let end = prefix_end(&prefix);
+        let candidate_limit = limit.saturating_add(self.mvcc.histories.len());
+        let mut entries: BTreeMap<Vec<u8>, ()> = self
+            .tree
+            .scan(Some(&prefix), end.as_deref(), candidate_limit)?
+            .into_iter()
+            .map(|(key, _)| (key, ()))
+            .collect();
+        for key in self
+            .mvcc
+            .histories
+            .range(prefix.clone()..)
+            .map(|(key, _)| key)
+        {
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            entries.insert(key.clone(), ());
+        }
+        let mut keys = Vec::with_capacity(limit.min(1024));
+        for key in entries.into_keys() {
+            if self.value_at_internal(&key, revision)?.is_some() {
+                keys.push(decode_index_primary(&key, &prefix)?);
+                if keys.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    fn value_at_internal(&self, key: &[u8], revision: u64) -> Result<Option<Vec<u8>>> {
+        if self
+            .revision(key)?
+            .is_none_or(|current| current <= revision)
+        {
+            self.tree.get(key)
+        } else {
+            mvcc::get_at(&self.mvcc, &self.mvcc_values, key, revision)
+        }
+    }
+
+    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+        self.write_batch(vec![BatchOperation::Put(key, value)])?;
+        Ok(())
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        let result = self.write_batch(vec![BatchOperation::Delete(key.to_vec())])?;
+        Ok(matches!(
