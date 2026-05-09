@@ -1098,3 +1098,163 @@ impl Engine {
     }
 
     pub(crate) fn scan_internal(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_healthy()?;
+        if let Some(key) = start {
+            validate_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        self.tree.scan(start, end, limit)
+    }
+
+    pub fn sync(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
+        if !self.pending_wal.is_empty() {
+            self.tree.sync()?;
+            self.mvcc_values.sync()?;
+            for record in self.pending_wal.drain(..) {
+                self.wal.write_all(&record)?;
+            }
+            self.wal.sync_data()?;
+        }
+        Ok(())
+    }
+
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
+        self.sync()?;
+        self.tree.validate()?;
+        let generation = self.checkpoint_generation + 1;
+        let temporary = self
+            .path
+            .join(format!("{}.tmp", page_file_name(generation)));
+        let published = self.path.join(page_file_name(generation));
+        let old = self.path.join(page_file_name(self.checkpoint_generation));
+        let temporary_values = self
+            .path
+            .join(format!("{}.tmp", value_file_name(generation)));
+        let published_values = self.path.join(value_file_name(generation));
+        let old_values = self.path.join(value_file_name(self.checkpoint_generation));
+        let temporary_revisions = self
+            .path
+            .join(format!("{}.tmp", revision_file_name(generation)));
+        let published_revisions = self.path.join(revision_file_name(generation));
+        let old_revisions = self
+            .path
+            .join(revision_file_name(self.checkpoint_generation));
+        let temporary_revision_values = self
+            .path
+            .join(format!("{}.tmp", revision_value_file_name(generation)));
+        let published_revision_values = self.path.join(revision_value_file_name(generation));
+        let old_revision_values = self
+            .path
+            .join(revision_value_file_name(self.checkpoint_generation));
+        let _ = fs::remove_file(&temporary);
+        let _ = fs::remove_file(&published);
+        let _ = fs::remove_file(&temporary_values);
+        let _ = fs::remove_file(&published_values);
+        let _ = fs::remove_file(&temporary_revisions);
+        let _ = fs::remove_file(&published_revisions);
+        let _ = fs::remove_file(&temporary_revision_values);
+        let _ = fs::remove_file(&published_revision_values);
+        let (root, len) = self.tree.compact_to(&temporary, &temporary_values)?;
+        let mut compacted_values = value_log::ValueLog::open(&temporary_revision_values)?;
+        let compacted_mvcc = mvcc::compact(&self.mvcc, &self.mvcc_values, &mut compacted_values)?;
+        compacted_values.sync()?;
+        mvcc::write(&temporary_revisions, &compacted_mvcc)?;
+        fs::rename(&temporary, &published)?;
+        fs::rename(&temporary_values, &published_values)?;
+        fs::rename(&temporary_revisions, &published_revisions)?;
+        fs::rename(&temporary_revision_values, &published_revision_values)?;
+        sync_directory(&self.path)?;
+        let new_state = TreeState {
+            root,
+            len,
+            generation,
+            lsn: self.last_lsn,
+        };
+        self.inject(FailurePoint::BeforeManifestPublish)?;
+        write_manifest(&self.path, new_state)?;
+        self.inject(FailurePoint::AfterManifestPublish)?;
+        self.tree = PageTree::open(&published, &published_values, root, len)?;
+        self.tree.validate()?;
+        self.mvcc_values = value_log::ValueLog::open(&published_revision_values)?;
+        self.mvcc = compacted_mvcc;
+        self.rotate_segment()?;
+        let wal_directory = self.path.join("wal");
+        for segment in list_segments(&wal_directory)? {
+            if segment < self.segment_id {
+                fs::remove_file(wal_directory.join(segment_name(segment)))?;
+            }
+        }
+        sync_directory(&wal_directory)?;
+        if old.exists() {
+            fs::remove_file(old)?;
+        }
+        if old_values.exists() {
+            fs::remove_file(old_values)?;
+        }
+        if old_revisions.exists() {
+            fs::remove_file(old_revisions)?;
+        }
+        if old_revision_values.exists() {
+            fs::remove_file(old_revision_values)?;
+        }
+        sync_directory(&self.path)?;
+        self.checkpoint_generation = generation;
+        Ok(())
+    }
+
+    pub fn stats(&self) -> Result<EngineStats> {
+        self.ensure_healthy()?;
+        Ok(EngineStats {
+            entries: self.len(),
+            last_lsn: self.last_lsn,
+            checkpoint_generation: self.checkpoint_generation,
+            wal_segments: list_segments(&self.path.join("wal"))?.len(),
+            pages: self.tree.page_count(),
+        })
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.last_lsn
+    }
+
+    pub fn committed_root(&self) -> (u64, u64, u64) {
+        (
+            self.checkpoint_generation,
+            self.tree.root_id(),
+            self.tree.len(),
+        )
+    }
+
+    pub fn len(&self) -> usize {
+        self.user_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn inject(&mut self, point: FailurePoint) -> Result<()> {
+        if let Some(injector) = &mut self.failure {
+            injector.hit(point)?;
+        }
+        Ok(())
+    }
+
+    fn commit_batch(&mut self, operations: &[PendingCommit], root: u64, len: u64) -> Result<()> {
+        let lsn = self
+            .last_lsn
+            .checked_add(1)
+            .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
+        let record = encode_record(lsn, operations, root, len)?;
