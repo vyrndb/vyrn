@@ -458,3 +458,163 @@ impl Engine {
         } else {
             mvcc::get_at(&self.mvcc, &self.mvcc_values, key, revision)
         }
+    }
+
+    pub fn scan_at(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        revision: u64,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_healthy()?;
+        if let Some(key) = start {
+            validate_user_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_user_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        if revision < self.mvcc.gc_floor {
+            return Err(Error::SnapshotTooOld {
+                requested: revision,
+                oldest: self.mvcc.gc_floor,
+            });
+        }
+        let candidate_limit = limit.saturating_add(self.mvcc.histories.len());
+        let mut keys: BTreeMap<Vec<u8>, ()> = self
+            .tree
+            .scan_excluding_prefix(start, end, candidate_limit, Some(INTERNAL_PREFIX))?
+            .into_iter()
+            .map(|(key, _)| (key, ()))
+            .collect();
+        for key in self.mvcc.histories.keys() {
+            if !key.starts_with(INTERNAL_PREFIX)
+                && start.is_none_or(|start| key.as_slice() >= start)
+                && end.is_none_or(|end| key.as_slice() < end)
+            {
+                keys.insert(key.clone(), ());
+            }
+        }
+        let mut rows = Vec::with_capacity(limit.min(1024));
+        for key in keys.into_keys() {
+            if let Some(value) = self.get_at(&key, revision)? {
+                rows.push((key, value));
+                if rows.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn changed_since(&self, key: &[u8], revision: u64) -> Result<bool> {
+        self.ensure_healthy()?;
+        validate_user_key(key)?;
+        Ok(self
+            .revision(key)?
+            .is_some_and(|current| current > revision))
+    }
+
+    pub fn range_changed_since(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        revision: u64,
+    ) -> Result<bool> {
+        self.ensure_healthy()?;
+        if self
+            .tree
+            .changed_since(start, end, revision, Some(INTERNAL_PREFIX))?
+        {
+            return Ok(true);
+        }
+        let tombstone_start = start
+            .map(tombstone_key)
+            .unwrap_or_else(|| TOMBSTONE_PREFIX.to_vec());
+        let tombstone_end = end
+            .map(tombstone_key)
+            .or_else(|| prefix_end(TOMBSTONE_PREFIX));
+        self.tree.changed_since(
+            Some(&tombstone_start),
+            tombstone_end.as_deref(),
+            revision,
+            None,
+        )
+    }
+
+    pub fn index_value_changed_since(
+        &self,
+        index: &[u8],
+        value: &[u8],
+        revision: u64,
+    ) -> Result<bool> {
+        self.ensure_healthy()?;
+        let start = index_value_prefix(index, value);
+        let end = prefix_end(&start);
+        if self
+            .tree
+            .changed_since(Some(&start), end.as_deref(), revision, None)?
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .mvcc
+            .histories
+            .range(start.clone()..)
+            .take_while(|(key, _)| key.starts_with(&start))
+            .any(|(_, versions)| {
+                versions
+                    .last()
+                    .is_some_and(|version| version.revision > revision)
+            }))
+    }
+
+    pub fn collect_versions(&mut self) -> usize {
+        mvcc::collect(
+            &mut self.mvcc,
+            self.active_snapshots
+                .first_key_value()
+                .map(|(revision, _)| *revision),
+            self.last_lsn,
+        )
+    }
+
+    pub fn retained_versions(&self) -> usize {
+        self.mvcc.histories.values().map(Vec::len).sum()
+    }
+
+    pub fn create_index(&mut self, name: Vec<u8>, unique: bool) -> Result<()> {
+        validate_index_name(&name)?;
+        if self.indexes.contains_key(&name) {
+            return Err(Error::IndexExists);
+        }
+        self.write_batch_internal(vec![BatchOperation::Put(
+            index_definition_key(&name),
+            vec![u8::from(unique)],
+        )])?;
+        self.indexes.insert(name, unique);
+        Ok(())
+    }
+
+    pub fn drop_index(&mut self, name: &[u8]) -> Result<()> {
+        if !self.indexes.contains_key(name) {
+            return Err(Error::IndexNotFound);
+        }
+        let start = index_entry_prefix(name);
+        let end = prefix_end(&start);
+        let mut operations: Vec<_> = self
+            .tree
+            .scan(Some(&start), end.as_deref(), usize::MAX)?
+            .into_iter()
+            .map(|(key, _)| BatchOperation::Delete(key))
+            .collect();
+        operations.push(BatchOperation::Delete(index_definition_key(name)));
+        self.write_batch_internal(operations)?;
+        self.indexes.remove(name);
+        Ok(())
+    }
+
+    pub fn write_indexed(
