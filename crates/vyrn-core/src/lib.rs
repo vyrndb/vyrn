@@ -778,3 +778,163 @@ impl Engine {
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
         let result = self.write_batch(vec![BatchOperation::Delete(key.to_vec())])?;
         Ok(matches!(
+            result.first(),
+            Some(BatchResult::Delete { existed: true })
+        ))
+    }
+
+    pub fn write_batch(&mut self, operations: Vec<BatchOperation>) -> Result<Vec<BatchResult>> {
+        for operation in &operations {
+            validate_user_operation(operation)?;
+        }
+        self.write_batch_internal(operations)
+    }
+
+    fn write_batch_internal(
+        &mut self,
+        operations: Vec<BatchOperation>,
+    ) -> Result<Vec<BatchResult>> {
+        self.ensure_healthy()?;
+        if operations.is_empty() {
+            return Ok(Vec::new());
+        }
+        for operation in &operations {
+            match operation {
+                BatchOperation::Put(key, value) => {
+                    validate_key(key)?;
+                    validate_value(value)?;
+                }
+                BatchOperation::Delete(key) => validate_key(key)?,
+            }
+        }
+        let requested = operations.len();
+        let operations = self.with_change_log(operations)?;
+        let original_root = self.tree.root_id();
+        let original_len = self.tree.len();
+        let original_user_len = self.user_len;
+        let oldest_snapshot = self
+            .active_snapshots
+            .first_key_value()
+            .map(|(revision, _)| *revision);
+        let mut previous = BTreeMap::new();
+        if oldest_snapshot.is_some() {
+            for operation in &operations {
+                let key = match operation {
+                    BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
+                };
+                if is_versioned_key(key) {
+                    previous
+                        .entry(key.clone())
+                        .or_insert((self.tree.revision(key)?, self.tree.get(key)?));
+                }
+            }
+        }
+        let mut pending = Vec::with_capacity(operations.len());
+        let mut results = Vec::with_capacity(operations.len());
+        for operation in operations {
+            match operation {
+                BatchOperation::Put(key, value) => {
+                    validate_key(&key)?;
+                    validate_value(&value)?;
+                    let revision = self.last_lsn.checked_add(1).ok_or_else(|| {
+                        Error::Io(io::Error::other("WAL sequence number exhausted"))
+                    })?;
+                    if !key.starts_with(INTERNAL_PREFIX) {
+                        let tombstone = tombstone_key(&key);
+                        if let Some((root, len)) = self.tree.prepare_delete(&tombstone)? {
+                            self.tree.publish(root, len);
+                        }
+                    }
+                    let existed = self.tree.get(&key)?.is_some();
+                    let (root, len) = self.tree.prepare_put(&key, &value, revision)?;
+                    if !key.starts_with(INTERNAL_PREFIX) && !existed {
+                        self.user_len += 1;
+                    }
+                    pending.push(PendingCommit {
+                        op: OP_PUT,
+                        key,
+                        value,
+                    });
+                    self.tree.publish(root, len);
+                    results.push(BatchResult::Put);
+                }
+                BatchOperation::Delete(key) => {
+                    validate_key(&key)?;
+                    if let Some((root, len)) = self.tree.prepare_delete(&key)? {
+                        self.tree.publish(root, len);
+                        if !key.starts_with(INTERNAL_PREFIX) {
+                            self.user_len -= 1;
+                        }
+                        if !key.starts_with(INTERNAL_PREFIX) {
+                            let revision = self.last_lsn.checked_add(1).ok_or_else(|| {
+                                Error::Io(io::Error::other("WAL sequence number exhausted"))
+                            })?;
+                            let tombstone = tombstone_key(&key);
+                            let (root, len) = self.tree.prepare_put(&tombstone, &[], revision)?;
+                            self.tree.publish(root, len);
+                        }
+                        pending.push(PendingCommit {
+                            op: OP_DELETE,
+                            key,
+                            value: Vec::new(),
+                        });
+                        results.push(BatchResult::Delete { existed: true });
+                    } else {
+                        results.push(BatchResult::Delete { existed: false });
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(results);
+        }
+        let revision = self
+            .last_lsn
+            .checked_add(1)
+            .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
+        let mut prepared = Vec::with_capacity(pending.len());
+        if oldest_snapshot.is_some() {
+            for operation in pending.iter().filter(|op| is_versioned_key(&op.key)) {
+                prepared.push((
+                    operation.key.clone(),
+                    mvcc::prepare_value(
+                        &mut self.mvcc_values,
+                        revision,
+                        (operation.op == OP_PUT).then_some(operation.value.as_slice()),
+                    )?,
+                ));
+            }
+        }
+        if let Err(error) = self.commit_batch(&pending, self.tree.root_id(), self.tree.len()) {
+            self.tree.publish(original_root, original_len);
+            self.user_len = original_user_len;
+            self.poisoned = true;
+            return Err(error);
+        }
+        if let Some(oldest_snapshot) = oldest_snapshot {
+            for (key, (revision, value)) in previous {
+                if let Some(revision) = revision.filter(|revision| *revision <= oldest_snapshot) {
+                    if self.mvcc.histories.get(&key).is_none_or(|versions| {
+                        versions
+                            .last()
+                            .is_none_or(|version| version.revision < revision)
+                    }) {
+                        mvcc::append(&mut self.mvcc, &mut self.mvcc_values, key, revision, value)?;
+                    }
+                }
+            }
+            for (key, value) in prepared {
+                mvcc::append_prepared(&mut self.mvcc, key, self.last_lsn, value);
+            }
+        }
+        // Hide results for the change records appended by with_change_log.
+        results.truncate(requested);
+        Ok(results)
+    }
+
+    pub fn scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
