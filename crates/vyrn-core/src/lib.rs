@@ -938,3 +938,163 @@ impl Engine {
         end: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_healthy()?;
+        if let Some(key) = start {
+            validate_user_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_user_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        self.tree
+            .scan_excluding_prefix(start, end, limit, Some(INTERNAL_PREFIX))
+    }
+
+    /// Appends a durable change record for every user mutation in `operations`.
+    ///
+    /// The records join the same batch as the data they describe, so a change is
+    /// visible after recovery exactly when its mutation committed.
+    fn with_change_log(&mut self, operations: Vec<BatchOperation>) -> Result<Vec<BatchOperation>> {
+        let sequence = self
+            .last_lsn
+            .checked_add(1)
+            .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
+        let mut records = Vec::new();
+        let mut index: u32 = 0;
+        for operation in &operations {
+            let published = match operation {
+                BatchOperation::Put(key, value) if is_published_key(key) => {
+                    Some((key.as_slice(), Some(value.as_slice())))
+                }
+                BatchOperation::Delete(key) if is_published_key(key) => {
+                    Some((key.as_slice(), None))
+                }
+                _ => None,
+            };
+            let Some((key, value)) = published else {
+                continue;
+            };
+            records.push(BatchOperation::Put(
+                change_log_key(change_log::Cursor::new(sequence, index)),
+                change_log::encode_entry(key, value),
+            ));
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| Error::Io(io::Error::other("too many changes in one commit")))?;
+        }
+        // Change records are appended after the caller's operations so their
+        // results stay contiguous at the front of the batch.
+        let mut combined = operations;
+        combined.extend(records);
+        Ok(combined)
+    }
+
+    /// Reads up to `limit` changes committed strictly after `cursor`.
+    ///
+    /// Pass `Cursor::start()` to replay everything still retained. Fails with
+    /// `CursorTooOld` when the requested position has already been trimmed, so a
+    /// resuming subscriber learns it must resynchronize instead of silently
+    /// skipping changes.
+    pub fn read_changes(
+        &self,
+        cursor: change_log::Cursor,
+        limit: usize,
+    ) -> Result<Vec<change_log::ChangeRecord>> {
+        self.ensure_healthy()?;
+        let retained = self.change_log_start()?;
+        if cursor < retained {
+            return Err(Error::CursorTooOld {
+                requested: cursor.to_token(),
+                oldest: retained.to_token(),
+            });
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut start = CHANGE_LOG_PREFIX.to_vec();
+        start.extend_from_slice(&cursor.suffix());
+        let end = prefix_end(CHANGE_LOG_PREFIX);
+        let mut records = Vec::new();
+        for (key, value) in self.tree.scan(Some(&start), end.as_deref(), limit + 1)? {
+            let suffix = &key[CHANGE_LOG_PREFIX.len()..];
+            let record = change_log::decode_entry(suffix, &value)?;
+            if record.cursor() <= cursor && cursor != change_log::Cursor::start() {
+                continue;
+            }
+            records.push(record);
+            if records.len() == limit {
+                break;
+            }
+        }
+        Ok(records)
+    }
+
+    /// The newest published cursor, for subscribing to future changes only.
+    pub fn latest_cursor(&self) -> Result<change_log::Cursor> {
+        self.ensure_healthy()?;
+        Ok(change_log::Cursor::new(self.last_lsn, u32::MAX))
+    }
+
+    /// The cursor of the newest record actually present in the change log.
+    ///
+    /// Unlike [`Engine::latest_cursor`] this never points past a real record, so
+    /// a caller can commit and then read back exactly the records it published.
+    pub fn latest_published_cursor(&self) -> Result<change_log::Cursor> {
+        self.ensure_healthy()?;
+        let end = prefix_end(CHANGE_LOG_PREFIX);
+        let records = self
+            .tree
+            .scan(Some(CHANGE_LOG_PREFIX), end.as_deref(), usize::MAX)?;
+        match records.last() {
+            Some((key, _)) => change_log::Cursor::from_suffix(&key[CHANGE_LOG_PREFIX.len()..]),
+            None => Ok(change_log::Cursor::start()),
+        }
+    }
+
+    /// The oldest cursor still retained; anything earlier has been trimmed.
+    pub fn change_log_start(&self) -> Result<change_log::Cursor> {
+        match self.tree.get(CHANGE_LOG_START_KEY)? {
+            Some(value) => change_log::Cursor::from_suffix(&value),
+            None => Ok(change_log::Cursor::start()),
+        }
+    }
+
+    /// Number of retained change records.
+    pub fn change_log_len(&self) -> Result<usize> {
+        let end = prefix_end(CHANGE_LOG_PREFIX);
+        Ok(self
+            .tree
+            .scan(Some(CHANGE_LOG_PREFIX), end.as_deref(), usize::MAX)?
+            .len())
+    }
+
+    /// Drops change records at or before `cursor` and records the new retention
+    /// floor, so later resume attempts from trimmed positions fail loudly.
+    pub fn trim_changes(&mut self, cursor: change_log::Cursor) -> Result<usize> {
+        self.ensure_healthy()?;
+        let end = prefix_end(CHANGE_LOG_PREFIX);
+        let mut operations = Vec::new();
+        for (key, _) in self
+            .tree
+            .scan(Some(CHANGE_LOG_PREFIX), end.as_deref(), usize::MAX)?
+        {
+            let position = change_log::Cursor::from_suffix(&key[CHANGE_LOG_PREFIX.len()..])?;
+            if position <= cursor {
+                operations.push(BatchOperation::Delete(key));
+            }
+        }
+        let removed = operations.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        operations.push(BatchOperation::Put(
+            CHANGE_LOG_START_KEY.to_vec(),
+            cursor.suffix(),
+        ));
+        self.write_batch_internal(operations)?;
+        Ok(removed)
+    }
+
+    pub(crate) fn scan_internal(
