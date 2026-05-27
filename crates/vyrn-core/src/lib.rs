@@ -1258,3 +1258,163 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
         let record = encode_record(lsn, operations, root, len)?;
+        let pending_len: u64 = self
+            .pending_wal
+            .iter()
+            .map(|record| record.len() as u64)
+            .sum();
+        let current_len = self.wal.metadata()?.len() + pending_len;
+        if current_len > SEGMENT_HEADER_LEN as u64
+            && current_len + record.len() as u64 > self.segment_size
+        {
+            self.sync()?;
+            self.rotate_segment()?;
+        }
+        if self.durability == DurabilityMode::Durable {
+            self.inject(FailurePoint::BeforePageSync)?;
+            self.tree.sync()?;
+            self.mvcc_values.sync()?;
+            self.inject(FailurePoint::AfterPageSync)?;
+            self.wal.write_all(&record)?;
+            self.inject(FailurePoint::AfterWalWrite)?;
+            self.inject(FailurePoint::BeforeWalSync)?;
+            self.wal.sync_data()?;
+        } else {
+            self.pending_wal.push(record);
+        }
+        self.last_lsn = lsn;
+        Ok(())
+    }
+
+    fn rotate_segment(&mut self) -> Result<()> {
+        let next = self
+            .segment_id
+            .checked_add(1)
+            .ok_or_else(|| Error::Io(io::Error::other("WAL segment number exhausted")))?;
+        self.wal = create_segment(&self.path.join("wal"), next, self.last_lsn + 1)?;
+        self.segment_id = next;
+        Ok(())
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.poisoned {
+            Err(Error::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let _ = self.sync();
+        let _ = FileExt::unlock(&self.lock);
+    }
+}
+
+fn open_lock(path: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.join("LOCK"))?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            Error::AlreadyOpen
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    Ok(lock)
+}
+
+fn create_segment(directory: &Path, segment_id: u64, first_lsn: u64) -> Result<File> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(directory.join(segment_name(segment_id)))?;
+    let mut header = [0; SEGMENT_HEADER_LEN];
+    header[0..4].copy_from_slice(SEGMENT_MAGIC);
+    header[4] = VERSION;
+    write_u64(&mut header, 8, segment_id);
+    write_u64(&mut header, 16, first_lsn);
+    let header_checksum = checksum(&header[0..24]);
+    write_u32(&mut header, 24, header_checksum);
+    file.write_all(&header)?;
+    file.sync_all()?;
+    sync_directory(directory)?;
+    Ok(file)
+}
+
+fn replay_segment(
+    path: &Path,
+    segment_id: u64,
+    is_last: bool,
+    state: &mut TreeState,
+    mvcc: &mut mvcc::State,
+    mvcc_values: &mut value_log::ValueLog,
+) -> Result<()> {
+    let mut file = OpenOptions::new().read(true).write(is_last).open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < SEGMENT_HEADER_LEN as u64 {
+        return Err(corrupt(segment_id, 0, "incomplete segment header"));
+    }
+    let mut header = [0; SEGMENT_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if &header[0..4] != SEGMENT_MAGIC
+        || header[4] != VERSION
+        || read_u64(&header, 8) != segment_id
+        || checksum(&header[0..24]) != read_u32(&header, 24)
+    {
+        return Err(corrupt(segment_id, 0, "invalid segment header"));
+    }
+
+    let mut offset = SEGMENT_HEADER_LEN as u64;
+    while offset < file_len {
+        if file_len - offset < RECORD_HEADER_LEN as u64 {
+            return truncate_or_corrupt(&mut file, is_last, segment_id, offset);
+        }
+        let mut record_header = [0; RECORD_HEADER_LEN];
+        file.read_exact(&mut record_header)?;
+        if &record_header[0..4] != RECORD_MAGIC || record_header[4] != VERSION {
+            return Err(corrupt(segment_id, offset, "invalid transaction header"));
+        }
+        let lsn = read_u64(&record_header, 5);
+        let operation_count = read_u32(&record_header, 13) as usize;
+        let payload_len = read_u32(&record_header, 17) as usize;
+        let expected_checksum = read_u32(&record_header, 21);
+        let root = read_u64(&record_header, 25);
+        let len = read_u64(&record_header, 33);
+        if operation_count == 0 || payload_len < operation_count.saturating_mul(OP_HEADER_LEN) {
+            return Err(corrupt(segment_id, offset, "invalid transaction metadata"));
+        }
+        let total_len = RECORD_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|size| size.checked_add(RECORD_FOOTER_LEN))
+            .ok_or_else(|| corrupt(segment_id, offset, "transaction length overflow"))?;
+        if total_len as u64 > file_len - offset {
+            return truncate_or_corrupt(&mut file, is_last, segment_id, offset);
+        }
+        let mut payload = vec![0; payload_len];
+        let mut footer = [0; RECORD_FOOTER_LEN];
+        file.read_exact(&mut payload)?;
+        file.read_exact(&mut footer)?;
+        validate_payload(&payload, operation_count)
+            .map_err(|reason| corrupt(segment_id, offset, reason))?;
+        if read_u32(&footer, 0) as usize != total_len
+            || &footer[4..8] != RECORD_END
+            || transaction_checksum(lsn, operation_count, &payload, root, len) != expected_checksum
+        {
+            return Err(corrupt(
+                segment_id,
+                offset,
+                "transaction checksum or footer mismatch",
+            ));
+        }
+        if lsn > state.lsn {
+            if lsn != state.lsn + 1 {
+                return Err(corrupt(segment_id, offset, "WAL sequence is discontinuous"));
+            }
+            state.root = root;
