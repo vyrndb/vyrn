@@ -1738,3 +1738,163 @@ fn decode_index_primary(key: &[u8], prefix: &[u8]) -> Result<Vec<u8>> {
     let primary = key
         .strip_prefix(prefix)
         .ok_or_else(|| Error::CorruptManifest("invalid index entry key".into()))?;
+    validate_key(primary)?;
+    Ok(primary.to_vec())
+}
+
+fn load_indexes(tree: &PageTree) -> Result<BTreeMap<Vec<u8>, bool>> {
+    let mut prefix = INTERNAL_PREFIX.to_vec();
+    prefix.extend_from_slice(b"index:def:");
+    let end = prefix_end(&prefix);
+    let mut indexes = BTreeMap::new();
+    for (key, value) in tree.scan(Some(&prefix), end.as_deref(), usize::MAX)? {
+        let encoded = key
+            .strip_prefix(prefix.as_slice())
+            .ok_or_else(|| Error::CorruptManifest("invalid index definition key".into()))?;
+        if encoded.len() < 2 || read_u16(encoded, 0) as usize != encoded.len() - 2 {
+            return Err(Error::CorruptManifest(
+                "invalid index definition name".into(),
+            ));
+        }
+        let unique = match value.as_slice() {
+            [0] => false,
+            [1] => true,
+            _ => {
+                return Err(Error::CorruptManifest(
+                    "invalid index definition value".into(),
+                ))
+            }
+        };
+        indexes.insert(encoded[2..].to_vec(), unique);
+    }
+    Ok(indexes)
+}
+
+fn validate_value(value: &[u8]) -> Result<()> {
+    if value.len() > MAX_VALUE_SIZE {
+        Err(Error::ValueTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn transaction_checksum(
+    lsn: u64,
+    operation_count: usize,
+    payload: &[u8],
+    root: u64,
+    len: u64,
+) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&[VERSION]);
+    hasher.update(&lsn.to_be_bytes());
+    hasher.update(&(operation_count as u32).to_be_bytes());
+    hasher.update(&(payload.len() as u32).to_be_bytes());
+    hasher.update(&root.to_be_bytes());
+    hasher.update(&len.to_be_bytes());
+    hasher.update(payload);
+    hasher.finalize()
+}
+
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(bytes);
+    hasher.finalize()
+}
+
+fn segment_name(segment: u64) -> String {
+    format!("{segment:020}.vwal")
+}
+
+fn page_file_name(generation: u64) -> String {
+    format!("pages-{generation:020}.vdb")
+}
+
+fn value_file_name(generation: u64) -> String {
+    format!("values-{generation:020}.vlog")
+}
+
+fn revision_file_name(generation: u64) -> String {
+    format!("revisions-{generation:020}.vmvcc")
+}
+
+fn revision_value_file_name(generation: u64) -> String {
+    format!("revision-values-{generation:020}.vlog")
+}
+
+fn corrupt(segment: u64, offset: u64, reason: impl Into<String>) -> Error {
+    Error::CorruptWal {
+        segment,
+        offset,
+        reason: reason.into(),
+    }
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn online_tree_persists_checkpoint_and_later_writes() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            engine.put(b"a".to_vec(), b"one".to_vec()).unwrap();
+            engine.put(b"b".to_vec(), b"two".to_vec()).unwrap();
+            engine.checkpoint().unwrap();
+            engine.delete(b"a").unwrap();
+            engine.put(b"c".to_vec(), b"three".to_vec()).unwrap();
+        }
+        let engine = Engine::open(directory.path()).unwrap();
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"two".to_vec()));
+        assert_eq!(engine.get(b"c").unwrap(), Some(b"three".to_vec()));
+        assert_eq!(engine.stats().unwrap().checkpoint_generation, 1);
+    }
+
+    #[test]
+    fn transactional_indexes_enforce_uniqueness_and_survive_reopen() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            engine.create_index(b"email".to_vec(), true).unwrap();
+            engine.create_index(b"tag".to_vec(), false).unwrap();
+            engine
+                .write_indexed(
+                    vec![BatchOperation::Put(b"user/1".to_vec(), b"alice".to_vec())],
+                    vec![
+                        IndexUpdate {
+                            index: b"email".to_vec(),
+                            primary_key: b"user/1".to_vec(),
+                            old_value: None,
