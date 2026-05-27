@@ -1578,3 +1578,163 @@ fn write_manifest(path: &Path, state: TreeState) -> Result<()> {
     write_u64(&mut manifest, 32, state.len);
     let manifest_checksum = checksum(&manifest[0..40]);
     write_u32(&mut manifest, 40, manifest_checksum);
+    let temporary = path.join("CURRENT.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&manifest)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, path.join("CURRENT"))?;
+    sync_directory(path)?;
+    Ok(())
+}
+
+fn list_segments(path: &Path) -> Result<Vec<u64>> {
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(number) = name.strip_suffix(".vwal") {
+            segments.push(
+                number
+                    .parse::<u64>()
+                    .map_err(|_| Error::CorruptManifest(format!("invalid segment name {name}")))?,
+            );
+        }
+    }
+    segments.sort_unstable();
+    for pair in segments.windows(2) {
+        if pair[1] != pair[0] + 1 {
+            return Err(Error::CorruptManifest(
+                "WAL segment sequence has a gap".into(),
+            ));
+        }
+    }
+    Ok(segments)
+}
+
+fn validate_key(key: &[u8]) -> Result<()> {
+    if key.is_empty() {
+        Err(Error::EmptyKey)
+    } else if key.len() > MAX_KEY_SIZE {
+        Err(Error::KeyTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_user_key(key: &[u8]) -> Result<()> {
+    validate_key(key)?;
+    if key.starts_with(INTERNAL_PREFIX) {
+        Err(Error::ReservedKey)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_user_operation(operation: &BatchOperation) -> Result<()> {
+    let key = match operation {
+        BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
+    };
+    if key.starts_with(INTERNAL_PREFIX) {
+        Err(Error::ReservedKey)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_index_name(name: &[u8]) -> Result<()> {
+    if name.is_empty() {
+        Err(Error::EmptyKey)
+    } else if name.len() > u16::MAX as usize {
+        Err(Error::KeyTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_index_value(value: Option<&[u8]>) -> Result<()> {
+    if value.is_some_and(|value| value.len() > u32::MAX as usize) {
+        Err(Error::ValueTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a key needs MVCC history.
+///
+/// Change log records are append-only and are never read at an older snapshot,
+/// so retaining historical versions of them would waste space and slow
+/// collection without making any read correct.
+fn is_versioned_key(key: &[u8]) -> bool {
+    !key.starts_with(CHANGE_LOG_PREFIX) && key != CHANGE_LOG_START_KEY
+}
+
+/// Whether a committed key is part of the published change stream.
+///
+/// User keys and documents are published; Vyrn's own bookkeeping (secondary
+/// index entries, tombstones, index definitions, and the change log itself) is
+/// not, so subscribers never see internal representation details.
+fn is_published_key(key: &[u8]) -> bool {
+    !key.starts_with(INTERNAL_PREFIX) || key.starts_with(document::DOCUMENT_KEY_PREFIX)
+}
+
+fn change_log_key(cursor: change_log::Cursor) -> Vec<u8> {
+    let mut key = CHANGE_LOG_PREFIX.to_vec();
+    key.extend_from_slice(&cursor.suffix());
+    key
+}
+
+fn tombstone_key(key: &[u8]) -> Vec<u8> {
+    let mut tombstone = TOMBSTONE_PREFIX.to_vec();
+    tombstone.extend_from_slice(key);
+    tombstone
+}
+
+fn index_definition_key(name: &[u8]) -> Vec<u8> {
+    let mut key = INTERNAL_PREFIX.to_vec();
+    key.extend_from_slice(b"index:def:");
+    key.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
+fn index_entry_prefix(name: &[u8]) -> Vec<u8> {
+    let mut key = INTERNAL_PREFIX.to_vec();
+    key.extend_from_slice(b"index:entry:");
+    key.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
+fn index_value_prefix(name: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut key = index_entry_prefix(name);
+    key.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    key.extend_from_slice(value);
+    key
+}
+
+fn index_entry_key(name: &[u8], value: &[u8], primary_key: &[u8]) -> Vec<u8> {
+    let mut key = index_value_prefix(name, value);
+    key.extend_from_slice(primary_key);
+    key
+}
+
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn decode_index_primary(key: &[u8], prefix: &[u8]) -> Result<Vec<u8>> {
+    let primary = key
+        .strip_prefix(prefix)
+        .ok_or_else(|| Error::CorruptManifest("invalid index entry key".into()))?;
