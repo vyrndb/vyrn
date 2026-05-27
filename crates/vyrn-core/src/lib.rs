@@ -1418,3 +1418,163 @@ fn replay_segment(
                 return Err(corrupt(segment_id, offset, "WAL sequence is discontinuous"));
             }
             state.root = root;
+            state.len = len;
+            state.lsn = lsn;
+            record_versions(&payload, operation_count, lsn, mvcc, mvcc_values)?;
+        }
+        offset += total_len as u64;
+    }
+    Ok(())
+}
+
+fn truncate_or_corrupt(file: &mut File, is_last: bool, segment: u64, offset: u64) -> Result<()> {
+    if !is_last {
+        return Err(corrupt(
+            segment,
+            offset,
+            "incomplete transaction in sealed segment",
+        ));
+    }
+    file.set_len(offset)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn encode_record(lsn: u64, operations: &[PendingCommit], root: u64, len: u64) -> Result<Vec<u8>> {
+    let operation_count: u32 = operations
+        .len()
+        .try_into()
+        .map_err(|_| Error::Io(io::Error::other("too many operations in transaction")))?;
+    let mut payload = Vec::new();
+    for operation in operations {
+        let key_len: u32 = operation
+            .key
+            .len()
+            .try_into()
+            .map_err(|_| Error::KeyTooLarge)?;
+        let value_len: u32 = operation
+            .value
+            .len()
+            .try_into()
+            .map_err(|_| Error::ValueTooLarge)?;
+        payload.push(operation.op);
+        payload.extend_from_slice(&key_len.to_be_bytes());
+        payload.extend_from_slice(&value_len.to_be_bytes());
+        payload.extend_from_slice(&operation.key);
+        payload.extend_from_slice(&operation.value);
+    }
+    let payload_len: u32 = payload
+        .len()
+        .try_into()
+        .map_err(|_| Error::Io(io::Error::other("transaction exceeds WAL record limit")))?;
+    let total_len = RECORD_HEADER_LEN + payload.len() + RECORD_FOOTER_LEN;
+    let total_len_u32: u32 = total_len
+        .try_into()
+        .map_err(|_| Error::Io(io::Error::other("transaction exceeds WAL record limit")))?;
+    let mut record = vec![0; total_len];
+    record[0..4].copy_from_slice(RECORD_MAGIC);
+    record[4] = VERSION;
+    write_u64(&mut record, 5, lsn);
+    write_u32(&mut record, 13, operation_count);
+    write_u32(&mut record, 17, payload_len);
+    write_u32(
+        &mut record,
+        21,
+        transaction_checksum(lsn, operations.len(), &payload, root, len),
+    );
+    write_u64(&mut record, 25, root);
+    write_u64(&mut record, 33, len);
+    record[RECORD_HEADER_LEN..total_len - RECORD_FOOTER_LEN].copy_from_slice(&payload);
+    write_u32(&mut record, total_len - RECORD_FOOTER_LEN, total_len_u32);
+    record[total_len - 4..].copy_from_slice(RECORD_END);
+    Ok(record)
+}
+
+fn validate_payload(
+    payload: &[u8],
+    operation_count: usize,
+) -> std::result::Result<(), &'static str> {
+    let mut offset = 0;
+    for _ in 0..operation_count {
+        if payload.len().saturating_sub(offset) < OP_HEADER_LEN {
+            return Err("truncated transaction operation");
+        }
+        let op = payload[offset];
+        let key_len = read_u32(payload, offset + 1) as usize;
+        let value_len = read_u32(payload, offset + 5) as usize;
+        if !matches!(op, OP_PUT | OP_DELETE)
+            || key_len == 0
+            || key_len > MAX_KEY_SIZE
+            || value_len > MAX_VALUE_SIZE
+            || (op == OP_DELETE && value_len != 0)
+        {
+            return Err("invalid transaction operation");
+        }
+        offset = offset
+            .checked_add(OP_HEADER_LEN)
+            .and_then(|value| value.checked_add(key_len))
+            .and_then(|value| value.checked_add(value_len))
+            .ok_or("transaction operation length overflow")?;
+        if offset > payload.len() {
+            return Err("truncated transaction operation");
+        }
+    }
+    if offset != payload.len() {
+        return Err("trailing transaction payload");
+    }
+    Ok(())
+}
+
+fn record_versions(
+    payload: &[u8],
+    operation_count: usize,
+    revision: u64,
+    state: &mut mvcc::State,
+    values: &mut value_log::ValueLog,
+) -> Result<()> {
+    let mut offset = 0;
+    for _ in 0..operation_count {
+        let op = payload[offset];
+        let key_len = read_u32(payload, offset + 1) as usize;
+        let value_len = read_u32(payload, offset + 5) as usize;
+        offset += OP_HEADER_LEN;
+        let key = payload[offset..offset + key_len].to_vec();
+        offset += key_len;
+        let value = (op == OP_PUT).then(|| payload[offset..offset + value_len].to_vec());
+        mvcc::append(state, values, key, revision, value)?;
+        offset += value_len;
+    }
+    Ok(())
+}
+
+fn read_manifest(path: &Path) -> Result<Option<TreeState>> {
+    let manifest_path = path.join("CURRENT");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(manifest_path)?;
+    if bytes.len() != MANIFEST_LEN
+        || &bytes[0..4] != MANIFEST_MAGIC
+        || bytes[4] != VERSION
+        || checksum(&bytes[0..40]) != read_u32(&bytes, 40)
+    {
+        return Err(Error::LegacyFormat);
+    }
+    Ok(Some(TreeState {
+        generation: read_u64(&bytes, 8),
+        lsn: read_u64(&bytes, 16),
+        root: read_u64(&bytes, 24),
+        len: read_u64(&bytes, 32),
+    }))
+}
+
+fn write_manifest(path: &Path, state: TreeState) -> Result<()> {
+    let mut manifest = [0; MANIFEST_LEN];
+    manifest[0..4].copy_from_slice(MANIFEST_MAGIC);
+    manifest[4] = VERSION;
+    write_u64(&mut manifest, 8, state.generation);
+    write_u64(&mut manifest, 16, state.lsn);
+    write_u64(&mut manifest, 24, state.root);
+    write_u64(&mut manifest, 32, state.len);
+    let manifest_checksum = checksum(&manifest[0..40]);
+    write_u32(&mut manifest, 40, manifest_checksum);
