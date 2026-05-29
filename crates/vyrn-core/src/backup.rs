@@ -148,3 +148,137 @@ fn read_archive(path: &Path, target: Option<&Path>) -> Result<()> {
         }
         if hasher.finalize() != expected_checksum {
             return Err(Error::CorruptBackup(format!(
+                "checksum mismatch for {}",
+                relative.display()
+            )));
+        }
+        if let Some(output) = output {
+            output.sync_all()?;
+        }
+    }
+    let mut footer = [0; 8];
+    archive.read_exact(&mut footer)?;
+    if &footer != FOOTER || archive.read(&mut [0])? != 0 {
+        return Err(Error::CorruptBackup(
+            "invalid footer or trailing data".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn database_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "CURRENT"
+            || name.starts_with("pages-") && name.ends_with(".vdb")
+            || name.starts_with("values-") && name.ends_with(".vlog")
+            || name.starts_with("revision-values-") && name.ends_with(".vlog")
+            || name.starts_with("revisions-") && name.ends_with(".vmvcc")
+        {
+            files.push(PathBuf::from(name.as_ref()));
+        } else if name == "wal" {
+            for segment in fs::read_dir(entry.path())? {
+                let segment = segment?;
+                if segment.file_type()?.is_file() {
+                    files.push(PathBuf::from("wal").join(segment.file_name()));
+                }
+            }
+        }
+    }
+    files.sort();
+    if !files.iter().any(|path| path == Path::new("CURRENT")) {
+        return Err(Error::CorruptBackup(
+            "database has no CURRENT manifest; checkpoint it first".into(),
+        ));
+    }
+    Ok(files)
+}
+
+fn safe_relative_path(bytes: &[u8]) -> Result<PathBuf> {
+    let value =
+        std::str::from_utf8(bytes).map_err(|_| Error::CorruptBackup("path is not UTF-8".into()))?;
+    let path = Path::new(value);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(Error::CorruptBackup("unsafe path in backup".into()));
+    }
+    Ok(path.to_owned())
+}
+
+fn write_u32(output: &mut File, value: u32) -> Result<()> {
+    output.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+fn write_u64(output: &mut File, value: u64) -> Result<()> {
+    output.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+fn read_u32(input: &mut File) -> Result<u32> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+fn read_u64(input: &mut File) -> Result<u64> {
+    let mut bytes = [0; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Engine;
+    use tempfile::tempdir;
+
+    #[test]
+    fn backup_verifies_restores_and_reopens() {
+        let source = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(source.path()).unwrap();
+            engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let archive = source.path().join("../backup.vyrn");
+        create_backup(source.path(), &archive).unwrap();
+        verify_backup(&archive).unwrap();
+        let restored = tempdir().unwrap();
+        let target = restored.path().join("db");
+        restore_backup(&archive, &target).unwrap();
+        let engine = Engine::open(target).unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), Some(b"value".to_vec()));
+        let _ = fs::remove_file(archive);
+    }
+
+    #[test]
+    fn corruption_is_detected() {
+        let source = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(source.path()).unwrap();
+            engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let archive = source.path().join("../corrupt.vyrn");
+        create_backup(source.path(), &archive).unwrap();
+        let mut bytes = fs::read(&archive).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(&archive, bytes).unwrap();
+        assert!(verify_backup(&archive).is_err());
+        let _ = fs::remove_file(archive);
+    }
+}
