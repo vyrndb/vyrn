@@ -1898,3 +1898,244 @@ mod tests {
                             index: b"email".to_vec(),
                             primary_key: b"user/1".to_vec(),
                             old_value: None,
+                            new_value: Some(b"a@example.com".to_vec()),
+                        },
+                        IndexUpdate {
+                            index: b"tag".to_vec(),
+                            primary_key: b"user/1".to_vec(),
+                            old_value: None,
+                            new_value: Some(b"admin".to_vec()),
+                        },
+                    ],
+                )
+                .unwrap();
+            let error = engine
+                .write_indexed(
+                    vec![BatchOperation::Put(b"user/2".to_vec(), b"other".to_vec())],
+                    vec![IndexUpdate {
+                        index: b"email".to_vec(),
+                        primary_key: b"user/2".to_vec(),
+                        old_value: None,
+                        new_value: Some(b"a@example.com".to_vec()),
+                    }],
+                )
+                .unwrap_err();
+            assert!(matches!(error, Error::UniqueViolation { .. }));
+            assert_eq!(engine.get(b"user/2").unwrap(), None);
+            let error = engine
+                .write_indexed(
+                    vec![
+                        BatchOperation::Put(b"user/2".to_vec(), b"two".to_vec()),
+                        BatchOperation::Put(b"user/3".to_vec(), b"three".to_vec()),
+                    ],
+                    vec![
+                        IndexUpdate {
+                            index: b"email".to_vec(),
+                            primary_key: b"user/2".to_vec(),
+                            old_value: None,
+                            new_value: Some(b"shared@example.com".to_vec()),
+                        },
+                        IndexUpdate {
+                            index: b"email".to_vec(),
+                            primary_key: b"user/3".to_vec(),
+                            old_value: None,
+                            new_value: Some(b"shared@example.com".to_vec()),
+                        },
+                    ],
+                )
+                .unwrap_err();
+            assert!(matches!(error, Error::UniqueViolation { .. }));
+            assert_eq!(engine.get(b"user/2").unwrap(), None);
+            assert_eq!(engine.get(b"user/3").unwrap(), None);
+            assert_eq!(
+                engine.lookup_index(b"tag", b"admin", 10).unwrap(),
+                vec![b"user/1".to_vec()]
+            );
+            assert_eq!(
+                engine.scan(None, None, 1).unwrap(),
+                vec![(b"user/1".to_vec(), b"alice".to_vec())]
+            );
+            engine.checkpoint().unwrap();
+        }
+        let mut engine = Engine::open(directory.path()).unwrap();
+        assert_eq!(
+            engine.lookup_index(b"email", b"a@example.com", 10).unwrap(),
+            vec![b"user/1".to_vec()]
+        );
+        engine.drop_index(b"tag").unwrap();
+        assert!(matches!(
+            engine.lookup_index(b"tag", b"admin", 10),
+            Err(Error::IndexNotFound)
+        ));
+    }
+
+    #[test]
+    fn index_lookup_at_reads_one_historical_revision() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.create_index(b"tag".to_vec(), false).unwrap();
+        engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/1".to_vec(), b"one".to_vec())],
+                vec![IndexUpdate {
+                    index: b"tag".to_vec(),
+                    primary_key: b"user/1".to_vec(),
+                    old_value: None,
+                    new_value: Some(b"admin".to_vec()),
+                }],
+            )
+            .unwrap();
+        let snapshot = engine.register_snapshot();
+        engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/1".to_vec(), b"one".to_vec())],
+                vec![IndexUpdate {
+                    index: b"tag".to_vec(),
+                    primary_key: b"user/1".to_vec(),
+                    old_value: Some(b"admin".to_vec()),
+                    new_value: Some(b"member".to_vec()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .lookup_index_at(b"tag", b"admin", 10, snapshot)
+                .unwrap(),
+            vec![b"user/1".to_vec()]
+        );
+        assert!(engine
+            .lookup_index_at(b"tag", b"member", 10, snapshot)
+            .unwrap()
+            .is_empty());
+        engine.release_snapshot(snapshot);
+    }
+
+    #[test]
+    fn active_snapshot_retains_history_until_release() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"key".to_vec(), b"one".to_vec()).unwrap();
+        let snapshot = engine.register_snapshot();
+        engine.put(b"key".to_vec(), b"two".to_vec()).unwrap();
+        engine.delete(b"key").unwrap();
+        assert_eq!(
+            engine.get_at(b"key", snapshot).unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(engine.collect_versions(), 0);
+        assert_eq!(
+            engine.get_at(b"key", snapshot).unwrap(),
+            Some(b"one".to_vec())
+        );
+        engine.release_snapshot(snapshot);
+        assert_eq!(engine.collect_versions(), 3);
+        assert_eq!(engine.retained_versions(), 0);
+        assert!(matches!(
+            engine.get_at(b"key", snapshot),
+            Err(Error::SnapshotTooOld { .. })
+        ));
+    }
+
+    #[test]
+    fn current_revisions_survive_updates_deletes_and_checkpoint() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            engine.put(b"updated".to_vec(), b"one".to_vec()).unwrap();
+            engine.put(b"deleted".to_vec(), b"value".to_vec()).unwrap();
+            engine.put(b"updated".to_vec(), b"two".to_vec()).unwrap();
+            engine.delete(b"deleted").unwrap();
+            assert_eq!(engine.revision(b"updated").unwrap(), Some(3));
+            assert_eq!(engine.revision(b"deleted").unwrap(), Some(4));
+            engine.checkpoint().unwrap();
+        }
+        let engine = Engine::open(directory.path()).unwrap();
+        assert_eq!(engine.revision(b"updated").unwrap(), Some(3));
+        assert_eq!(engine.revision(b"deleted").unwrap(), Some(4));
+    }
+
+    #[test]
+    fn deleted_revision_survives_wal_only_reopen() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            engine.put(b"deleted".to_vec(), b"value".to_vec()).unwrap();
+            engine.delete(b"deleted").unwrap();
+        }
+        let engine = Engine::open(directory.path()).unwrap();
+        assert_eq!(engine.revision(b"deleted").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rotates_transaction_segments_and_recovers() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open_with_segment_size(directory.path(), 128).unwrap();
+            for index in 0..20 {
+                engine
+                    .put(format!("key-{index}").into_bytes(), vec![index as u8; 40])
+                    .unwrap();
+            }
+            assert!(engine.stats().unwrap().wal_segments > 1);
+        }
+        assert_eq!(Engine::open(directory.path()).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn write_batch_recovers_as_one_transaction() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            let before = engine.sequence();
+            let results = engine
+                .write_batch(vec![
+                    BatchOperation::Put(b"a".to_vec(), b"one".to_vec()),
+                    BatchOperation::Put(b"b".to_vec(), b"two".to_vec()),
+                    BatchOperation::Delete(b"missing".to_vec()),
+                ])
+                .unwrap();
+            assert_eq!(results.len(), 3);
+            assert_eq!(engine.sequence(), before + 1);
+        }
+        let engine = Engine::open(directory.path()).unwrap();
+        assert_eq!(engine.sequence(), 1);
+        assert_eq!(engine.get(b"a").unwrap(), Some(b"one".to_vec()));
+        assert_eq!(engine.get(b"b").unwrap(), Some(b"two".to_vec()));
+    }
+
+    #[test]
+    fn async_wal_is_published_only_by_sync() {
+        let directory = tempdir().unwrap();
+        let wal = directory.path().join("wal/00000000000000000001.vwal");
+        let mut engine = Engine::open_with_options(
+            directory.path(),
+            EngineOptions {
+                durability: DurabilityMode::Async,
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        engine.put(b"a".to_vec(), b"one".to_vec()).unwrap();
+        assert_eq!(fs::metadata(&wal).unwrap().len(), SEGMENT_HEADER_LEN as u64);
+        engine.sync().unwrap();
+        assert!(fs::metadata(&wal).unwrap().len() > SEGMENT_HEADER_LEN as u64);
+    }
+
+    #[test]
+    fn scan_is_ordered_and_rejects_reversed_bounds() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        for key in [b"c", b"a", b"b", b"d"] {
+            engine.put(key.to_vec(), key.to_vec()).unwrap();
+        }
+        let rows = engine.scan(Some(b"b"), Some(b"d"), 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.0.as_slice()).collect::<Vec<_>>(),
+            vec![b"b", b"c"]
+        );
+        assert!(matches!(
+            engine.scan(Some(b"z"), Some(b"a"), 10),
+            Err(Error::InvalidRange)
+        ));
+    }
+}
