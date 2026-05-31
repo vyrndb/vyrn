@@ -538,3 +538,143 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             output.put_u8(45);
             put_bytes(output, &prefix)?;
             put_optional_string(output, cursor.as_deref())?;
+        }
+        Message::SubscribeCollectionFrom { collection, cursor } => {
+            output.put_u8(46);
+            put_string(output, &collection)?;
+            put_optional_string(output, cursor.as_deref())?;
+        }
+        Message::CursorChange { cursor, key, value } => {
+            output.put_u8(47);
+            put_string(output, &cursor)?;
+            put_bytes(output, &key)?;
+            put_optional_bytes(output, value.as_deref())?;
+        }
+        Message::CursorDocumentChange {
+            cursor,
+            collection,
+            id,
+            document,
+        } => {
+            output.put_u8(48);
+            put_string(output, &cursor)?;
+            put_string(output, &collection)?;
+            put_string(output, &id)?;
+            put_optional_bytes(output, document.as_deref())?;
+        }
+        Message::Caught { cursor } => {
+            output.put_u8(49);
+            put_string(output, &cursor)?;
+        }
+        Message::Begin => output.put_u8(15),
+        Message::Commit => output.put_u8(16),
+        Message::Rollback => output.put_u8(17),
+        Message::CreateIndex { name, unique } => {
+            output.put_u8(21);
+            put_bytes(output, &name)?;
+            output.put_u8(u8::from(unique));
+        }
+        Message::DropIndex { name } => {
+            output.put_u8(22);
+            put_bytes(output, &name)?;
+        }
+        Message::IndexUpdate {
+            index,
+            primary_key,
+            old_value,
+            new_value,
+        } => {
+            output.put_u8(23);
+            put_bytes(output, &index)?;
+            put_bytes(output, &primary_key)?;
+            put_optional_bytes(output, old_value.as_deref())?;
+            put_optional_bytes(output, new_value.as_deref())?;
+        }
+        Message::IndexLookup {
+            index,
+            value,
+            limit,
+        } => {
+            output.put_u8(24);
+            put_bytes(output, &index)?;
+            put_bytes(output, &value)?;
+            output.put_u32(limit);
+        }
+        Message::CreateCollection {
+            collection,
+            indexes,
+        } => {
+            output.put_u8(31);
+            put_string(output, &collection)?;
+            output.put_u32(
+                indexes
+                    .len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many document indexes"))?,
+            );
+            for index in indexes {
+                put_string(output, &index.field)?;
+                output.put_u8(u8::from(index.unique));
+            }
+        }
+        Message::GetDocument { collection, id } => {
+            output.put_u8(32);
+            put_string(output, &collection)?;
+            put_string(output, &id)?;
+        }
+        Message::PutDocument {
+            collection,
+            id,
+            document,
+        } => {
+            output.put_u8(33);
+            put_string(output, &collection)?;
+            put_string(output, &id)?;
+            put_bytes(output, &document)?;
+        }
+        Message::DeleteDocument { collection, id } => {
+            output.put_u8(34);
+            put_string(output, &collection)?;
+            put_string(output, &id)?;
+        }
+        Message::ListDocuments { collection, limit } => {
+            output.put_u8(35);
+            put_string(output, &collection)?;
+            output.put_u32(limit);
+        }
+        Message::QueryDocuments {
+            collection,
+            field,
+            value,
+            limit,
+        } => {
+            output.put_u8(36);
+            put_string(output, &collection)?;
+            put_string(output, &field)?;
+            put_bytes(output, &value)?;
+            output.put_u32(limit);
+        }
+        Message::SubscribeCollection { collection } => {
+            output.put_u8(37);
+            put_string(output, &collection)?;
+        }
+        Message::CollectionCreated => output.put_u8(38),
+        Message::DocumentValue { document } => {
+            output.put_u8(39);
+            put_optional_bytes(output, document.as_deref())?;
+        }
+        Message::DocumentWritten => output.put_u8(40),
+        Message::DocumentDeleted { existed } => {
+            output.put_u8(41);
+            output.put_u8(u8::from(existed));
+        }
+        Message::Documents { documents } => {
+            output.put_u8(42);
+            output.put_u32(
+                documents
+                    .len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many documents"))?,
+            );
+            for (id, document) in documents {
+                put_string(output, &id)?;
