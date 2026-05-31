@@ -258,3 +258,143 @@ impl std::fmt::Debug for Message {
                 .field("cursor", cursor)
                 .field("collection", collection)
                 .field("id", id)
+                .field("document_len", &document.as_ref().map(Vec::len))
+                .finish(),
+            Self::Caught { cursor } => formatter
+                .debug_struct("Caught")
+                .field("cursor", cursor)
+                .finish(),
+            Self::Begin => formatter.write_str("Begin"),
+            Self::Commit => formatter.write_str("Commit"),
+            Self::Rollback => formatter.write_str("Rollback"),
+            Self::CreateIndex { name, unique } => formatter
+                .debug_struct("CreateIndex")
+                .field("name_len", &name.len())
+                .field("unique", unique)
+                .finish(),
+            Self::DropIndex { name } => formatter
+                .debug_struct("DropIndex")
+                .field("name_len", &name.len())
+                .finish(),
+            Self::IndexUpdate {
+                index,
+                primary_key,
+                old_value,
+                new_value,
+            } => formatter
+                .debug_struct("IndexUpdate")
+                .field("index_len", &index.len())
+                .field("primary_key_len", &primary_key.len())
+                .field("old_value_len", &old_value.as_ref().map(Vec::len))
+                .field("new_value_len", &new_value.as_ref().map(Vec::len))
+                .finish(),
+            Self::IndexLookup {
+                index,
+                value,
+                limit,
+            } => formatter
+                .debug_struct("IndexLookup")
+                .field("index_len", &index.len())
+                .field("value_len", &value.len())
+                .field("limit", limit)
+                .finish(),
+            Self::CreateCollection {
+                collection,
+                indexes,
+            } => formatter
+                .debug_struct("CreateCollection")
+                .field("collection", collection)
+                .field("index_count", &indexes.len())
+                .finish(),
+            Self::GetDocument { collection, id } | Self::DeleteDocument { collection, id } => {
+                formatter
+                    .debug_struct("DocumentRequest")
+                    .field("collection", collection)
+                    .field("id", id)
+                    .finish()
+            }
+            Self::PutDocument {
+                collection,
+                id,
+                document,
+            } => formatter
+                .debug_struct("PutDocument")
+                .field("collection", collection)
+                .field("id", id)
+                .field("document_len", &document.len())
+                .finish(),
+            Self::ListDocuments { collection, limit } => formatter
+                .debug_struct("ListDocuments")
+                .field("collection", collection)
+                .field("limit", limit)
+                .finish(),
+            Self::QueryDocuments {
+                collection,
+                field,
+                value,
+                limit,
+            } => formatter
+                .debug_struct("QueryDocuments")
+                .field("collection", collection)
+                .field("field", field)
+                .field("value_len", &value.len())
+                .field("limit", limit)
+                .finish(),
+            Self::SubscribeCollection { collection } => formatter
+                .debug_struct("SubscribeCollection")
+                .field("collection", collection)
+                .finish(),
+            Self::Authenticated => formatter.write_str("Authenticated"),
+            Self::Value { value } => formatter
+                .debug_struct("Value")
+                .field("value_len", &value.as_ref().map(Vec::len))
+                .finish(),
+            Self::Values { values } => formatter
+                .debug_struct("Values")
+                .field("value_count", &values.len())
+                .finish(),
+            Self::Written => formatter.write_str("Written"),
+            Self::Deleted { existed } => formatter
+                .debug_struct("Deleted")
+                .field("existed", existed)
+                .finish(),
+            Self::Rows { rows } => formatter
+                .debug_struct("Rows")
+                .field("row_count", &rows.len())
+                .finish(),
+            Self::Subscribed => formatter.write_str("Subscribed"),
+            Self::Begun => formatter.write_str("Begun"),
+            Self::Committed => formatter.write_str("Committed"),
+            Self::RolledBack => formatter.write_str("RolledBack"),
+            Self::IndexCreated => formatter.write_str("IndexCreated"),
+            Self::IndexDropped => formatter.write_str("IndexDropped"),
+            Self::IndexUpdated => formatter.write_str("IndexUpdated"),
+            Self::Keys { keys } => formatter
+                .debug_struct("Keys")
+                .field("key_count", &keys.len())
+                .finish(),
+            Self::CollectionCreated => formatter.write_str("CollectionCreated"),
+            Self::DocumentValue { document } => formatter
+                .debug_struct("DocumentValue")
+                .field("document_len", &document.as_ref().map(Vec::len))
+                .finish(),
+            Self::DocumentWritten => formatter.write_str("DocumentWritten"),
+            Self::DocumentDeleted { existed } => formatter
+                .debug_struct("DocumentDeleted")
+                .field("existed", existed)
+                .finish(),
+            Self::Documents { documents } => formatter
+                .debug_struct("Documents")
+                .field("document_count", &documents.len())
+                .finish(),
+            Self::CollectionSubscribed => formatter.write_str("CollectionSubscribed"),
+            Self::DocumentChange {
+                sequence,
+                id,
+                document,
+            } => formatter
+                .debug_struct("DocumentChange")
+                .field("sequence", sequence)
+                .field("id", id)
+                .field("document_len", &document.as_ref().map(Vec::len))
+                .finish(),
