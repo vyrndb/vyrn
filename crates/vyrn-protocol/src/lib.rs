@@ -398,3 +398,143 @@ impl std::fmt::Debug for Message {
                 .field("id", id)
                 .field("document_len", &document.as_ref().map(Vec::len))
                 .finish(),
+            Self::Change {
+                sequence,
+                key,
+                value,
+            } => formatter
+                .debug_struct("Change")
+                .field("sequence", sequence)
+                .field("key_len", &key.len())
+                .field("value_len", &value.as_ref().map(Vec::len))
+                .finish(),
+            Self::Error { code, message } => formatter
+                .debug_struct("Error")
+                .field("code", code)
+                .field("message", message)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorCode {
+    AuthenticationFailed,
+    InvalidRequest,
+    UnsupportedVersion,
+    Conflict,
+    Storage,
+    Internal,
+}
+
+#[derive(Debug, Error)]
+pub enum CodecError {
+    #[error("I/O error: {0}")]
+    Io(#[from] io::Error),
+    #[error("malformed protocol message: {0}")]
+    Malformed(&'static str),
+}
+
+pub struct VyrnCodec {
+    frames: LengthDelimitedCodec,
+}
+
+impl Default for VyrnCodec {
+    fn default() -> Self {
+        Self {
+            frames: LengthDelimitedCodec::builder()
+                .max_frame_length(MAX_FRAME_SIZE)
+                .new_codec(),
+        }
+    }
+}
+
+impl Decoder for VyrnCodec {
+    type Item = Envelope;
+    type Error = CodecError;
+
+    fn decode(&mut self, source: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let Some(mut frame) = self.frames.decode(source)? else {
+            return Ok(None);
+        };
+        let envelope = decode_envelope(&mut frame)?;
+        if frame.has_remaining() {
+            return Err(CodecError::Malformed("trailing bytes"));
+        }
+        Ok(Some(envelope))
+    }
+}
+
+impl Encoder<Envelope> for VyrnCodec {
+    type Error = CodecError;
+
+    fn encode(&mut self, message: Envelope, destination: &mut BytesMut) -> Result<(), Self::Error> {
+        let encoded = encode_envelope(message)?;
+        if encoded.len() > MAX_FRAME_SIZE {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "message exceeds frame limit").into(),
+            );
+        }
+        self.frames.encode(encoded, destination)?;
+        Ok(())
+    }
+}
+
+fn encode_envelope(envelope: Envelope) -> Result<Bytes, CodecError> {
+    let mut output = BytesMut::with_capacity(64);
+    output.put_u16(envelope.version);
+    output.put_u64(envelope.request_id);
+    encode_message(envelope.message, &mut output)?;
+    Ok(output.freeze())
+}
+
+fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecError> {
+    match message {
+        Message::Authenticate {
+            username,
+            password,
+            database,
+        } => {
+            output.put_u8(1);
+            put_string(output, &username)?;
+            put_string(output, &password)?;
+            put_string(output, &database)?;
+        }
+        Message::Get { key } => {
+            output.put_u8(2);
+            put_bytes(output, &key)?;
+        }
+        Message::MultiGet { keys } => {
+            output.put_u8(29);
+            output.put_u32(
+                keys.len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many keys"))?,
+            );
+            for key in keys {
+                put_bytes(output, &key)?;
+            }
+        }
+        Message::Put { key, value } => {
+            output.put_u8(3);
+            put_bytes(output, &key)?;
+            put_bytes(output, &value)?;
+        }
+        Message::Delete { key } => {
+            output.put_u8(4);
+            put_bytes(output, &key)?;
+        }
+        Message::Scan { start, end, limit } => {
+            output.put_u8(5);
+            put_optional_bytes(output, start.as_deref())?;
+            put_optional_bytes(output, end.as_deref())?;
+            output.put_u32(limit);
+        }
+        Message::Subscribe { prefix } => {
+            output.put_u8(12);
+            put_bytes(output, &prefix)?;
+        }
+        Message::SubscribeFrom { prefix, cursor } => {
+            output.put_u8(45);
+            put_bytes(output, &prefix)?;
+            put_optional_string(output, cursor.as_deref())?;
