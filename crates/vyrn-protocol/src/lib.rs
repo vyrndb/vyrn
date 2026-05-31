@@ -128,3 +128,133 @@ pub enum Message {
     Authenticated,
     Value {
         value: Option<Vec<u8>>,
+    },
+    Values {
+        values: Vec<Option<Vec<u8>>>,
+    },
+    Written,
+    Deleted {
+        existed: bool,
+    },
+    Rows {
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    Subscribed,
+    Begun,
+    Committed,
+    RolledBack,
+    IndexCreated,
+    IndexDropped,
+    IndexUpdated,
+    Keys {
+        keys: Vec<Vec<u8>>,
+    },
+    CollectionCreated,
+    DocumentValue {
+        document: Option<Vec<u8>>,
+    },
+    DocumentWritten,
+    DocumentDeleted {
+        existed: bool,
+    },
+    Documents {
+        documents: Vec<(String, Vec<u8>)>,
+    },
+    CollectionSubscribed,
+    DocumentChange {
+        sequence: u64,
+        id: String,
+        document: Option<Vec<u8>>,
+    },
+    Change {
+        sequence: u64,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    /// A change carrying the durable cursor that produced it, so a subscriber
+    /// can persist its position and resume without gaps.
+    CursorChange {
+        cursor: String,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    CursorDocumentChange {
+        cursor: String,
+        collection: String,
+        id: String,
+        document: Option<Vec<u8>>,
+    },
+    /// Marks the end of the replayed backlog; everything after is live.
+    Caught {
+        cursor: String,
+    },
+    Error {
+        code: ErrorCode,
+        message: String,
+    },
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authenticate {
+                username, database, ..
+            } => formatter
+                .debug_struct("Authenticate")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .field("database", database)
+                .finish(),
+            Self::Get { key } => formatter
+                .debug_struct("Get")
+                .field("key_len", &key.len())
+                .finish(),
+            Self::MultiGet { keys } => formatter
+                .debug_struct("MultiGet")
+                .field("key_count", &keys.len())
+                .finish(),
+            Self::Put { key, value } => formatter
+                .debug_struct("Put")
+                .field("key_len", &key.len())
+                .field("value_len", &value.len())
+                .finish(),
+            Self::Delete { key } => formatter
+                .debug_struct("Delete")
+                .field("key_len", &key.len())
+                .finish(),
+            Self::Scan { start, end, limit } => formatter
+                .debug_struct("Scan")
+                .field("start_len", &start.as_ref().map(Vec::len))
+                .field("end_len", &end.as_ref().map(Vec::len))
+                .field("limit", limit)
+                .finish(),
+            Self::Subscribe { prefix } => formatter
+                .debug_struct("Subscribe")
+                .field("prefix_len", &prefix.len())
+                .finish(),
+            Self::SubscribeFrom { prefix, cursor } => formatter
+                .debug_struct("SubscribeFrom")
+                .field("prefix_len", &prefix.len())
+                .field("cursor", cursor)
+                .finish(),
+            Self::SubscribeCollectionFrom { collection, cursor } => formatter
+                .debug_struct("SubscribeCollectionFrom")
+                .field("collection", collection)
+                .field("cursor", cursor)
+                .finish(),
+            Self::CursorChange { cursor, key, value } => formatter
+                .debug_struct("CursorChange")
+                .field("cursor", cursor)
+                .field("key_len", &key.len())
+                .field("value_len", &value.as_ref().map(Vec::len))
+                .finish(),
+            Self::CursorDocumentChange {
+                cursor,
+                collection,
+                id,
+                document,
+            } => formatter
+                .debug_struct("CursorDocumentChange")
+                .field("cursor", cursor)
+                .field("collection", collection)
+                .field("id", id)
