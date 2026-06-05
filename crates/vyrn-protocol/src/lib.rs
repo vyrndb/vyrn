@@ -818,3 +818,143 @@ fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
         12 => Message::Subscribe {
             prefix: get_bytes(input, MAX_FRAME_SIZE)?,
         },
+        13 => Message::Subscribed,
+        14 => Message::Change {
+            sequence: get_u64(input)?,
+            key: get_bytes(input, MAX_FRAME_SIZE)?,
+            value: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        15 => Message::Begin,
+        16 => Message::Commit,
+        17 => Message::Rollback,
+        18 => Message::Begun,
+        19 => Message::Committed,
+        20 => Message::RolledBack,
+        21 => Message::CreateIndex {
+            name: get_bytes(input, MAX_FRAME_SIZE)?,
+            unique: get_bool(input)?,
+        },
+        22 => Message::DropIndex {
+            name: get_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        23 => Message::IndexUpdate {
+            index: get_bytes(input, MAX_FRAME_SIZE)?,
+            primary_key: get_bytes(input, MAX_FRAME_SIZE)?,
+            old_value: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+            new_value: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        24 => Message::IndexLookup {
+            index: get_bytes(input, MAX_FRAME_SIZE)?,
+            value: get_bytes(input, MAX_FRAME_SIZE)?,
+            limit: get_u32(input)?,
+        },
+        25 => Message::IndexCreated,
+        26 => Message::IndexDropped,
+        27 => Message::IndexUpdated,
+        28 => {
+            let count = get_u32(input)? as usize;
+            if count > MAX_SCAN_LIMIT as usize {
+                return Err(CodecError::Malformed("too many keys"));
+            }
+            let mut keys = Vec::with_capacity(count);
+            for _ in 0..count {
+                keys.push(get_bytes(input, MAX_FRAME_SIZE)?);
+            }
+            Message::Keys { keys }
+        }
+        29 => {
+            let count = get_u32(input)? as usize;
+            if count == 0 || count > MAX_SCAN_LIMIT as usize {
+                return Err(CodecError::Malformed("multi-get key count is out of range"));
+            }
+            let mut keys = Vec::with_capacity(count);
+            for _ in 0..count {
+                keys.push(get_bytes(input, MAX_FRAME_SIZE)?);
+            }
+            Message::MultiGet { keys }
+        }
+        30 => {
+            let count = get_u32(input)? as usize;
+            if count > MAX_SCAN_LIMIT as usize {
+                return Err(CodecError::Malformed("too many values"));
+            }
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(get_optional_bytes(input, MAX_FRAME_SIZE)?);
+            }
+            Message::Values { values }
+        }
+        31 => {
+            let collection = get_string(input, MAX_DOCUMENT_NAME)?;
+            let count = get_u32(input)? as usize;
+            if count > MAX_DOCUMENT_INDEXES {
+                return Err(CodecError::Malformed("too many document indexes"));
+            }
+            let mut indexes = Vec::with_capacity(count);
+            for _ in 0..count {
+                indexes.push(DocumentIndex {
+                    field: get_string(input, MAX_DOCUMENT_NAME)?,
+                    unique: get_bool(input)?,
+                });
+            }
+            Message::CreateCollection {
+                collection,
+                indexes,
+            }
+        }
+        32 => Message::GetDocument {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            id: get_string(input, MAX_DOCUMENT_NAME)?,
+        },
+        33 => Message::PutDocument {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            id: get_string(input, MAX_DOCUMENT_NAME)?,
+            document: get_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        34 => Message::DeleteDocument {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            id: get_string(input, MAX_DOCUMENT_NAME)?,
+        },
+        35 => Message::ListDocuments {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            limit: get_u32(input)?,
+        },
+        36 => Message::QueryDocuments {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            field: get_string(input, MAX_DOCUMENT_NAME)?,
+            value: get_bytes(input, MAX_FRAME_SIZE)?,
+            limit: get_u32(input)?,
+        },
+        37 => Message::SubscribeCollection {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+        },
+        38 => Message::CollectionCreated,
+        39 => Message::DocumentValue {
+            document: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        40 => Message::DocumentWritten,
+        41 => Message::DocumentDeleted {
+            existed: get_bool(input)?,
+        },
+        42 => {
+            let count = get_u32(input)? as usize;
+            if count > MAX_SCAN_LIMIT as usize {
+                return Err(CodecError::Malformed("too many documents"));
+            }
+            let mut documents = Vec::with_capacity(count);
+            for _ in 0..count {
+                documents.push((
+                    get_string(input, MAX_DOCUMENT_NAME)?,
+                    get_bytes(input, MAX_FRAME_SIZE)?,
+                ));
+            }
+            Message::Documents { documents }
+        }
+        43 => Message::CollectionSubscribed,
+        44 => Message::DocumentChange {
+            sequence: get_u64(input)?,
+            id: get_string(input, MAX_DOCUMENT_NAME)?,
+            document: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        45 => Message::SubscribeFrom {
+            prefix: get_bytes(input, MAX_FRAME_SIZE)?,
