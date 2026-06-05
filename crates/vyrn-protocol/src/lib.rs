@@ -958,3 +958,143 @@ fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
         },
         45 => Message::SubscribeFrom {
             prefix: get_bytes(input, MAX_FRAME_SIZE)?,
+            cursor: get_optional_string(input, MAX_CURSOR)?,
+        },
+        46 => Message::SubscribeCollectionFrom {
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            cursor: get_optional_string(input, MAX_CURSOR)?,
+        },
+        47 => Message::CursorChange {
+            cursor: get_string(input, MAX_CURSOR)?,
+            key: get_bytes(input, MAX_FRAME_SIZE)?,
+            value: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        48 => Message::CursorDocumentChange {
+            cursor: get_string(input, MAX_CURSOR)?,
+            collection: get_string(input, MAX_DOCUMENT_NAME)?,
+            id: get_string(input, MAX_DOCUMENT_NAME)?,
+            document: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        49 => Message::Caught {
+            cursor: get_string(input, MAX_CURSOR)?,
+        },
+        _ => return Err(CodecError::Malformed("unknown message type")),
+    };
+    Ok(Envelope {
+        version,
+        request_id,
+        message,
+    })
+}
+
+fn put_optional_bytes(output: &mut BytesMut, value: Option<&[u8]>) -> Result<(), CodecError> {
+    match value {
+        Some(value) => {
+            output.put_u8(1);
+            put_bytes(output, value)
+        }
+        None => {
+            output.put_u8(0);
+            Ok(())
+        }
+    }
+}
+
+fn get_optional_bytes(input: &mut BytesMut, maximum: usize) -> Result<Option<Vec<u8>>, CodecError> {
+    match get_u8(input)? {
+        0 => Ok(None),
+        1 => get_bytes(input, maximum).map(Some),
+        _ => Err(CodecError::Malformed("invalid optional value")),
+    }
+}
+
+fn put_string(output: &mut BytesMut, value: &str) -> Result<(), CodecError> {
+    put_bytes(output, value.as_bytes())
+}
+
+fn put_optional_string(output: &mut BytesMut, value: Option<&str>) -> Result<(), CodecError> {
+    put_optional_bytes(output, value.map(str::as_bytes))
+}
+
+fn get_optional_string(input: &mut BytesMut, maximum: usize) -> Result<Option<String>, CodecError> {
+    get_optional_bytes(input, maximum)?
+        .map(|value| {
+            String::from_utf8(value).map_err(|_| CodecError::Malformed("string is not UTF-8"))
+        })
+        .transpose()
+}
+
+fn get_string(input: &mut BytesMut, maximum: usize) -> Result<String, CodecError> {
+    String::from_utf8(get_bytes(input, maximum)?)
+        .map_err(|_| CodecError::Malformed("string is not UTF-8"))
+}
+
+fn put_bytes(output: &mut BytesMut, value: &[u8]) -> Result<(), CodecError> {
+    output.put_u32(
+        value
+            .len()
+            .try_into()
+            .map_err(|_| CodecError::Malformed("byte field is too large"))?,
+    );
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn get_bytes(input: &mut BytesMut, maximum: usize) -> Result<Vec<u8>, CodecError> {
+    let length = get_u32(input)? as usize;
+    if length > maximum {
+        return Err(CodecError::Malformed("byte field exceeds limit"));
+    }
+    require(input, length)?;
+    Ok(input.split_to(length).to_vec())
+}
+
+fn get_u8(input: &mut BytesMut) -> Result<u8, CodecError> {
+    require(input, 1)?;
+    Ok(input.get_u8())
+}
+fn get_u32(input: &mut BytesMut) -> Result<u32, CodecError> {
+    require(input, 4)?;
+    Ok(input.get_u32())
+}
+fn get_u64(input: &mut BytesMut) -> Result<u64, CodecError> {
+    require(input, 8)?;
+    Ok(input.get_u64())
+}
+fn get_bool(input: &mut BytesMut) -> Result<bool, CodecError> {
+    match get_u8(input)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(CodecError::Malformed("invalid boolean")),
+    }
+}
+fn require(input: &BytesMut, length: usize) -> Result<(), CodecError> {
+    if input.remaining() < length {
+        Err(CodecError::Malformed("truncated message"))
+    } else {
+        Ok(())
+    }
+}
+
+fn error_code(code: ErrorCode) -> u8 {
+    match code {
+        ErrorCode::AuthenticationFailed => 1,
+        ErrorCode::InvalidRequest => 2,
+        ErrorCode::UnsupportedVersion => 3,
+        ErrorCode::Conflict => 6,
+        ErrorCode::Storage => 4,
+        ErrorCode::Internal => 5,
+    }
+}
+fn decode_error_code(code: u8) -> Result<ErrorCode, CodecError> {
+    match code {
+        1 => Ok(ErrorCode::AuthenticationFailed),
+        2 => Ok(ErrorCode::InvalidRequest),
+        3 => Ok(ErrorCode::UnsupportedVersion),
+        4 => Ok(ErrorCode::Storage),
+        6 => Ok(ErrorCode::Conflict),
+        5 => Ok(ErrorCode::Internal),
+        _ => Err(CodecError::Malformed("unknown error code")),
+    }
+}
+
