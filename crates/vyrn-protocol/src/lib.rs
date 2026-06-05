@@ -1098,3 +1098,203 @@ fn decode_error_code(code: u8) -> Result<ErrorCode, CodecError> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(message: Message) {
+        let envelope = Envelope::new(42, message);
+        let mut codec = VyrnCodec::default();
+        let mut bytes = BytesMut::new();
+        codec.encode(envelope.clone(), &mut bytes).unwrap();
+        assert_eq!(codec.decode(&mut bytes).unwrap(), Some(envelope));
+    }
+
+    #[test]
+    fn every_message_round_trips() {
+        for message in [
+            Message::Authenticate {
+                username: "u".into(),
+                password: "secret".into(),
+                database: "d".into(),
+            },
+            Message::Get { key: vec![0, 1] },
+            Message::MultiGet {
+                keys: vec![vec![0], vec![1]],
+            },
+            Message::Put {
+                key: vec![2],
+                value: vec![3, 4],
+            },
+            Message::Delete { key: vec![5] },
+            Message::Scan {
+                start: None,
+                end: Some(vec![9]),
+                limit: 10,
+            },
+            Message::Subscribe {
+                prefix: b"users/".to_vec(),
+            },
+            Message::Begin,
+            Message::Commit,
+            Message::Rollback,
+            Message::CreateIndex {
+                name: b"email".to_vec(),
+                unique: true,
+            },
+            Message::DropIndex {
+                name: b"email".to_vec(),
+            },
+            Message::IndexUpdate {
+                index: b"email".to_vec(),
+                primary_key: b"user/1".to_vec(),
+                old_value: None,
+                new_value: Some(b"a@example.com".to_vec()),
+            },
+            Message::IndexLookup {
+                index: b"email".to_vec(),
+                value: b"a@example.com".to_vec(),
+                limit: 10,
+            },
+            Message::Authenticated,
+            Message::Value { value: None },
+            Message::Values {
+                values: vec![Some(vec![1]), None],
+            },
+            Message::Written,
+            Message::Deleted { existed: true },
+            Message::Rows {
+                rows: vec![(vec![1], vec![2])],
+            },
+            Message::Subscribed,
+            Message::Begun,
+            Message::Committed,
+            Message::RolledBack,
+            Message::IndexCreated,
+            Message::IndexDropped,
+            Message::IndexUpdated,
+            Message::Keys {
+                keys: vec![b"user/1".to_vec()],
+            },
+            Message::Change {
+                sequence: 7,
+                key: b"users/a".to_vec(),
+                value: Some(b"online".to_vec()),
+            },
+            Message::CreateCollection {
+                collection: "users".into(),
+                indexes: vec![DocumentIndex {
+                    field: "email".into(),
+                    unique: true,
+                }],
+            },
+            Message::GetDocument {
+                collection: "users".into(),
+                id: "user_1".into(),
+            },
+            Message::PutDocument {
+                collection: "users".into(),
+                id: "user_1".into(),
+                document: br#"{"email":"a@example.com"}"#.to_vec(),
+            },
+            Message::DeleteDocument {
+                collection: "users".into(),
+                id: "user_1".into(),
+            },
+            Message::ListDocuments {
+                collection: "users".into(),
+                limit: 25,
+            },
+            Message::QueryDocuments {
+                collection: "users".into(),
+                field: "email".into(),
+                value: br#""a@example.com""#.to_vec(),
+                limit: 25,
+            },
+            Message::SubscribeCollection {
+                collection: "users".into(),
+            },
+            Message::CollectionCreated,
+            Message::DocumentValue { document: None },
+            Message::DocumentWritten,
+            Message::DocumentDeleted { existed: true },
+            Message::Documents {
+                documents: vec![("user_1".into(), b"{}".to_vec())],
+            },
+            Message::CollectionSubscribed,
+            Message::DocumentChange {
+                sequence: 9,
+                id: "user_1".into(),
+                document: Some(b"{}".to_vec()),
+            },
+            Message::SubscribeFrom {
+                prefix: b"users/".to_vec(),
+                cursor: Some("0000000000000007-00000001".into()),
+            },
+            Message::SubscribeFrom {
+                prefix: b"users/".to_vec(),
+                cursor: None,
+            },
+            Message::SubscribeCollectionFrom {
+                collection: "users".into(),
+                cursor: Some("0000000000000007-00000001".into()),
+            },
+            Message::CursorChange {
+                cursor: "0000000000000008-00000000".into(),
+                key: b"users/a".to_vec(),
+                value: Some(b"online".to_vec()),
+            },
+            Message::CursorDocumentChange {
+                cursor: "0000000000000009-00000000".into(),
+                collection: "users".into(),
+                id: "user_1".into(),
+                document: None,
+            },
+            Message::Caught {
+                cursor: "0000000000000009-00000000".into(),
+            },
+            Message::Error {
+                code: ErrorCode::Storage,
+                message: "bad".into(),
+            },
+        ] {
+            round_trip(message);
+        }
+    }
+
+    #[test]
+    fn maximum_value_has_low_wire_overhead() {
+        let message = Envelope::new(
+            1,
+            Message::Put {
+                key: vec![1; 64 * 1024],
+                value: vec![2; 16 * 1024 * 1024],
+            },
+        );
+        let mut codec = VyrnCodec::default();
+        let mut bytes = BytesMut::new();
+        codec.encode(message, &mut bytes).unwrap();
+        assert!(bytes.len() < 17 * 1024 * 1024);
+    }
+
+    #[test]
+    fn malformed_input_never_panics() {
+        for length in 0..64 {
+            let mut input = BytesMut::from(&vec![0xff; length][..]);
+            let _ = decode_envelope(&mut input);
+        }
+    }
+
+    #[test]
+    fn authentication_debug_redacts_password() {
+        let debug = format!(
+            "{:?}",
+            Message::Authenticate {
+                username: "u".into(),
+                password: "top-secret".into(),
+                database: "d".into()
+            }
+        );
+        assert!(!debug.contains("top-secret"));
+    }
+}
