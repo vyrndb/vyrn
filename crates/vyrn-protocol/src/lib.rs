@@ -678,3 +678,143 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             );
             for (id, document) in documents {
                 put_string(output, &id)?;
+                put_bytes(output, &document)?;
+            }
+        }
+        Message::CollectionSubscribed => output.put_u8(43),
+        Message::DocumentChange {
+            sequence,
+            id,
+            document,
+        } => {
+            output.put_u8(44);
+            output.put_u64(sequence);
+            put_string(output, &id)?;
+            put_optional_bytes(output, document.as_deref())?;
+        }
+        Message::Authenticated => output.put_u8(6),
+        Message::Value { value } => {
+            output.put_u8(7);
+            put_optional_bytes(output, value.as_deref())?;
+        }
+        Message::Values { values } => {
+            output.put_u8(30);
+            output.put_u32(
+                values
+                    .len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many values"))?,
+            );
+            for value in values {
+                put_optional_bytes(output, value.as_deref())?;
+            }
+        }
+        Message::Written => output.put_u8(8),
+        Message::Deleted { existed } => {
+            output.put_u8(9);
+            output.put_u8(u8::from(existed));
+        }
+        Message::Rows { rows } => {
+            output.put_u8(10);
+            output.put_u32(
+                rows.len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many rows"))?,
+            );
+            for (key, value) in rows {
+                put_bytes(output, &key)?;
+                put_bytes(output, &value)?;
+            }
+        }
+        Message::Subscribed => output.put_u8(13),
+        Message::Begun => output.put_u8(18),
+        Message::Committed => output.put_u8(19),
+        Message::RolledBack => output.put_u8(20),
+        Message::IndexCreated => output.put_u8(25),
+        Message::IndexDropped => output.put_u8(26),
+        Message::IndexUpdated => output.put_u8(27),
+        Message::Keys { keys } => {
+            output.put_u8(28);
+            output.put_u32(
+                keys.len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many keys"))?,
+            );
+            for key in keys {
+                put_bytes(output, &key)?;
+            }
+        }
+        Message::Change {
+            sequence,
+            key,
+            value,
+        } => {
+            output.put_u8(14);
+            output.put_u64(sequence);
+            put_bytes(output, &key)?;
+            put_optional_bytes(output, value.as_deref())?;
+        }
+        Message::Error { code, message } => {
+            output.put_u8(11);
+            output.put_u8(error_code(code));
+            put_string(output, &message)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
+    require(input, 11)?;
+    let version = input.get_u16();
+    let request_id = input.get_u64();
+    let kind = input.get_u8();
+    let message = match kind {
+        1 => Message::Authenticate {
+            username: get_string(input, MAX_AUTH_FIELD)?,
+            password: get_string(input, MAX_AUTH_FIELD)?,
+            database: get_string(input, MAX_AUTH_FIELD)?,
+        },
+        2 => Message::Get {
+            key: get_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        3 => Message::Put {
+            key: get_bytes(input, MAX_FRAME_SIZE)?,
+            value: get_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        4 => Message::Delete {
+            key: get_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        5 => Message::Scan {
+            start: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+            end: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+            limit: get_u32(input)?,
+        },
+        6 => Message::Authenticated,
+        7 => Message::Value {
+            value: get_optional_bytes(input, MAX_FRAME_SIZE)?,
+        },
+        8 => Message::Written,
+        9 => Message::Deleted {
+            existed: get_bool(input)?,
+        },
+        10 => {
+            let count = get_u32(input)? as usize;
+            if count > MAX_SCAN_LIMIT as usize {
+                return Err(CodecError::Malformed("too many rows"));
+            }
+            let mut rows = Vec::with_capacity(count);
+            for _ in 0..count {
+                rows.push((
+                    get_bytes(input, MAX_FRAME_SIZE)?,
+                    get_bytes(input, MAX_FRAME_SIZE)?,
+                ));
+            }
+            Message::Rows { rows }
+        }
+        11 => Message::Error {
+            code: decode_error_code(get_u8(input)?)?,
+            message: get_string(input, MAX_ERROR_MESSAGE)?,
+        },
+        12 => Message::Subscribe {
+            prefix: get_bytes(input, MAX_FRAME_SIZE)?,
+        },
