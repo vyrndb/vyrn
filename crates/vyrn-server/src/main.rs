@@ -458,3 +458,163 @@ async fn handle_connection(
             database,
         } if password.len() <= 4096 => {
             let permit = Arc::clone(&state.auth_limit).acquire_owned().await?;
+            let expected_username = state.username.clone();
+            let expected_database = state.database.clone();
+            let password_hash = state.password_hash.clone();
+            task::spawn_blocking(move || {
+                let _permit = permit;
+                let verified = Argon2::default()
+                    .verify_password(password.as_bytes(), &password_hash.password_hash())
+                    .is_ok();
+                verified && username == expected_username && database == expected_database
+            })
+            .await
+            .context("authentication worker failed")?
+        }
+        _ => false,
+    };
+    if !authenticated {
+        send_error(
+            &mut framed,
+            first.request_id,
+            ErrorCode::AuthenticationFailed,
+            "authentication failed",
+        )
+        .await?;
+        return Ok(());
+    }
+    framed
+        .send(Envelope::new(first.request_id, Message::Authenticated))
+        .await?;
+    let mut transaction: Option<ConnectionTransaction> = None;
+
+    let mut connection_error = None;
+    loop {
+        let request_timeout = transaction
+            .as_ref()
+            .map_or(CLIENT_IDLE_TIMEOUT, |transaction| {
+                state
+                    .transaction_timeout
+                    .saturating_sub(transaction.started.elapsed())
+                    .min(CLIENT_IDLE_TIMEOUT)
+            });
+        let request = match next_message(&mut framed, request_timeout).await {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(error) => {
+                connection_error = Some(error);
+                break;
+            }
+        };
+        let request_id = request.request_id;
+        if request.version != PROTOCOL_VERSION {
+            send_error(
+                &mut framed,
+                request_id,
+                ErrorCode::UnsupportedVersion,
+                "unsupported protocol version",
+            )
+            .await?;
+            continue;
+        }
+        let response = match request.message {
+            Message::Subscribe { prefix } if transaction.is_none() => {
+                if prefix.len() > vyrn_core::MAX_KEY_SIZE {
+                    server_error(
+                        ErrorCode::InvalidRequest,
+                        "subscription prefix is too large",
+                    )
+                } else {
+                    framed
+                        .send(Envelope::new(request_id, Message::Subscribed))
+                        .await?;
+                    stream_changes(&mut framed, state.changes.subscribe(), prefix).await?;
+                    return Ok(());
+                }
+            }
+            Message::SubscribeFrom { prefix, cursor } if transaction.is_none() => {
+                if prefix.len() > vyrn_core::MAX_KEY_SIZE {
+                    server_error(
+                        ErrorCode::InvalidRequest,
+                        "subscription prefix is too large",
+                    )
+                } else {
+                    match resolve_cursor(&state, cursor.as_deref()).await {
+                        Ok(start) => {
+                            framed
+                                .send(Envelope::new(request_id, Message::Subscribed))
+                                .await?;
+                            stream_from_cursor(
+                                &mut framed,
+                                &state,
+                                start,
+                                CursorStream::Keys { prefix },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        Err(error) => storage_error_message(error),
+                    }
+                }
+            }
+            Message::SubscribeCollectionFrom { collection, cursor } if transaction.is_none() => {
+                match resolve_cursor(&state, cursor.as_deref()).await {
+                    Ok(start) => {
+                        framed
+                            .send(Envelope::new(request_id, Message::CollectionSubscribed))
+                            .await?;
+                        stream_from_cursor(
+                            &mut framed,
+                            &state,
+                            start,
+                            CursorStream::Collection { collection },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(error) => storage_error_message(error),
+                }
+            }
+            Message::SubscribeCollection { collection } if transaction.is_none() => {
+                match vyrn_core::document::collection_key_prefix(&collection) {
+                    Ok(prefix) => {
+                        framed
+                            .send(Envelope::new(request_id, Message::CollectionSubscribed))
+                            .await?;
+                        stream_document_changes(
+                            &mut framed,
+                            state.changes.subscribe(),
+                            &collection,
+                            prefix,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    Err(error) => storage_error_message(error),
+                }
+            }
+            Message::Begin if transaction.is_none() => {
+                match register_transaction_snapshot(&state).await {
+                    Ok(sequence) => {
+                        transaction = Some(ConnectionTransaction {
+                            sequence,
+                            started: tokio::time::Instant::now(),
+                            read_keys: BTreeMap::new(),
+                            read_ranges: Vec::new(),
+                            index_reads: Vec::new(),
+                            writes: BTreeMap::new(),
+                            index_updates: Vec::new(),
+                        });
+                        Message::Begun
+                    }
+                    Err(message) => server_error(ErrorCode::Storage, &message),
+                }
+            }
+            Message::Commit if transaction.is_some() => {
+                let transaction = transaction.take().unwrap();
+                if transaction.started.elapsed() > state.transaction_timeout {
+                    release_transaction_snapshot(&state, transaction.sequence).await;
+                    server_error(
+                        ErrorCode::Conflict,
+                        "transaction exceeded its lifetime limit",
+                    )
