@@ -298,3 +298,163 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::default());
     let readers = Arc::new(
         (0..args.read_handles)
+            .map(|_| ReadEngine::open(&args.data).map(RwLock::new))
+            .collect::<vyrn_core::Result<Vec<_>>>()?,
+    );
+    let read_queues = start_read_workers(&readers, args.write_queue_capacity);
+    let engine = Arc::new(RwLock::new(engine));
+    let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
+    let (change_sender, _) = broadcast::channel(args.write_queue_capacity);
+    if args.transaction_timeout_seconds == 0
+        || args.mvcc_gc_ms == 0
+        || args.mvcc_gc_checkpoint_versions == 0
+    {
+        bail!("transaction timeout and MVCC GC interval must be greater than zero");
+    }
+    if durability == DurabilityMode::Async {
+        start_async_sync(
+            Arc::clone(&engine),
+            Duration::from_millis(args.async_sync_ms),
+            Arc::clone(&metrics),
+        );
+    }
+    start_mvcc_gc(
+        Arc::clone(&engine),
+        Duration::from_millis(args.mvcc_gc_ms),
+        args.mvcc_gc_checkpoint_versions,
+        Arc::clone(&metrics),
+    );
+    start_write_worker(
+        Arc::clone(&engine),
+        write_receiver,
+        WriteWorkerConfig {
+            maximum_batch: args.write_batch_size,
+            delay: Duration::from_micros(args.write_batch_delay_us),
+            checkpoint_writes: args.checkpoint_writes,
+            readers: Arc::clone(&readers),
+            changes: change_sender.clone(),
+            metrics: Arc::clone(&metrics),
+        },
+    );
+    let state = Arc::new(ServerState {
+        writes: write_sender,
+        username: args.username,
+        password_hash,
+        database: args.database,
+        auth_limit: Arc::new(Semaphore::new(args.max_auth_jobs)),
+        changes: change_sender,
+        read_queues,
+        next_reader: AtomicU64::new(0),
+        engine: Arc::clone(&engine),
+        transaction_timeout: Duration::from_secs(args.transaction_timeout_seconds),
+        metrics: Arc::clone(&metrics),
+    });
+    let admin_metrics = Arc::clone(&metrics);
+    tokio::spawn(async move { serve_admin(admin_listener, admin_metrics).await });
+    metrics.ready.store(true, Ordering::Release);
+    let connection_limit = Arc::new(Semaphore::new(args.max_connections));
+
+    println!(
+        "vyrnd {} listening on {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        args.bind,
+        if tls_acceptor.is_some() {
+            "TLS 1.3"
+        } else {
+            "PLAINTEXT DEVELOPMENT MODE"
+        }
+    );
+
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted.context("failed to accept connection")?;
+                let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+                let state = Arc::clone(&state);
+                let tls_acceptor = tls_acceptor.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_connection(stream, tls_acceptor, state).await {
+                        eprintln!("connection {peer} closed: {error}");
+                    }
+                });
+            }
+            result = shutdown_signal() => {
+                result.context("failed to listen for shutdown signal")?;
+                metrics.ready.store(false, Ordering::Release);
+                println!("vyrnd draining connections");
+                break;
+            }
+        }
+    }
+
+    if metrics.active_connections.load(Ordering::Acquire) != 0 {
+        let _ = timeout(
+            Duration::from_secs(args.shutdown_timeout_seconds),
+            metrics.drained.notified(),
+        )
+        .await;
+    }
+    println!("vyrnd shutdown complete");
+    Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    signal::ctrl_c().await
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    tls_acceptor: Option<TlsAcceptor>,
+    state: Arc<ServerState>,
+) -> Result<()> {
+    state
+        .metrics
+        .active_connections
+        .fetch_add(1, Ordering::Relaxed);
+    let _connection = ConnectionGuard(Arc::clone(&state.metrics));
+    stream.set_nodelay(true)?;
+    let transport: BoxedTransport = if let Some(acceptor) = tls_acceptor {
+        let tls = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+            .await
+            .context("TLS handshake timed out")?
+            .context("TLS handshake failed")?;
+        Box::new(tls)
+    } else {
+        Box::new(stream)
+    };
+    let mut framed = Framed::new(transport, VyrnCodec::default());
+    let Some(first) = next_message(&mut framed, HANDSHAKE_TIMEOUT).await? else {
+        return Ok(());
+    };
+
+    if first.version != PROTOCOL_VERSION {
+        send_error(
+            &mut framed,
+            first.request_id,
+            ErrorCode::UnsupportedVersion,
+            "unsupported protocol version",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let authenticated = match first.message {
+        Message::Authenticate {
+            username,
+            password,
+            database,
+        } if password.len() <= 4096 => {
+            let permit = Arc::clone(&state.auth_limit).acquire_owned().await?;
