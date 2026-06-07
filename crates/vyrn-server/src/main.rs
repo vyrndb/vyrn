@@ -138,3 +138,163 @@ impl Drop for ConnectionGuard {
         if self.0.active_connections.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.0.drained.notify_waiters();
         }
+    }
+}
+
+#[derive(Clone)]
+struct ChangeEvent {
+    sequence: u64,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+    /// Durable position of this change, when it was published to the change log.
+    cursor: Option<change_log::Cursor>,
+}
+
+enum ReadRequest {
+    Get {
+        key: Vec<u8>,
+        response: oneshot::Sender<vyrn_core::Result<Option<Vec<u8>>>>,
+    },
+    MultiGet {
+        keys: Vec<Vec<u8>>,
+        response: oneshot::Sender<vyrn_core::Result<Vec<Option<Vec<u8>>>>>,
+    },
+    Scan {
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+        limit: usize,
+        response: oneshot::Sender<vyrn_core::Result<Rows>>,
+    },
+}
+
+enum WriteRequest {
+    Operation {
+        operation: BatchOperation,
+        response: oneshot::Sender<std::result::Result<BatchResult, String>>,
+    },
+    Document {
+        request: DocumentWrite,
+        response: oneshot::Sender<vyrn_core::Result<Message>>,
+    },
+    CreateIndex {
+        name: Vec<u8>,
+        unique: bool,
+        response: oneshot::Sender<vyrn_core::Result<()>>,
+    },
+    DropIndex {
+        name: Vec<u8>,
+        response: oneshot::Sender<vyrn_core::Result<()>>,
+    },
+    Transaction {
+        snapshot_sequence: u64,
+        read_keys: Vec<Vec<u8>>,
+        read_ranges: Vec<ReadRange>,
+        index_reads: Vec<(Vec<u8>, Vec<u8>)>,
+        operations: Vec<BatchOperation>,
+        index_updates: Vec<IndexUpdate>,
+        response: oneshot::Sender<std::result::Result<Vec<BatchResult>, String>>,
+    },
+}
+
+struct WriteWorkerConfig {
+    maximum_batch: usize,
+    delay: Duration,
+    checkpoint_writes: u64,
+    readers: Arc<Vec<RwLock<ReadEngine>>>,
+    changes: broadcast::Sender<ChangeEvent>,
+    metrics: Arc<Metrics>,
+}
+
+enum DocumentWrite {
+    CreateCollection {
+        collection: String,
+        indexes: Vec<IndexDefinition>,
+    },
+    Put {
+        collection: String,
+        id: String,
+        document: Vec<u8>,
+    },
+    Delete {
+        collection: String,
+        id: String,
+    },
+}
+
+struct ConnectionTransaction {
+    sequence: u64,
+    started: tokio::time::Instant,
+    read_keys: BTreeMap<Vec<u8>, ()>,
+    read_ranges: Vec<ReadRange>,
+    index_reads: Vec<(Vec<u8>, Vec<u8>)>,
+    writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    index_updates: Vec<IndexUpdate>,
+}
+
+struct ServerState {
+    writes: mpsc::Sender<WriteRequest>,
+    username: String,
+    password_hash: PasswordHashString,
+    database: String,
+    auth_limit: Arc<Semaphore>,
+    changes: broadcast::Sender<ChangeEvent>,
+    read_queues: Vec<std::sync::mpsc::SyncSender<ReadRequest>>,
+    next_reader: AtomicU64,
+    engine: Arc<RwLock<Engine>>,
+    transaction_timeout: Duration,
+    metrics: Arc<Metrics>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    if args.username.is_empty() || args.database.is_empty() {
+        bail!("username and database must not be empty");
+    }
+    if args.max_connections == 0
+        || args.max_auth_jobs == 0
+        || args.checkpoint_writes == 0
+        || args.write_batch_size == 0
+        || args.write_queue_capacity == 0
+        || args.read_handles == 0
+    {
+        bail!("connection, authentication, checkpoint, and write queue limits must be greater than zero");
+    }
+    if args.allow_plaintext && args.tls_cert_file.is_some() {
+        bail!("choose TLS or plaintext; one listener cannot serve both");
+    }
+    if !args.allow_plaintext && args.tls_cert_file.is_none() {
+        bail!("TLS certificate and key are required unless --allow-plaintext is explicit");
+    }
+
+    let password_hash = load_password_hash(&args.password_hash_file)?;
+    let tls_acceptor = match (&args.tls_cert_file, &args.tls_key_file) {
+        (Some(certificate), Some(key)) => Some(load_tls(certificate, key)?),
+        (None, None) => None,
+        _ => unreachable!("clap validates paired TLS arguments"),
+    };
+    let durability = match args.durability.as_str() {
+        "durable" => DurabilityMode::Durable,
+        "async" => DurabilityMode::Async,
+        _ => bail!("VYRN_DURABILITY must be durable or async"),
+    };
+    if durability == DurabilityMode::Async && args.async_sync_ms == 0 {
+        bail!("VYRN_ASYNC_SYNC_MS must be greater than zero in async mode");
+    }
+    let engine = Engine::open_with_options(
+        &args.data,
+        EngineOptions {
+            durability,
+            ..EngineOptions::default()
+        },
+    )
+    .context("failed to open Vyrn data directory")?;
+    let listener = TcpListener::bind(&args.bind)
+        .await
+        .with_context(|| format!("failed to bind {}", args.bind))?;
+    let admin_listener = TcpListener::bind(&args.admin_bind)
+        .await
+        .with_context(|| format!("failed to bind admin endpoint {}", args.admin_bind))?;
+    let metrics = Arc::new(Metrics::default());
+    let readers = Arc::new(
+        (0..args.read_handles)
