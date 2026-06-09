@@ -778,3 +778,163 @@ async fn resolve_cursor(
             .map_err(|_| StorageError::Poisoned)?
         }
     }
+}
+
+/// Streams the durable backlog from `start`, then live changes, without gaps.
+///
+/// The live broadcast is subscribed to before the backlog is read, so changes
+/// committed during replay are buffered instead of lost. Records already
+/// replayed are then dropped by cursor, so nothing is delivered twice.
+async fn stream_from_cursor(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    state: &ServerState,
+    start: change_log::Cursor,
+    stream: CursorStream,
+) -> Result<()> {
+    let mut live = state.changes.subscribe();
+    let mut cursor = start;
+
+    loop {
+        let engine = Arc::clone(&state.engine);
+        let from = cursor;
+        let batch = task::spawn_blocking(move || {
+            engine
+                .read()
+                .map_err(|_| StorageError::Poisoned)?
+                .read_changes(from, CHANGE_REPLAY_BATCH)
+        })
+        .await;
+        let batch = match batch {
+            Ok(Ok(batch)) => batch,
+            Ok(Err(error)) => {
+                send_error(framed, 0, cursor_error_code(&error), &error.to_string()).await?;
+                return Ok(());
+            }
+            Err(_) => {
+                send_error(framed, 0, ErrorCode::Storage, "change log read failed").await?;
+                return Ok(());
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for record in &batch {
+            if let Some(message) = cursor_message(&stream, record) {
+                framed.send(Envelope::new(0, message)).await?;
+            }
+        }
+        cursor = batch.last().unwrap().cursor();
+    }
+    framed
+        .send(Envelope::new(
+            0,
+            Message::Caught {
+                cursor: cursor.to_token(),
+            },
+        ))
+        .await?;
+
+    loop {
+        match live.recv().await {
+            Ok(change) => {
+                // Skip anything the backlog replay already delivered.
+                if change.cursor.is_some_and(|position| position <= cursor) {
+                    continue;
+                }
+                if let Some(position) = change.cursor {
+                    cursor = position;
+                }
+                let record = change_log::ChangeRecord {
+                    sequence: change.sequence,
+                    index: change.cursor.map_or(0, |position| position.index),
+                    document: vyrn_core::document::change_target(&change.key),
+                    key: change.key,
+                    value: change.value,
+                };
+                if let Some(message) = cursor_message(&stream, &record) {
+                    framed.send(Envelope::new(0, message)).await?;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                // The durable log still holds these changes, so resume from the
+                // last delivered cursor instead of dropping the subscription.
+                send_error(
+                    framed,
+                    0,
+                    ErrorCode::Storage,
+                    &format!(
+                        "subscription lagged; resume from cursor {}",
+                        cursor.to_token()
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+fn cursor_message(stream: &CursorStream, record: &change_log::ChangeRecord) -> Option<Message> {
+    match stream {
+        CursorStream::Keys { prefix } => {
+            // Document keys are internal encodings; they belong to collection
+            // subscriptions, not raw key-prefix subscriptions.
+            if record.document.is_some() || !record.key.starts_with(prefix) {
+                return None;
+            }
+            Some(Message::CursorChange {
+                cursor: record.cursor().to_token(),
+                key: record.key.clone(),
+                value: record.value.clone(),
+            })
+        }
+        CursorStream::Collection { collection } => {
+            let target = record.document.as_ref()?;
+            if &target.collection != collection {
+                return None;
+            }
+            Some(Message::CursorDocumentChange {
+                cursor: record.cursor().to_token(),
+                collection: target.collection.clone(),
+                id: target.id.clone(),
+                document: record.value.clone(),
+            })
+        }
+    }
+}
+
+fn cursor_error_code(error: &StorageError) -> ErrorCode {
+    match error {
+        StorageError::CursorTooOld { .. } | StorageError::InvalidCursor(_) => {
+            ErrorCode::InvalidRequest
+        }
+        _ => ErrorCode::Storage,
+    }
+}
+
+async fn execute(state: Arc<ServerState>, request: Message) -> Message {
+    state.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+    match request {
+        Message::Put { key, value } => {
+            state.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            submit_write(&state, BatchOperation::Put(key, value)).await
+        }
+        Message::Delete { key } => {
+            state.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            submit_write(&state, BatchOperation::Delete(key)).await
+        }
+        Message::Get { key } => {
+            state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+            submit_get(&state, key).await
+        }
+        Message::MultiGet { keys } => {
+            state
+                .metrics
+                .reads
+                .fetch_add(keys.len() as u64, Ordering::Relaxed);
+            if keys.is_empty() || keys.len() > MAX_SCAN_LIMIT as usize {
+                return server_error(
+                    ErrorCode::InvalidRequest,
+                    "multi-get key count is out of range",
+                );
