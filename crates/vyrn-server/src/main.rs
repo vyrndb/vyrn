@@ -1258,3 +1258,163 @@ async fn submit_drop_index(state: &Arc<ServerState>, name: Vec<u8>) -> Message {
 
 fn encode_document(
     value: &serde_json::Map<String, serde_json::Value>,
+) -> vyrn_core::Result<Vec<u8>> {
+    serde_json::to_vec(value).map_err(|error| {
+        StorageError::InvalidDocument(format!("document encoding failed: {error}"))
+    })
+}
+
+fn encode_documents(documents: Vec<vyrn_core::document::Document>) -> vyrn_core::Result<Message> {
+    Ok(Message::Documents {
+        documents: documents
+            .into_iter()
+            .map(|document| Ok((document.id, encode_document(&document.value)?)))
+            .collect::<vyrn_core::Result<Vec<_>>>()?,
+    })
+}
+
+async fn submit_document(state: &Arc<ServerState>, request: DocumentWrite) -> Message {
+    let (sender, receiver) = oneshot::channel();
+    if state
+        .writes
+        .send(WriteRequest::Document {
+            request,
+            response: sender,
+        })
+        .await
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage writer is unavailable");
+    }
+    match receiver.await {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
+    }
+}
+
+async fn submit_write(state: &Arc<ServerState>, operation: BatchOperation) -> Message {
+    let (sender, receiver) = oneshot::channel();
+    if state
+        .writes
+        .send(WriteRequest::Operation {
+            operation,
+            response: sender,
+        })
+        .await
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage writer is unavailable");
+    }
+    match receiver.await {
+        Ok(Ok(BatchResult::Put)) => Message::Written,
+        Ok(Ok(BatchResult::Delete { existed })) => Message::Deleted { existed },
+        Ok(Err(message)) => server_error(ErrorCode::Storage, &message),
+        Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
+    }
+}
+
+async fn execute_transaction(
+    engine: &Arc<RwLock<Engine>>,
+    transaction: &mut ConnectionTransaction,
+    request: Message,
+) -> Message {
+    match request {
+        Message::Get { key } => {
+            transaction.read_keys.insert(key.clone(), ());
+            if let Some(value) = transaction.writes.get(&key) {
+                return Message::Value {
+                    value: value.clone(),
+                };
+            }
+            let revision = transaction.sequence;
+            execute_engine_shared(engine, move |engine| {
+                Ok(Message::Value {
+                    value: engine.get_at(&key, revision)?,
+                })
+            })
+            .await
+        }
+        Message::Put { key, value } => {
+            transaction.writes.insert(key, Some(value));
+            Message::Written
+        }
+        Message::Delete { key } => {
+            let existed = if let Some(value) = transaction.writes.get(&key) {
+                value.is_some()
+            } else {
+                let revision = transaction.sequence;
+                let lookup_key = key.clone();
+                match execute_engine_shared(engine, move |engine| {
+                    Ok(Message::Value {
+                        value: engine.get_at(&lookup_key, revision)?,
+                    })
+                })
+                .await
+                {
+                    Message::Value { value } => value.is_some(),
+                    error => return error,
+                }
+            };
+            transaction.writes.insert(key, None);
+            Message::Deleted { existed }
+        }
+        Message::IndexUpdate {
+            index,
+            primary_key,
+            old_value,
+            new_value,
+        } => {
+            transaction.index_updates.push(IndexUpdate {
+                index,
+                primary_key,
+                old_value,
+                new_value,
+            });
+            Message::IndexUpdated
+        }
+        Message::IndexLookup {
+            index,
+            value,
+            limit,
+        } => {
+            if limit == 0 || limit > MAX_SCAN_LIMIT {
+                return server_error(ErrorCode::InvalidRequest, "index limit is out of range");
+            }
+            transaction.index_reads.push((index.clone(), value.clone()));
+            let revision = transaction.sequence;
+            let fetch_limit = limit as usize + transaction.index_updates.len();
+            let lookup_index = index.clone();
+            let lookup_value = value.clone();
+            let keys = match execute_engine_shared(engine, move |engine| {
+                Ok(Message::Keys {
+                    keys: engine.lookup_index_at(
+                        &lookup_index,
+                        &lookup_value,
+                        fetch_limit,
+                        revision,
+                    )?,
+                })
+            })
+            .await
+            {
+                Message::Keys { keys } => keys,
+                error => return error,
+            };
+            let mut keys: BTreeMap<_, _> = keys.into_iter().map(|key| (key, ())).collect();
+            for update in &transaction.index_updates {
+                if update.index != index || update.old_value == update.new_value {
+                    continue;
+                }
+                if update.old_value.as_ref() == Some(&value) {
+                    keys.remove(&update.primary_key);
+                }
+                if update.new_value.as_ref() == Some(&value) {
+                    keys.insert(update.primary_key.clone(), ());
+                }
+            }
+            Message::Keys {
+                keys: keys.into_keys().take(limit as usize).collect(),
+            }
+        }
+        Message::Scan { start, end, limit } => {
