@@ -1098,3 +1098,163 @@ fn start_read_workers(
                             } => {
                                 let _ = response.send(reader.scan(
                                     start.as_deref(),
+                                    end.as_deref(),
+                                    limit,
+                                ));
+                            }
+                        }
+                    }
+                })
+                .expect("failed to start storage reader");
+            sender
+        })
+        .collect()
+}
+
+async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
+    let (response, receiver) = oneshot::channel();
+    let index =
+        state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len();
+    if state.read_queues[index]
+        .try_send(ReadRequest::Get { key, response })
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    }
+    match receiver.await {
+        Ok(Ok(value)) => Message::Value { value },
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
+    }
+}
+
+async fn submit_multi_get(state: &ServerState, keys: Vec<Vec<u8>>) -> Message {
+    let (response, receiver) = oneshot::channel();
+    let index =
+        state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len();
+    if state.read_queues[index]
+        .try_send(ReadRequest::MultiGet { keys, response })
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    }
+    match receiver.await {
+        Ok(Ok(values)) => Message::Values { values },
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
+    }
+}
+
+async fn submit_scan(
+    state: &ServerState,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+    limit: usize,
+) -> Message {
+    let (response, receiver) = oneshot::channel();
+    let index =
+        state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len();
+    if state.read_queues[index]
+        .try_send(ReadRequest::Scan {
+            start,
+            end,
+            limit,
+            response,
+        })
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    }
+    match receiver.await {
+        Ok(Ok(rows)) => Message::Rows { rows },
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
+    }
+}
+
+async fn execute_engine<F>(state: &ServerState, operation: F) -> Message
+where
+    F: FnOnce(&Engine) -> vyrn_core::Result<Message> + Send + 'static,
+{
+    execute_engine_shared(&state.engine, operation).await
+}
+
+async fn execute_engine_shared<F>(engine: &Arc<RwLock<Engine>>, operation: F) -> Message
+where
+    F: FnOnce(&Engine) -> vyrn_core::Result<Message> + Send + 'static,
+{
+    let engine = Arc::clone(engine);
+    match task::spawn_blocking(move || {
+        let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
+        operation(&engine)
+    })
+    .await
+    {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage operation task failed"),
+    }
+}
+
+fn storage_error_message(error: StorageError) -> Message {
+    match error {
+        StorageError::Conflict | StorageError::UniqueViolation { .. } => {
+            server_error(ErrorCode::Conflict, &error.to_string())
+        }
+        StorageError::EmptyKey
+        | StorageError::ReservedKey
+        | StorageError::KeyTooLarge
+        | StorageError::ValueTooLarge
+        | StorageError::InvalidRange
+        | StorageError::SnapshotTooOld { .. }
+        | StorageError::IndexExists
+        | StorageError::IndexNotFound => {
+            server_error(ErrorCode::InvalidRequest, &error.to_string())
+        }
+        _ => server_error(ErrorCode::Storage, &error.to_string()),
+    }
+}
+
+async fn submit_create_index(state: &Arc<ServerState>, name: Vec<u8>, unique: bool) -> Message {
+    let (sender, receiver) = oneshot::channel();
+    if state
+        .writes
+        .send(WriteRequest::CreateIndex {
+            name,
+            unique,
+            response: sender,
+        })
+        .await
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage writer is unavailable");
+    }
+    match receiver.await {
+        Ok(Ok(())) => Message::IndexCreated,
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
+    }
+}
+
+async fn submit_drop_index(state: &Arc<ServerState>, name: Vec<u8>) -> Message {
+    let (sender, receiver) = oneshot::channel();
+    if state
+        .writes
+        .send(WriteRequest::DropIndex {
+            name,
+            response: sender,
+        })
+        .await
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage writer is unavailable");
+    }
+    match receiver.await {
+        Ok(Ok(())) => Message::IndexDropped,
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
+    }
+}
+
+fn encode_document(
+    value: &serde_json::Map<String, serde_json::Value>,
