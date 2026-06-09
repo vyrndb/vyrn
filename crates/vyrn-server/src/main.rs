@@ -938,3 +938,163 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
                     ErrorCode::InvalidRequest,
                     "multi-get key count is out of range",
                 );
+            }
+            submit_multi_get(&state, keys).await
+        }
+        Message::CreateCollection {
+            collection,
+            indexes,
+        } => {
+            if indexes.len() > MAX_DOCUMENT_INDEXES {
+                return server_error(ErrorCode::InvalidRequest, "too many document indexes");
+            }
+            state.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            submit_document(
+                &state,
+                DocumentWrite::CreateCollection {
+                    collection,
+                    indexes: indexes
+                        .into_iter()
+                        .map(|index| IndexDefinition::new(index.field, index.unique))
+                        .collect(),
+                },
+            )
+            .await
+        }
+        Message::PutDocument {
+            collection,
+            id,
+            document,
+        } => {
+            state.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            submit_document(
+                &state,
+                DocumentWrite::Put {
+                    collection,
+                    id,
+                    document,
+                },
+            )
+            .await
+        }
+        Message::DeleteDocument { collection, id } => {
+            state.metrics.writes.fetch_add(1, Ordering::Relaxed);
+            submit_document(&state, DocumentWrite::Delete { collection, id }).await
+        }
+        Message::GetDocument { collection, id } => {
+            state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+            execute_engine(&state, move |engine| {
+                Ok(Message::DocumentValue {
+                    document: engine
+                        .open_collection(collection)?
+                        .get(&id)?
+                        .map(|document| encode_document(&document.value))
+                        .transpose()?,
+                })
+            })
+            .await
+        }
+        Message::ListDocuments { collection, limit } => {
+            if limit == 0 || limit > MAX_SCAN_LIMIT {
+                return server_error(ErrorCode::InvalidRequest, "document limit is out of range");
+            }
+            state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+            execute_engine(&state, move |engine| {
+                encode_documents(engine.open_collection(collection)?.all(limit as usize)?)
+            })
+            .await
+        }
+        Message::QueryDocuments {
+            collection,
+            field,
+            value,
+            limit,
+        } => {
+            if limit == 0 || limit > MAX_SCAN_LIMIT {
+                return server_error(ErrorCode::InvalidRequest, "document limit is out of range");
+            }
+            state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&value) else {
+                return server_error(
+                    ErrorCode::InvalidRequest,
+                    "document query value is not valid JSON",
+                );
+            };
+            execute_engine(&state, move |engine| {
+                encode_documents(engine.open_collection(collection)?.find(
+                    &field,
+                    &value,
+                    limit as usize,
+                )?)
+            })
+            .await
+        }
+        Message::CreateIndex { name, unique } => submit_create_index(&state, name, unique).await,
+        Message::DropIndex { name } => submit_drop_index(&state, name).await,
+        Message::IndexLookup {
+            index,
+            value,
+            limit,
+        } => {
+            if limit == 0 || limit > MAX_SCAN_LIMIT {
+                return server_error(ErrorCode::InvalidRequest, "index limit is out of range");
+            }
+            execute_engine(&state, move |engine| {
+                Ok(Message::Keys {
+                    keys: engine.lookup_index(&index, &value, limit as usize)?,
+                })
+            })
+            .await
+        }
+        Message::Scan { start, end, limit } => {
+            state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+            if limit == 0 || limit > MAX_SCAN_LIMIT {
+                return server_error(ErrorCode::InvalidRequest, "scan limit is out of range");
+            }
+            if start
+                .as_deref()
+                .zip(end.as_deref())
+                .is_some_and(|(start, end)| start > end)
+            {
+                return server_error(ErrorCode::InvalidRequest, "scan start must not exceed end");
+            }
+            submit_scan(&state, start, end, limit as usize).await
+        }
+        _ => server_error(ErrorCode::InvalidRequest, "message is not a valid request"),
+    }
+}
+
+fn start_read_workers(
+    readers: &Arc<Vec<RwLock<ReadEngine>>>,
+    capacity: usize,
+) -> Vec<std::sync::mpsc::SyncSender<ReadRequest>> {
+    readers
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+            let readers = Arc::clone(readers);
+            thread::Builder::new()
+                .name(format!("vyrn-reader-{index}"))
+                .spawn(move || {
+                    while let Ok(request) = receiver.recv() {
+                        let reader = match readers[index].read() {
+                            Ok(reader) => reader,
+                            Err(_) => break,
+                        };
+                        match request {
+                            ReadRequest::Get { key, response } => {
+                                let _ = response.send(reader.get(&key));
+                            }
+                            ReadRequest::MultiGet { keys, response } => {
+                                let result = keys.into_iter().map(|key| reader.get(&key)).collect();
+                                let _ = response.send(result);
+                            }
+                            ReadRequest::Scan {
+                                start,
+                                end,
+                                limit,
+                                response,
+                            } => {
+                                let _ = response.send(reader.scan(
+                                    start.as_deref(),
