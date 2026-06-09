@@ -618,3 +618,163 @@ async fn handle_connection(
                         ErrorCode::Conflict,
                         "transaction exceeded its lifetime limit",
                     )
+                } else {
+                    commit_transaction(&state, transaction).await
+                }
+            }
+            Message::Rollback if transaction.is_some() => {
+                let transaction = transaction.take().unwrap();
+                release_transaction_snapshot(&state, transaction.sequence).await;
+                Message::RolledBack
+            }
+            Message::Begin
+            | Message::Commit
+            | Message::Rollback
+            | Message::Subscribe { .. }
+            | Message::SubscribeCollection { .. } => {
+                server_error(ErrorCode::InvalidRequest, "invalid transaction state")
+            }
+            message => {
+                if let Some(transaction) = transaction.as_mut() {
+                    execute_transaction(&state.engine, transaction, message).await
+                } else {
+                    execute(Arc::clone(&state), message).await
+                }
+            }
+        };
+        framed.send(Envelope::new(request_id, response)).await?;
+    }
+    if let Some(transaction) = transaction {
+        release_transaction_snapshot(&state, transaction.sequence).await;
+    }
+    match connection_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn register_transaction_snapshot(state: &ServerState) -> std::result::Result<u64, String> {
+    let engine = Arc::clone(&state.engine);
+    task::spawn_blocking(move || {
+        let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+        Ok::<_, StorageError>(engine.register_snapshot())
+    })
+    .await
+    .map_err(|_| "snapshot registration task failed".to_owned())?
+    .map_err(|error| error.to_string())
+}
+
+async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
+    let engine = Arc::clone(&state.engine);
+    let _ = task::spawn_blocking(move || {
+        if let Ok(mut engine) = engine.write() {
+            engine.release_snapshot(sequence);
+            engine.collect_versions();
+        }
+    })
+    .await;
+}
+
+async fn stream_changes(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    mut receiver: broadcast::Receiver<ChangeEvent>,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    loop {
+        match receiver.recv().await {
+            Ok(change) if change.key.starts_with(&prefix) => {
+                framed
+                    .send(Envelope::new(
+                        0,
+                        Message::Change {
+                            sequence: change.sequence,
+                            key: change.key,
+                            value: change.value,
+                        },
+                    ))
+                    .await?;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                send_error(
+                    framed,
+                    0,
+                    ErrorCode::Storage,
+                    "subscription lagged; reconnect and resynchronize",
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+async fn stream_document_changes(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    mut receiver: broadcast::Receiver<ChangeEvent>,
+    collection: &str,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    loop {
+        match receiver.recv().await {
+            Ok(change) if change.key.starts_with(&prefix) => {
+                let Ok(id) = vyrn_core::document::document_id_from_key(collection, &change.key)
+                else {
+                    continue;
+                };
+                framed
+                    .send(Envelope::new(
+                        0,
+                        Message::DocumentChange {
+                            sequence: change.sequence,
+                            id,
+                            document: change.value,
+                        },
+                    ))
+                    .await?;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                send_error(
+                    framed,
+                    0,
+                    ErrorCode::Storage,
+                    "subscription lagged; reconnect and resynchronize",
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+enum CursorStream {
+    Keys { prefix: Vec<u8> },
+    Collection { collection: String },
+}
+
+/// Resolves a client cursor token into a starting position.
+///
+/// `None` means "live changes only" and resolves to the newest cursor, so a
+/// fresh subscriber does not replay history it never asked for.
+async fn resolve_cursor(
+    state: &ServerState,
+    cursor: Option<&str>,
+) -> vyrn_core::Result<change_log::Cursor> {
+    match cursor {
+        Some("") => Ok(change_log::Cursor::start()),
+        Some(token) => change_log::Cursor::parse_token(token),
+        None => {
+            let engine = Arc::clone(&state.engine);
+            task::spawn_blocking(move || {
+                engine
+                    .read()
+                    .map_err(|_| StorageError::Poisoned)?
+                    .latest_cursor()
+            })
+            .await
+            .map_err(|_| StorageError::Poisoned)?
+        }
+    }
