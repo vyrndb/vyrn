@@ -1418,3 +1418,163 @@ async fn execute_transaction(
             }
         }
         Message::Scan { start, end, limit } => {
+            if limit == 0 || limit > MAX_SCAN_LIMIT {
+                return server_error(ErrorCode::InvalidRequest, "scan limit is out of range");
+            }
+            if start
+                .as_deref()
+                .zip(end.as_deref())
+                .is_some_and(|(start, end)| start > end)
+            {
+                return server_error(ErrorCode::InvalidRequest, "scan start must not exceed end");
+            }
+            transaction.read_ranges.push((start.clone(), end.clone()));
+            let revision = transaction.sequence;
+            let fetch_limit = limit as usize + transaction.writes.len();
+            let scan_start = start.clone();
+            let scan_end = end.clone();
+            let rows = match execute_engine_shared(engine, move |engine| {
+                Ok(Message::Rows {
+                    rows: engine.scan_at(
+                        scan_start.as_deref(),
+                        scan_end.as_deref(),
+                        fetch_limit,
+                        revision,
+                    )?,
+                })
+            })
+            .await
+            {
+                Message::Rows { rows } => rows,
+                error => return error,
+            };
+            let mut view: BTreeMap<_, _> = rows.into_iter().collect();
+            for (key, value) in &transaction.writes {
+                if start.as_ref().is_some_and(|start| key < start)
+                    || end.as_ref().is_some_and(|end| key >= end)
+                {
+                    continue;
+                }
+                if let Some(value) = value {
+                    view.insert(key.clone(), value.clone());
+                } else {
+                    view.remove(key);
+                }
+            }
+            Message::Rows {
+                rows: view.into_iter().take(limit as usize).collect(),
+            }
+        }
+        _ => server_error(
+            ErrorCode::InvalidRequest,
+            "message is not valid in a transaction",
+        ),
+    }
+}
+
+async fn commit_transaction(
+    state: &Arc<ServerState>,
+    transaction: ConnectionTransaction,
+) -> Message {
+    let snapshot_sequence = transaction.sequence;
+    if transaction.writes.is_empty() && transaction.index_updates.is_empty() {
+        release_transaction_snapshot(state, snapshot_sequence).await;
+        return Message::Committed;
+    }
+    let operations = transaction
+        .writes
+        .into_iter()
+        .map(|(key, value)| match value {
+            Some(value) => BatchOperation::Put(key, value),
+            None => BatchOperation::Delete(key),
+        })
+        .collect();
+    let (sender, receiver) = oneshot::channel();
+    if state
+        .writes
+        .send(WriteRequest::Transaction {
+            snapshot_sequence: transaction.sequence,
+            read_keys: transaction.read_keys.into_keys().collect(),
+            read_ranges: transaction.read_ranges,
+            index_reads: transaction.index_reads,
+            operations,
+            index_updates: transaction.index_updates,
+            response: sender,
+        })
+        .await
+        .is_err()
+    {
+        release_transaction_snapshot(state, snapshot_sequence).await;
+        return server_error(ErrorCode::Storage, "storage writer is unavailable");
+    }
+    let response = match receiver.await {
+        Ok(Ok(_)) => Message::Committed,
+        Ok(Err(message)) if message == StorageError::Conflict.to_string() => {
+            server_error(ErrorCode::Conflict, &message)
+        }
+        Ok(Err(message)) => server_error(ErrorCode::Storage, &message),
+        Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
+    };
+    release_transaction_snapshot(state, snapshot_sequence).await;
+    response
+}
+
+fn start_mvcc_gc(
+    engine: Arc<RwLock<Engine>>,
+    interval: Duration,
+    checkpoint_versions: usize,
+    metrics: Arc<Metrics>,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+            let engine = Arc::clone(&engine);
+            let result = task::spawn_blocking(move || {
+                engine
+                    .write()
+                    .map_err(|_| StorageError::Poisoned)
+                    .and_then(|mut engine| {
+                        let collected = engine.collect_versions();
+                        if collected >= checkpoint_versions {
+                            engine.checkpoint()?;
+                        }
+                        Ok(collected)
+                    })
+            })
+            .await;
+            if let Ok(Ok(collected)) = result {
+                metrics.mvcc_gc_runs.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .mvcc_versions_collected
+                    .fetch_add(collected as u64, Ordering::Relaxed);
+            } else {
+                metrics.storage_failed.store(true, Ordering::Release);
+                metrics.ready.store(false, Ordering::Release);
+                return;
+            }
+        }
+    });
+}
+
+fn start_async_sync(engine: Arc<RwLock<Engine>>, interval: Duration, metrics: Arc<Metrics>) {
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+            let engine = Arc::clone(&engine);
+            let result = task::spawn_blocking(move || {
+                engine.write().map_err(|_| StorageError::Poisoned)?.sync()
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                metrics.storage_failed.store(true, Ordering::Release);
+                metrics.ready.store(false, Ordering::Release);
+                return;
+            }
+        }
+    });
+}
+
+fn start_write_worker(
+    engine: Arc<RwLock<Engine>>,
+    mut receiver: mpsc::Receiver<WriteRequest>,
+    config: WriteWorkerConfig,
