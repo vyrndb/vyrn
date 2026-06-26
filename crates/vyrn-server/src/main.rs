@@ -1738,3 +1738,163 @@ fn start_write_worker(
                 Some(WriteRequest::Transaction { index_updates, .. }) => index_updates.clone(),
                 _ => Vec::new(),
             };
+            if let Some(snapshot_sequence) = snapshot_sequence {
+                let conflict_engine = Arc::clone(&engine);
+                let conflict_operations = operations.clone();
+                let conflict_index_updates = index_updates.clone();
+                let conflict = task::spawn_blocking(move || {
+                    let engine = conflict_engine.read().map_err(|_| StorageError::Poisoned)?;
+                    has_conflict(
+                        &engine,
+                        snapshot_sequence,
+                        &read_keys,
+                        &read_ranges,
+                        &index_reads,
+                        &conflict_operations,
+                        &conflict_index_updates,
+                    )
+                })
+                .await;
+                match conflict {
+                    Ok(Ok(true)) => {
+                        respond_writes(requests, Err(StorageError::Conflict.to_string()));
+                        continue;
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(error)) => {
+                        record_storage_error(&config.metrics, &error);
+                        respond_writes(requests, Err(error.to_string()));
+                        continue;
+                    }
+                    Err(_) => {
+                        config.metrics.storage_failed.store(true, Ordering::Release);
+                        config.metrics.ready.store(false, Ordering::Release);
+                        respond_writes(requests, Err("conflict check task failed".into()));
+                        continue;
+                    }
+                }
+            }
+            let operation_count = operations.len() as u64;
+            config.metrics.write_batches.fetch_add(1, Ordering::Relaxed);
+            config
+                .metrics
+                .batched_writes
+                .fetch_add(operation_count, Ordering::Relaxed);
+            let should_checkpoint =
+                writes_since_checkpoint + operation_count >= config.checkpoint_writes;
+            let commit_operations = operations.clone();
+            let commit_index_updates = index_updates.clone();
+            let engine = Arc::clone(&engine);
+            let result = task::spawn_blocking(move || {
+                let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+                // Read the change log position before committing so the records
+                // this batch publishes can be read back with their real cursors.
+                let before = engine.latest_published_cursor()?;
+                let results = if commit_index_updates.is_empty() {
+                    engine.write_batch(commit_operations)?
+                } else {
+                    engine.write_indexed(commit_operations, commit_index_updates)?
+                };
+                let published = engine.read_changes(before, CHANGE_REPLAY_BATCH)?;
+                if should_checkpoint {
+                    engine.checkpoint()?;
+                }
+                let (generation, root, len) = engine.committed_root();
+                Ok::<_, StorageError>((
+                    results,
+                    should_checkpoint,
+                    engine.sequence(),
+                    generation,
+                    root,
+                    len,
+                    published,
+                ))
+            })
+            .await;
+            match result {
+                Ok(Ok((results, checkpointed, sequence, generation, root, len, published))) => {
+                    for reader in config.readers.iter() {
+                        match reader.write() {
+                            Ok(mut reader) => {
+                                if let Err(error) = reader.refresh(generation, root, len) {
+                                    record_storage_error(&config.metrics, &error);
+                                    respond_writes(requests, Err(error.to_string()));
+                                    return;
+                                }
+                            }
+                            Err(_) => {
+                                config.metrics.storage_failed.store(true, Ordering::Release);
+                                config.metrics.ready.store(false, Ordering::Release);
+                                respond_writes(
+                                    requests,
+                                    Err("storage reader lock poisoned".into()),
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    writes_since_checkpoint = if checkpointed {
+                        config.metrics.checkpoints.fetch_add(1, Ordering::Relaxed);
+                        0
+                    } else {
+                        writes_since_checkpoint + operation_count
+                    };
+                    // Broadcast the records the commit actually published, so a
+                    // live cursor always matches a durable one.
+                    for record in published {
+                        let _ = config.changes.send(ChangeEvent {
+                            sequence: record.sequence,
+                            key: record.key,
+                            value: record.value,
+                            cursor: Some(change_log::Cursor::new(record.sequence, record.index)),
+                        });
+                    }
+                    let _ = sequence;
+                    respond_writes(requests, Ok(results));
+                }
+                Ok(Err(error)) => {
+                    record_storage_error(&config.metrics, &error);
+                    respond_writes(requests, Err(error.to_string()));
+                }
+                Err(_) => {
+                    config.metrics.storage_failed.store(true, Ordering::Release);
+                    config.metrics.ready.store(false, Ordering::Release);
+                    respond_writes(requests, Err("storage writer task failed".into()));
+                }
+            }
+        }
+    });
+}
+
+type DocumentChangeEvent = (Vec<u8>, Option<Vec<u8>>);
+
+fn apply_document_write(
+    engine: &mut Engine,
+    request: DocumentWrite,
+) -> vyrn_core::Result<(Message, Option<DocumentChangeEvent>)> {
+    match request {
+        DocumentWrite::CreateCollection {
+            collection,
+            indexes,
+        } => {
+            engine.collection(collection, &indexes)?;
+            Ok((Message::CollectionCreated, None))
+        }
+        DocumentWrite::Put {
+            collection,
+            id,
+            document,
+        } => {
+            let value: serde_json::Value = serde_json::from_slice(&document).map_err(|error| {
+                StorageError::InvalidDocument(format!("document is not valid JSON: {error}"))
+            })?;
+            let indexes = document_indexes(engine, &collection)?;
+            let mut handle = engine.collection(collection.clone(), &indexes)?;
+            handle.put(&id, &value)?;
+            let key = vyrn_core::document::document_change_key(&collection, &id)?;
+            Ok((Message::DocumentWritten, Some((key, Some(document)))))
+        }
+        DocumentWrite::Delete { collection, id } => {
+            let indexes = document_indexes(engine, &collection)?;
+            let mut handle = engine.collection(collection.clone(), &indexes)?;
+            let existed = handle.delete(&id)?;
