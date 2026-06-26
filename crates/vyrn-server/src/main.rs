@@ -1898,3 +1898,163 @@ fn apply_document_write(
             let indexes = document_indexes(engine, &collection)?;
             let mut handle = engine.collection(collection.clone(), &indexes)?;
             let existed = handle.delete(&id)?;
+            let change = if existed {
+                Some((
+                    vyrn_core::document::document_change_key(&collection, &id)?,
+                    None,
+                ))
+            } else {
+                None
+            };
+            Ok((Message::DocumentDeleted { existed }, change))
+        }
+    }
+}
+
+fn document_indexes(engine: &Engine, collection: &str) -> vyrn_core::Result<Vec<IndexDefinition>> {
+    Ok(engine
+        .collection_indexes(collection)?
+        .into_iter()
+        .map(|(field, unique)| IndexDefinition::new(field, unique))
+        .collect())
+}
+
+fn operation_key(operation: &BatchOperation) -> &[u8] {
+    match operation {
+        BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
+    }
+}
+
+fn respond_writes(
+    requests: Vec<WriteRequest>,
+    result: std::result::Result<Vec<BatchResult>, String>,
+) {
+    match result {
+        Ok(results) => {
+            let mut results = results.into_iter();
+            for request in requests {
+                match request {
+                    WriteRequest::Operation { response, .. } => {
+                        let result = results
+                            .next()
+                            .ok_or_else(|| "storage returned no write result".into());
+                        let _ = response.send(result);
+                    }
+                    WriteRequest::Document { .. }
+                    | WriteRequest::CreateIndex { .. }
+                    | WriteRequest::DropIndex { .. } => {
+                        unreachable!()
+                    }
+                    WriteRequest::Transaction {
+                        operations,
+                        response,
+                        ..
+                    } => {
+                        let transaction_results: Vec<_> =
+                            results.by_ref().take(operations.len()).collect();
+                        let result = if transaction_results.len() == operations.len() {
+                            Ok(transaction_results)
+                        } else {
+                            Err("storage returned too few transaction results".into())
+                        };
+                        let _ = response.send(result);
+                    }
+                }
+            }
+        }
+        Err(message) => {
+            for request in requests {
+                match request {
+                    WriteRequest::Operation { response, .. } => {
+                        let _ = response.send(Err(message.clone()));
+                    }
+                    WriteRequest::Document { .. }
+                    | WriteRequest::CreateIndex { .. }
+                    | WriteRequest::DropIndex { .. } => {
+                        unreachable!()
+                    }
+                    WriteRequest::Transaction { response, .. } => {
+                        let _ = response.send(Err(message.clone()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn has_conflict(
+    engine: &Engine,
+    snapshot_sequence: u64,
+    read_keys: &[Vec<u8>],
+    read_ranges: &[ReadRange],
+    index_reads: &[(Vec<u8>, Vec<u8>)],
+    operations: &[BatchOperation],
+    index_updates: &[IndexUpdate],
+) -> vyrn_core::Result<bool> {
+    for key in operations
+        .iter()
+        .map(operation_key)
+        .chain(
+            index_updates
+                .iter()
+                .map(|update| update.primary_key.as_slice()),
+        )
+        .chain(read_keys.iter().map(Vec::as_slice))
+    {
+        if engine.changed_since(key, snapshot_sequence)? {
+            return Ok(true);
+        }
+    }
+    for (start, end) in read_ranges {
+        if engine.range_changed_since(start.as_deref(), end.as_deref(), snapshot_sequence)? {
+            return Ok(true);
+        }
+    }
+    for (index, value) in index_reads {
+        if engine.index_value_changed_since(index, value, snapshot_sequence)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn record_storage_error(metrics: &Metrics, error: &StorageError) {
+    metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+    if matches!(error, StorageError::Poisoned | StorageError::Io(_)) {
+        metrics.storage_failed.store(true, Ordering::Release);
+        metrics.ready.store(false, Ordering::Release);
+    }
+}
+
+async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let metrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            let mut request = [0; 2048];
+            let Ok(count) = timeout(Duration::from_secs(5), stream.read(&mut request)).await else {
+                return;
+            };
+            let Ok(count) = count else { return };
+            let line = String::from_utf8_lossy(&request[..count]);
+            let path = line.split_whitespace().nth(1).unwrap_or("/");
+            let ready = metrics.ready.load(Ordering::Acquire)
+                && !metrics.storage_failed.load(Ordering::Acquire);
+            let (status, content_type, body) = match path {
+                "/health/live" => ("200 OK", "text/plain", "ok\n".to_owned()),
+                "/health/ready" if ready => ("200 OK", "text/plain", "ready\n".to_owned()),
+                "/health/ready" => ("503 Service Unavailable", "text/plain", "not ready\n".to_owned()),
+                "/metrics" => (
+                    "200 OK",
+                    "text/plain; version=0.0.4",
+                    format!(
+                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\n",
+                        u8::from(ready),
+                        u8::from(metrics.storage_failed.load(Ordering::Relaxed)),
+                        metrics.active_connections.load(Ordering::Relaxed),
+                        metrics.total_requests.load(Ordering::Relaxed),
+                        metrics.failed_requests.load(Ordering::Relaxed),
+                        metrics.reads.load(Ordering::Relaxed),
+                        metrics.writes.load(Ordering::Relaxed),
