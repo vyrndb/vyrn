@@ -1578,3 +1578,163 @@ fn start_write_worker(
     engine: Arc<RwLock<Engine>>,
     mut receiver: mpsc::Receiver<WriteRequest>,
     config: WriteWorkerConfig,
+) {
+    tokio::spawn(async move {
+        let mut writes_since_checkpoint = 0_u64;
+        let mut pending = None;
+        loop {
+            let first = match pending.take() {
+                Some(request) => request,
+                None => match receiver.recv().await {
+                    Some(request) => request,
+                    None => break,
+                },
+            };
+            let mut requests = vec![first];
+            if matches!(requests.first(), Some(WriteRequest::Document { .. })) {
+                let Some(WriteRequest::Document { request, response }) = requests.pop() else {
+                    unreachable!()
+                };
+                let engine = Arc::clone(&engine);
+                let result = task::spawn_blocking(move || {
+                    let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+                    let before = engine.latest_published_cursor()?;
+                    let outcome = apply_document_write(&mut engine, request);
+                    let published = engine.read_changes(before, CHANGE_REPLAY_BATCH)?;
+                    let (generation, root, len) = engine.committed_root();
+                    Ok::<_, StorageError>((outcome, published, generation, root, len))
+                })
+                .await;
+                match result {
+                    Ok(Ok((outcome, published, generation, root, len))) => {
+                        if let Err(error) = &outcome {
+                            record_storage_error(&config.metrics, error);
+                        }
+                        let mut reader_failed = false;
+                        for reader in config.readers.iter() {
+                            match reader.write() {
+                                Ok(mut reader) => {
+                                    if let Err(error) = reader.refresh(generation, root, len) {
+                                        record_storage_error(&config.metrics, &error);
+                                        reader_failed = true;
+                                    }
+                                }
+                                Err(_) => {
+                                    config.metrics.storage_failed.store(true, Ordering::Release);
+                                    config.metrics.ready.store(false, Ordering::Release);
+                                    reader_failed = true;
+                                }
+                            }
+                        }
+                        for record in published {
+                            let _ = config.changes.send(ChangeEvent {
+                                sequence: record.sequence,
+                                key: record.key,
+                                value: record.value,
+                                cursor: Some(change_log::Cursor::new(
+                                    record.sequence,
+                                    record.index,
+                                )),
+                            });
+                        }
+                        let _ = response.send(match outcome {
+                            Ok((message, _)) if !reader_failed => Ok(message),
+                            Ok(_) => Err(StorageError::Poisoned),
+                            Err(error) => Err(error),
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        record_storage_error(&config.metrics, &error);
+                        let _ = response.send(Err(error));
+                    }
+                    Err(_) => {
+                        config.metrics.storage_failed.store(true, Ordering::Release);
+                        config.metrics.ready.store(false, Ordering::Release);
+                        let _ = response.send(Err(StorageError::Poisoned));
+                    }
+                }
+                continue;
+            }
+            if matches!(
+                requests.first(),
+                Some(WriteRequest::CreateIndex { .. } | WriteRequest::DropIndex { .. })
+            ) {
+                let request = requests.pop().unwrap();
+                let engine = Arc::clone(&engine);
+                let result = task::spawn_blocking(move || {
+                    let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+                    match request {
+                        WriteRequest::CreateIndex {
+                            name,
+                            unique,
+                            response,
+                        } => {
+                            let result = engine.create_index(name, unique);
+                            Ok::<_, StorageError>((response, result))
+                        }
+                        WriteRequest::DropIndex { name, response } => {
+                            let result = engine.drop_index(&name);
+                            Ok((response, result))
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await;
+                match result {
+                    Ok(Ok((response, result))) => {
+                        let _ = response.send(result);
+                    }
+                    Ok(Err(error)) => record_storage_error(&config.metrics, &error),
+                    Err(_) => {
+                        config.metrics.storage_failed.store(true, Ordering::Release);
+                        config.metrics.ready.store(false, Ordering::Release);
+                    }
+                }
+                continue;
+            }
+            if matches!(requests.first(), Some(WriteRequest::Operation { .. })) {
+                if !config.delay.is_zero() {
+                    sleep(config.delay).await;
+                }
+                while requests.len() < config.maximum_batch {
+                    match receiver.try_recv() {
+                        Ok(request @ WriteRequest::Operation { .. }) => requests.push(request),
+                        Ok(request) => {
+                            pending = Some(request);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            let (snapshot_sequence, read_keys, read_ranges, index_reads) = match requests.first() {
+                Some(WriteRequest::Transaction {
+                    snapshot_sequence,
+                    read_keys,
+                    read_ranges,
+                    index_reads,
+                    ..
+                }) => (
+                    Some(*snapshot_sequence),
+                    read_keys.clone(),
+                    read_ranges.clone(),
+                    index_reads.clone(),
+                ),
+                _ => (None, Vec::new(), Vec::new(), Vec::new()),
+            };
+            let operations: Vec<_> = requests
+                .iter()
+                .flat_map(|request| match request {
+                    WriteRequest::Operation { operation, .. } => vec![operation.clone()],
+                    WriteRequest::Transaction { operations, .. } => operations.clone(),
+                    WriteRequest::Document { .. }
+                    | WriteRequest::CreateIndex { .. }
+                    | WriteRequest::DropIndex { .. } => {
+                        unreachable!()
+                    }
+                })
+                .collect();
+            let index_updates = match requests.first() {
+                Some(WriteRequest::Transaction { index_updates, .. }) => index_updates.clone(),
+                _ => Vec::new(),
+            };
