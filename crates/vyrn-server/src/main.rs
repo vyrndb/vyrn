@@ -2058,3 +2058,163 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
                         metrics.failed_requests.load(Ordering::Relaxed),
                         metrics.reads.load(Ordering::Relaxed),
                         metrics.writes.load(Ordering::Relaxed),
+                        metrics.checkpoints.load(Ordering::Relaxed),
+                        metrics.write_batches.load(Ordering::Relaxed),
+                        metrics.batched_writes.load(Ordering::Relaxed),
+                        metrics.mvcc_gc_runs.load(Ordering::Relaxed),
+                        metrics.mvcc_versions_collected.load(Ordering::Relaxed),
+                    ),
+                ),
+                _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+    }
+}
+
+fn server_error(code: ErrorCode, message: &str) -> Message {
+    Message::Error {
+        code,
+        message: message.to_owned(),
+    }
+}
+
+async fn next_message(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    duration: Duration,
+) -> Result<Option<Envelope>> {
+    match timeout(duration, framed.next()).await {
+        Ok(Some(Ok(message))) => Ok(Some(message)),
+        Ok(Some(Err(error))) => Err(error.into()),
+        Ok(None) => Ok(None),
+        Err(_) => bail!("client idle timeout"),
+    }
+}
+
+async fn send_error(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    request_id: u64,
+    code: ErrorCode,
+    message: &str,
+) -> Result<()> {
+    framed
+        .send(Envelope::new(request_id, server_error(code, message)))
+        .await?;
+    Ok(())
+}
+
+fn load_password_hash(path: &Path) -> Result<PasswordHashString> {
+    let hash = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read password hash file {}", path.display()))?;
+    let hash = hash.trim_end_matches(['\r', '\n']);
+    if hash.is_empty() || hash.contains(['\r', '\n']) || !hash.starts_with("$argon2id$") {
+        bail!("password hash file must contain exactly one Argon2id PHC string");
+    }
+    PasswordHashString::new(hash)
+        .map_err(|_| anyhow::anyhow!("password hash file contains an invalid PHC string"))
+}
+
+fn load_tls(certificate_path: &Path, key_path: &Path) -> Result<TlsAcceptor> {
+    let certificates: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(
+        File::open(certificate_path).context("failed to open TLS certificate")?,
+    ))
+    .collect::<std::result::Result<_, _>>()
+    .context("failed to parse TLS certificate")?;
+    if certificates.is_empty() {
+        bail!("TLS certificate file contains no certificates");
+    }
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(
+        File::open(key_path).context("failed to open TLS private key")?,
+    ))
+    .context("failed to parse TLS private key")?
+    .context("TLS private key file contains no key")?;
+    let config = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)
+        .context("TLS certificate and key are invalid or do not match")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn transaction_reads_persisted_snapshot_and_its_writes() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"a".to_vec(), b"old".to_vec()).unwrap();
+        engine.put(b"b".to_vec(), b"two".to_vec()).unwrap();
+        let sequence = engine.register_snapshot();
+        engine.put(b"a".to_vec(), b"current".to_vec()).unwrap();
+        let engine = Arc::new(RwLock::new(engine));
+        let mut transaction = ConnectionTransaction {
+            sequence,
+            started: tokio::time::Instant::now(),
+            read_keys: BTreeMap::new(),
+            read_ranges: Vec::new(),
+            index_reads: Vec::new(),
+            writes: BTreeMap::new(),
+            index_updates: Vec::new(),
+        };
+        assert_eq!(
+            execute_transaction(
+                &engine,
+                &mut transaction,
+                Message::Get { key: b"a".to_vec() }
+            )
+            .await,
+            Message::Value {
+                value: Some(b"old".to_vec())
+            }
+        );
+        assert_eq!(
+            execute_transaction(
+                &engine,
+                &mut transaction,
+                Message::Put {
+                    key: b"a".to_vec(),
+                    value: b"new".to_vec()
+                }
+            )
+            .await,
+            Message::Written
+        );
+        assert_eq!(
+            execute_transaction(
+                &engine,
+                &mut transaction,
+                Message::Get { key: b"a".to_vec() }
+            )
+            .await,
+            Message::Value {
+                value: Some(b"new".to_vec())
+            }
+        );
+        assert_eq!(
+            execute_transaction(
+                &engine,
+                &mut transaction,
+                Message::Delete { key: b"b".to_vec() }
+            )
+            .await,
+            Message::Deleted { existed: true }
+        );
+        assert_eq!(
+            execute_transaction(
+                &engine,
+                &mut transaction,
+                Message::Get { key: b"b".to_vec() }
+            )
+            .await,
+            Message::Value { value: None }
+        );
+        assert_eq!(
+            execute_transaction(
+                &engine,
