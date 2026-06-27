@@ -1,0 +1,24 @@
+[package]
+name = "vyrnd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+clap.workspace = true
+futures-util = { version = "0.3", features = ["sink"] }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+vyrn-core = { path = "../vyrn-core" }
+vyrn-protocol = { path = "../vyrn-protocol" }
+
+[dev-dependencies]
+proptest = "1.7"
+tempfile = "3.20"
