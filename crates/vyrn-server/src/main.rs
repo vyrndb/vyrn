@@ -2218,3 +2218,164 @@ mod tests {
         assert_eq!(
             execute_transaction(
                 &engine,
+                &mut transaction,
+                Message::Scan {
+                    start: None,
+                    end: None,
+                    limit: 10
+                }
+            )
+            .await,
+            Message::Rows {
+                rows: vec![(b"a".to_vec(), b"new".to_vec())]
+            }
+        );
+    }
+
+    #[test]
+    fn conflict_detection_only_rejects_keys_changed_after_snapshot() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"b".to_vec(), b"old".to_vec()).unwrap();
+        let snapshot = engine.sequence();
+        engine.put(b"a".to_vec(), b"new".to_vec()).unwrap();
+        assert!(has_conflict(
+            &engine,
+            snapshot,
+            &[],
+            &[],
+            &[],
+            &[BatchOperation::Put(b"a".to_vec(), b"new".to_vec())],
+            &[]
+        )
+        .unwrap());
+        assert!(!has_conflict(
+            &engine,
+            snapshot,
+            &[],
+            &[],
+            &[],
+            &[BatchOperation::Delete(b"b".to_vec())],
+            &[]
+        )
+        .unwrap());
+        assert!(!has_conflict(
+            &engine,
+            snapshot,
+            &[],
+            &[],
+            &[],
+            &[BatchOperation::Put(b"c".to_vec(), b"new".to_vec())],
+            &[]
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn serializable_conflicts_cover_reads_and_phantoms() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.create_index(b"tag".to_vec(), false).unwrap();
+        let snapshot = engine.sequence();
+        engine
+            .write_indexed(
+                vec![
+                    BatchOperation::Put(b"account/a".to_vec(), b"1".to_vec()),
+                    BatchOperation::Put(b"users/new".to_vec(), b"1".to_vec()),
+                ],
+                vec![IndexUpdate {
+                    index: b"tag".to_vec(),
+                    primary_key: b"users/new".to_vec(),
+                    old_value: None,
+                    new_value: Some(b"admin".to_vec()),
+                }],
+            )
+            .unwrap();
+        assert!(has_conflict(
+            &engine,
+            snapshot,
+            &[b"account/a".to_vec()],
+            &[],
+            &[],
+            &[BatchOperation::Put(b"account/b".to_vec(), b"1".to_vec())],
+            &[]
+        )
+        .unwrap());
+        assert!(has_conflict(
+            &engine,
+            snapshot,
+            &[],
+            &[(Some(b"users/".to_vec()), Some(b"users0".to_vec()))],
+            &[],
+            &[BatchOperation::Put(b"audit".to_vec(), b"1".to_vec())],
+            &[]
+        )
+        .unwrap());
+        assert!(has_conflict(
+            &engine,
+            snapshot,
+            &[],
+            &[],
+            &[(b"tag".to_vec(), b"admin".to_vec())],
+            &[BatchOperation::Put(b"audit".to_vec(), b"1".to_vec())],
+            &[]
+        )
+        .unwrap());
+        assert!(!has_conflict(
+            &engine,
+            engine.sequence(),
+            &[b"account/a".to_vec()],
+            &[(Some(b"users/".to_vec()), Some(b"users0".to_vec()))],
+            &[(b"tag".to_vec(), b"admin".to_vec())],
+            &[BatchOperation::Put(b"audit".to_vec(), b"1".to_vec())],
+            &[]
+        )
+        .unwrap());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn generated_serializable_histories_detect_stale_reads_and_phantoms(
+            suffix in prop::collection::vec(any::<u8>(), 1..32),
+        ) {
+            let directory = tempdir().unwrap();
+            let mut engine = Engine::open(directory.path()).unwrap();
+            let snapshot = engine.sequence();
+            let mut point_key = b"point/".to_vec();
+            point_key.extend_from_slice(&suffix);
+            let mut range_key = b"range/".to_vec();
+            range_key.extend_from_slice(&suffix);
+            engine.put(point_key.clone(), b"point".to_vec()).unwrap();
+            engine.put(range_key, b"range".to_vec()).unwrap();
+            prop_assert!(has_conflict(
+                &engine,
+                snapshot,
+                std::slice::from_ref(&point_key),
+                &[],
+                &[],
+                &[BatchOperation::Put(b"other".to_vec(), b"value".to_vec())],
+                &[],
+            ).unwrap());
+            prop_assert!(has_conflict(
+                &engine,
+                snapshot,
+                &[],
+                &[(Some(b"range/".to_vec()), Some(b"range0".to_vec()))],
+                &[],
+                &[BatchOperation::Put(b"other".to_vec(), b"value".to_vec())],
+                &[],
+            ).unwrap());
+            prop_assert!(!has_conflict(
+                &engine,
+                engine.sequence(),
+                std::slice::from_ref(&point_key),
+                &[(Some(b"range/".to_vec()), Some(b"range0".to_vec()))],
+                &[],
+                &[BatchOperation::Put(b"other".to_vec(), b"value".to_vec())],
+                &[],
+            ).unwrap());
+        }
+    }
+}
