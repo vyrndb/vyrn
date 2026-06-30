@@ -138,3 +138,143 @@ pub enum Error {
     TransactionActive,
     #[error("connection closed by server")]
     ConnectionClosed,
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("document error: {0}")]
+    Document(String),
+    #[error("server returned {code:?}: {message}")]
+    Server { code: ErrorCode, message: String },
+    #[error("transport security error: {0}")]
+    Tls(String),
+    #[error("I/O or codec error: {0}")]
+    Transport(String),
+}
+
+pub struct Change {
+    pub sequence: u64,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+/// One event from a resumable subscription.
+///
+/// Persist `cursor` after processing an event; passing it to a later
+/// `subscribe_*_from` call resumes without gaps or duplicates. `Caught` marks
+/// the end of the replayed backlog, so a client can tell history from live
+/// traffic.
+pub enum StreamEvent {
+    Change {
+        cursor: String,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
+    Document {
+        cursor: String,
+        collection: String,
+        id: String,
+        value: Option<serde_json::Value>,
+    },
+    Caught {
+        cursor: String,
+    },
+}
+
+impl StreamEvent {
+    pub fn cursor(&self) -> &str {
+        match self {
+            Self::Change { cursor, .. }
+            | Self::Document { cursor, .. }
+            | Self::Caught { cursor } => cursor,
+        }
+    }
+}
+
+/// A subscription that reports durable cursors so it can be resumed.
+pub struct CursorSubscription {
+    framed: Framed<BoxedTransport, VyrnCodec>,
+}
+
+impl CursorSubscription {
+    pub async fn next(&mut self) -> Result<Option<StreamEvent>, Error> {
+        let Some(message) = self.framed.next().await else {
+            return Ok(None);
+        };
+        let envelope = message.map_err(|error| Error::Transport(error.to_string()))?;
+        match envelope.message {
+            Message::CursorChange { cursor, key, value } => {
+                Ok(Some(StreamEvent::Change { cursor, key, value }))
+            }
+            Message::CursorDocumentChange {
+                cursor,
+                collection,
+                id,
+                document,
+            } => Ok(Some(StreamEvent::Document {
+                cursor,
+                collection,
+                id,
+                value: document.as_deref().map(decode_document).transpose()?,
+            })),
+            Message::Caught { cursor } => Ok(Some(StreamEvent::Caught { cursor })),
+            Message::Error { code, message } => Err(Error::Server { code, message }),
+            message => Err(unexpected(message)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionIndex {
+    pub field: String,
+    pub unique: bool,
+}
+
+impl CollectionIndex {
+    pub fn new(field: impl Into<String>, unique: bool) -> Self {
+        Self {
+            field: field.into(),
+            unique,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Document {
+    pub id: String,
+    pub value: serde_json::Value,
+}
+
+pub struct DocumentChange {
+    pub sequence: u64,
+    pub id: String,
+    pub value: Option<serde_json::Value>,
+}
+
+pub struct DocumentSubscription {
+    framed: Framed<BoxedTransport, VyrnCodec>,
+}
+
+impl DocumentSubscription {
+    pub async fn next(&mut self) -> Result<Option<DocumentChange>, Error> {
+        let Some(message) = self.framed.next().await else {
+            return Ok(None);
+        };
+        let envelope = message.map_err(|error| Error::Transport(error.to_string()))?;
+        match envelope.message {
+            Message::DocumentChange {
+                sequence,
+                id,
+                document,
+            } => Ok(Some(DocumentChange {
+                sequence,
+                id,
+                value: document.as_deref().map(decode_document).transpose()?,
+            })),
+            Message::Error { code, message } => Err(Error::Server { code, message }),
+            message => Err(unexpected(message)),
+        }
+    }
+}
+
+pub struct Subscription {
+    framed: Framed<BoxedTransport, VyrnCodec>,
+}
