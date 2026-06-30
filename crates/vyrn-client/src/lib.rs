@@ -558,3 +558,143 @@ impl Client {
                 collection: collection.to_owned(),
                 field: field.to_owned(),
                 value,
+                limit,
+            })
+            .await?
+        {
+            Message::Documents { documents } => decode_documents(documents),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn subscribe_collection(
+        mut self,
+        collection: &str,
+    ) -> Result<DocumentSubscription, Error> {
+        match self
+            .request(Message::SubscribeCollection {
+                collection: collection.to_owned(),
+            })
+            .await?
+        {
+            Message::CollectionSubscribed => Ok(DocumentSubscription {
+                framed: self.framed,
+            }),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    /// Subscribes to key changes, resuming after `cursor`.
+    ///
+    /// `None` delivers only changes committed after this call. `Some("")`
+    /// replays everything still retained. A stale cursor fails with
+    /// `ErrorCode::InvalidRequest` rather than silently skipping changes.
+    pub async fn subscribe_from(
+        mut self,
+        prefix: Vec<u8>,
+        cursor: Option<String>,
+    ) -> Result<CursorSubscription, Error> {
+        match self
+            .request(Message::SubscribeFrom { prefix, cursor })
+            .await?
+        {
+            Message::Subscribed => Ok(CursorSubscription {
+                framed: self.framed,
+            }),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    /// Subscribes to document changes in one collection, resuming after `cursor`.
+    pub async fn subscribe_collection_from(
+        mut self,
+        collection: &str,
+        cursor: Option<String>,
+    ) -> Result<CursorSubscription, Error> {
+        match self
+            .request(Message::SubscribeCollectionFrom {
+                collection: collection.to_owned(),
+                cursor,
+            })
+            .await?
+        {
+            Message::CollectionSubscribed => Ok(CursorSubscription {
+                framed: self.framed,
+            }),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn subscribe(mut self, prefix: Vec<u8>) -> Result<Subscription, Error> {
+        match self.request(Message::Subscribe { prefix }).await? {
+            Message::Subscribed => Ok(Subscription {
+                framed: self.framed,
+            }),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn scan(
+        &mut self,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+        limit: Option<u32>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+        match self.request(Message::Scan { start, end, limit }).await? {
+            Message::Rows { rows } => Ok(rows),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    async fn request(&mut self, message: Message) -> Result<Message, Error> {
+        if self.transaction_active {
+            match self.request_raw(Message::Rollback).await? {
+                Message::RolledBack => self.transaction_active = false,
+                message => return Err(unexpected(message)),
+            }
+        }
+        self.request_raw(message).await
+    }
+
+    async fn request_raw(&mut self, message: Message) -> Result<Message, Error> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.checked_add(1).unwrap_or(1);
+        timeout(
+            REQUEST_TIMEOUT,
+            self.framed.send(Envelope::new(request_id, message)),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|error| Error::Transport(error.to_string()))?;
+
+        let response = timeout(REQUEST_TIMEOUT, self.framed.next())
+            .await
+            .map_err(|_| Error::Timeout)?
+            .ok_or(Error::ConnectionClosed)?
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        if response.version != PROTOCOL_VERSION {
+            return Err(Error::Protocol(
+                "server used an unsupported protocol version".into(),
+            ));
+        }
+        if response.request_id != request_id {
+            return Err(Error::Protocol("response request ID did not match".into()));
+        }
+        match response.message {
+            Message::Error { code, message } => Err(Error::Server { code, message }),
+            message => Ok(message),
+        }
+    }
+}
+
+impl Transaction<'_> {
+    pub async fn update_index(
+        &mut self,
+        index: Vec<u8>,
+        primary_key: Vec<u8>,
+        old_value: Option<Vec<u8>>,
+        new_value: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        match self
+            .client
