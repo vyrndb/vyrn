@@ -698,3 +698,164 @@ impl Transaction<'_> {
     ) -> Result<(), Error> {
         match self
             .client
+            .request_raw(Message::IndexUpdate {
+                index,
+                primary_key,
+                old_value,
+                new_value,
+            })
+            .await?
+        {
+            Message::IndexUpdated => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn lookup_index(
+        &mut self,
+        index: Vec<u8>,
+        value: Vec<u8>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+        match self
+            .client
+            .request_raw(Message::IndexLookup {
+                index,
+                value,
+                limit,
+            })
+            .await?
+        {
+            Message::Keys { keys } => Ok(keys),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn get(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+        match self.client.request_raw(Message::Get { key }).await? {
+            Message::Value { value } => Ok(value),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
+        match self.client.request_raw(Message::Put { key, value }).await? {
+            Message::Written => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn delete(&mut self, key: Vec<u8>) -> Result<bool, Error> {
+        match self.client.request_raw(Message::Delete { key }).await? {
+            Message::Deleted { existed } => Ok(existed),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn scan(
+        &mut self,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+        limit: Option<u32>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+        match self
+            .client
+            .request_raw(Message::Scan { start, end, limit })
+            .await?
+        {
+            Message::Rows { rows } => Ok(rows),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn commit(self) -> Result<(), Error> {
+        let result = self.client.request_raw(Message::Commit).await;
+        self.client.transaction_active = false;
+        match result? {
+            Message::Committed => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn rollback(self) -> Result<(), Error> {
+        let result = self.client.request_raw(Message::Rollback).await;
+        self.client.transaction_active = false;
+        match result? {
+            Message::RolledBack => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+}
+
+fn load_ca(path: &Path) -> Result<RootCertStore, Error> {
+    let file = File::open(path).map_err(|error| Error::Tls(error.to_string()))?;
+    let certificates: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(file))
+            .collect::<Result<_, _>>()
+            .map_err(|error| Error::Tls(error.to_string()))?;
+    if certificates.is_empty() {
+        return Err(Error::Tls("CA file contains no certificates".into()));
+    }
+    let mut roots = RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| Error::Tls(error.to_string()))?;
+    }
+    Ok(roots)
+}
+
+fn unexpected(message: Message) -> Error {
+    Error::Protocol(format!("unexpected response type: {message:?}"))
+}
+
+fn decode_document(bytes: &[u8]) -> Result<serde_json::Value, Error> {
+    serde_json::from_slice(bytes)
+        .map_err(|error| Error::Document(format!("server returned invalid JSON: {error}")))
+}
+
+fn decode_documents(documents: Vec<(String, Vec<u8>)>) -> Result<Vec<Document>, Error> {
+    documents
+        .into_iter()
+        .map(|(id, document)| {
+            Ok(Document {
+                id,
+                value: decode_document(&document)?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_secure_connection_string() {
+        let options = ConnectionOptions::parse("vyrn://alica:secret@localhost:7432/app").unwrap();
+        assert_eq!(options.host, "localhost");
+        assert_eq!(options.port, 7432);
+        assert_eq!(options.username, "alica");
+        assert_eq!(options.database, "app");
+        assert!(options.tls_required);
+        assert!(!format!("{options:?}").contains("secret"));
+    }
+
+    #[test]
+    fn allows_explicit_development_plaintext() {
+        let options =
+            ConnectionOptions::parse("vyrn://user:pass@localhost/app?tls=disable").unwrap();
+        assert!(!options.tls_required);
+    }
+
+    #[test]
+    fn rejects_unknown_options_without_exposing_values() {
+        let error =
+            ConnectionOptions::parse("vyrn://user:pass@localhost/app?password=do-not-print-this")
+                .unwrap_err()
+                .to_string();
+        assert!(!error.contains("do-not-print-this"));
+    }
+}
