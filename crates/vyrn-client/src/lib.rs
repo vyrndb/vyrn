@@ -278,3 +278,143 @@ impl DocumentSubscription {
 pub struct Subscription {
     framed: Framed<BoxedTransport, VyrnCodec>,
 }
+
+impl Subscription {
+    pub async fn next(&mut self) -> Result<Option<Change>, Error> {
+        let Some(message) = self.framed.next().await else {
+            return Ok(None);
+        };
+        let envelope = message.map_err(|error| Error::Transport(error.to_string()))?;
+        match envelope.message {
+            Message::Change {
+                sequence,
+                key,
+                value,
+            } => Ok(Some(Change {
+                sequence,
+                key,
+                value,
+            })),
+            Message::Error { code, message } => Err(Error::Server { code, message }),
+            message => Err(unexpected(message)),
+        }
+    }
+}
+
+pub struct Client {
+    framed: Framed<BoxedTransport, VyrnCodec>,
+    next_request_id: u64,
+    transaction_active: bool,
+}
+
+pub struct Transaction<'a> {
+    client: &'a mut Client,
+}
+
+impl Client {
+    pub async fn connect(connection_string: &str) -> Result<Self, Error> {
+        let ca_path = std::env::var_os("VYRN_TLS_CA_FILE").map(PathBuf::from);
+        Self::connect_with_ca(connection_string, ca_path.as_deref()).await
+    }
+
+    pub async fn connect_with_ca(
+        connection_string: &str,
+        ca_path: Option<&Path>,
+    ) -> Result<Self, Error> {
+        let options = ConnectionOptions::parse(connection_string)?;
+        let stream = timeout(
+            REQUEST_TIMEOUT,
+            TcpStream::connect((options.host.as_str(), options.port)),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|error| Error::Transport(error.to_string()))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|error| Error::Transport(error.to_string()))?;
+
+        let transport: BoxedTransport = if options.tls_required {
+            let ca_path = ca_path.ok_or(Error::MissingCa)?;
+            let roots = load_ca(ca_path)?;
+            let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server_name = ServerName::try_from(options.host.clone())
+                .map_err(|_| Error::Tls("host is not a valid TLS server name".into()))?;
+            let tls = timeout(
+                REQUEST_TIMEOUT,
+                TlsConnector::from(Arc::new(config)).connect(server_name, stream),
+            )
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|error| Error::Tls(error.to_string()))?;
+            Box::new(tls)
+        } else {
+            Box::new(stream)
+        };
+
+        let mut client = Self {
+            framed: Framed::new(transport, VyrnCodec::default()),
+            next_request_id: 1,
+            transaction_active: false,
+        };
+        match client
+            .request(Message::Authenticate {
+                username: options.username,
+                password: options.password,
+                database: options.database,
+            })
+            .await?
+        {
+            Message::Authenticated => Ok(client),
+            _ => Err(Error::Protocol("unexpected authentication response".into())),
+        }
+    }
+
+    pub async fn get(&mut self, key: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
+        match self.request(Message::Get { key }).await? {
+            Message::Value { value } => Ok(value),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn multi_get(&mut self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>, Error> {
+        match self.request(Message::MultiGet { keys }).await? {
+            Message::Values { values } => Ok(values),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn put(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), Error> {
+        match self.request(Message::Put { key, value }).await? {
+            Message::Written => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn delete(&mut self, key: Vec<u8>) -> Result<bool, Error> {
+        match self.request(Message::Delete { key }).await? {
+            Message::Deleted { existed } => Ok(existed),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
+        match self.request(Message::Begin).await? {
+            Message::Begun => {
+                self.transaction_active = true;
+                Ok(Transaction { client: self })
+            }
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn create_index(&mut self, name: Vec<u8>, unique: bool) -> Result<(), Error> {
+        match self.request(Message::CreateIndex { name, unique }).await? {
+            Message::IndexCreated => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn drop_index(&mut self, name: Vec<u8>) -> Result<(), Error> {
+        match self.request(Message::DropIndex { name }).await? {
