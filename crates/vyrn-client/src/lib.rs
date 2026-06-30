@@ -418,3 +418,143 @@ impl Client {
 
     pub async fn drop_index(&mut self, name: Vec<u8>) -> Result<(), Error> {
         match self.request(Message::DropIndex { name }).await? {
+            Message::IndexDropped => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn lookup_index(
+        &mut self,
+        index: Vec<u8>,
+        value: Vec<u8>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+        match self
+            .request(Message::IndexLookup {
+                index,
+                value,
+                limit,
+            })
+            .await?
+        {
+            Message::Keys { keys } => Ok(keys),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn create_collection(
+        &mut self,
+        collection: &str,
+        indexes: &[CollectionIndex],
+    ) -> Result<(), Error> {
+        match self
+            .request(Message::CreateCollection {
+                collection: collection.to_owned(),
+                indexes: indexes
+                    .iter()
+                    .map(|index| DocumentIndex {
+                        field: index.field.clone(),
+                        unique: index.unique,
+                    })
+                    .collect(),
+            })
+            .await?
+        {
+            Message::CollectionCreated => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn get_document(
+        &mut self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Document>, Error> {
+        match self
+            .request(Message::GetDocument {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+            })
+            .await?
+        {
+            Message::DocumentValue { document } => document
+                .as_deref()
+                .map(|bytes| {
+                    Ok(Document {
+                        id: id.to_owned(),
+                        value: decode_document(bytes)?,
+                    })
+                })
+                .transpose(),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn put_document<T: serde::Serialize>(
+        &mut self,
+        collection: &str,
+        id: &str,
+        value: &T,
+    ) -> Result<(), Error> {
+        let document = serde_json::to_vec(value)
+            .map_err(|error| Error::Document(format!("document is not valid JSON: {error}")))?;
+        match self
+            .request(Message::PutDocument {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+                document,
+            })
+            .await?
+        {
+            Message::DocumentWritten => Ok(()),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn delete_document(&mut self, collection: &str, id: &str) -> Result<bool, Error> {
+        match self
+            .request(Message::DeleteDocument {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+            })
+            .await?
+        {
+            Message::DocumentDeleted { existed } => Ok(existed),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn list_documents(
+        &mut self,
+        collection: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<Document>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+        match self
+            .request(Message::ListDocuments {
+                collection: collection.to_owned(),
+                limit,
+            })
+            .await?
+        {
+            Message::Documents { documents } => decode_documents(documents),
+            message => Err(unexpected(message)),
+        }
+    }
+
+    pub async fn query_documents(
+        &mut self,
+        collection: &str,
+        field: &str,
+        value: &serde_json::Value,
+        limit: Option<u32>,
+    ) -> Result<Vec<Document>, Error> {
+        let limit = limit.unwrap_or(DEFAULT_SCAN_LIMIT).min(MAX_SCAN_LIMIT);
+        let value = serde_json::to_vec(value)
+            .map_err(|error| Error::Document(format!("query value is not valid JSON: {error}")))?;
+        match self
+            .request(Message::QueryDocuments {
+                collection: collection.to_owned(),
+                field: field.to_owned(),
+                value,
