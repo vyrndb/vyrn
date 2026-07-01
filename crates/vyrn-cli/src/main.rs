@@ -88,3 +88,75 @@ async fn main() -> Result<()> {
             vyrn_core::backup::verify_backup(&archive)?;
             println!("verified {}", archive.display());
             return Ok(());
+        }
+        Command::Restore { archive, target } => {
+            vyrn_core::backup::restore_backup(archive, &target)?;
+            println!("restored {}", target.display());
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let mut url = args.url.context("--url or VYRN_URL is required")?;
+    if let Some(password_file) = args.password_file {
+        let password = read_secret_file(&password_file)?;
+        url = insert_password(&url, &password)?;
+    }
+    let mut client = Client::connect_with_ca(&url, args.tls_ca_file.as_deref())
+        .await
+        .context("failed to connect to Vyrn")?;
+
+    match command {
+        Command::Get { key, hex: use_hex } => match client.get(key.into_bytes()).await? {
+            Some(value) if use_hex => println!("{}", hex::encode(value)),
+            Some(value) => println!("{}", String::from_utf8_lossy(&value)),
+            None => println!("(not found)"),
+        },
+        Command::Put { key, value } => {
+            client.put(key.into_bytes(), value.into_bytes()).await?;
+            println!("OK");
+        }
+        Command::Delete { key } => {
+            let existed = client.delete(key.into_bytes()).await?;
+            println!("{}", if existed { "DELETED" } else { "NOT_FOUND" });
+        }
+        Command::Scan { start, end, limit } => {
+            for (key, value) in client
+                .scan(
+                    start.map(String::into_bytes),
+                    end.map(String::into_bytes),
+                    Some(limit),
+                )
+                .await?
+            {
+                println!(
+                    "{}\t{}",
+                    String::from_utf8_lossy(&key),
+                    String::from_utf8_lossy(&value)
+                );
+            }
+        }
+        Command::Backup { .. } | Command::VerifyBackup { .. } | Command::Restore { .. } => {
+            unreachable!("offline commands return before connecting")
+        }
+    }
+    Ok(())
+}
+
+fn read_secret_file(path: &PathBuf) -> Result<String> {
+    let secret = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let secret = secret.trim_end_matches(['\r', '\n']);
+    if secret.is_empty() || secret.contains(['\r', '\n']) {
+        anyhow::bail!("secret file must contain exactly one non-empty line");
+    }
+    Ok(secret.to_owned())
+}
+
+fn insert_password(url: &str, password: &str) -> Result<String> {
+    let mut parsed = url::Url::parse(url).context("invalid Vyrn URL")?;
+    parsed
+        .set_password(Some(password))
+        .map_err(|_| anyhow::anyhow!("URL cannot contain a password"))?;
+    Ok(parsed.into())
+}
