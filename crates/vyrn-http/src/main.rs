@@ -148,3 +148,153 @@ struct QueryDocumentsRequest {
     value: serde_json::Value,
     limit: Option<u32>,
 }
+
+#[derive(Deserialize)]
+struct SubscribeCollectionQuery {
+    collection: String,
+}
+
+#[derive(Serialize)]
+struct DocumentResponse {
+    id: String,
+    document: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct OptionalDocumentResponse {
+    document: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct DocumentsResponse {
+    documents: Vec<DocumentResponse>,
+}
+
+#[derive(Serialize)]
+struct DocumentChangeResponse {
+    sequence: u64,
+    id: String,
+    document: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ValueResponse {
+    value: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ValuesResponse {
+    values: Vec<Option<String>>,
+}
+
+#[derive(Serialize)]
+struct DeleteResponse {
+    existed: bool,
+}
+
+#[derive(Serialize)]
+struct RowsResponse {
+    rows: Vec<RowResponse>,
+}
+
+#[derive(Serialize)]
+struct RowResponse {
+    key: String,
+    value: String,
+}
+
+#[derive(Serialize)]
+struct TransactionResponse {
+    deleted: Vec<bool>,
+}
+
+#[derive(Serialize)]
+struct ChangeResponse {
+    sequence: u64,
+    key: String,
+    value: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+    let token = read_secret_file(&args.token_file)?;
+    let mut connection_url = args.url;
+    if let Some(path) = args.password_file {
+        connection_url = insert_password(&connection_url, &read_secret_file(&path)?)?;
+    }
+    let state = AppState {
+        connection_url,
+        tls_ca_file: args.tls_ca_file,
+        token: token.into(),
+        clients: Arc::new(ClientPool {
+            idle: Mutex::new(Vec::new()),
+            maximum: args.idle_connections,
+        }),
+    };
+    connect(&state)
+        .await
+        .context("failed to connect to Vyrn during gateway startup")?;
+
+    let protected = Router::new()
+        .route("/v1/get", post(get_value))
+        .route("/v1/multi-get", post(multi_get))
+        .route("/v1/put", post(put_value))
+        .route("/v1/delete", post(delete_value))
+        .route("/v1/scan", post(scan))
+        .route("/v1/transaction", post(transaction))
+        .route("/v1/subscribe", get(subscribe))
+        .route("/v1/collections/create", post(create_collection))
+        .route("/v1/documents/get", post(get_document))
+        .route("/v1/documents/put", post(put_document))
+        .route("/v1/documents/delete", post(delete_document))
+        .route("/v1/documents/list", post(list_documents))
+        .route("/v1/documents/query", post(query_documents))
+        .route("/v1/documents/subscribe", get(subscribe_collection))
+        .layer(DefaultBodyLimit::max(JSON_LIMIT))
+        .layer(middleware::from_fn_with_state(state.clone(), authenticate));
+    let app = Router::new()
+        .route("/health/live", get(|| async { "ok\n" }))
+        .route("/health/ready", get(ready))
+        .merge(protected)
+        .with_state(state);
+    let listener = TcpListener::bind(&args.bind)
+        .await
+        .with_context(|| format!("failed to bind {}", args.bind))?;
+    println!("vyrn-http listening on {}", args.bind);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn authenticate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let supplied = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if supplied
+        .is_none_or(|supplied| !constant_time_eq(supplied.as_bytes(), state.token.as_bytes()))
+    {
+        return ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "authentication_failed",
+            "invalid bearer token",
+        )
+        .into_response();
+    }
+    if request.method() == Method::OPTIONS {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    next.run(request).await
+}
+
+async fn ready(State(state): State<AppState>) -> Response {
+    match connect(&state).await {
+        Ok(_) => (StatusCode::OK, "ready\n").into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response(),
