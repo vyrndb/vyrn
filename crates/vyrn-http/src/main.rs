@@ -298,3 +298,153 @@ async fn ready(State(state): State<AppState>) -> Response {
     match connect(&state).await {
         Ok(_) => (StatusCode::OK, "ready\n").into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response(),
+    }
+}
+
+async fn get_value(
+    State(state): State<AppState>,
+    Json(request): Json<KeyRequest>,
+) -> Result<Json<ValueResponse>, ApiError> {
+    let mut client = checkout(&state).await?;
+    let value = client.get(decode("key", &request.key)?).await?;
+    checkin(&state, client).await;
+    Ok(Json(ValueResponse {
+        value: value.map(|value| STANDARD.encode(value)),
+    }))
+}
+
+async fn multi_get(
+    State(state): State<AppState>,
+    Json(request): Json<MultiGetRequest>,
+) -> Result<Json<ValuesResponse>, ApiError> {
+    if request.keys.is_empty() || request.keys.len() > MAX_SCAN_LIMIT as usize {
+        return Err(ApiError::bad_request(
+            "multi-get must contain between 1 and 10000 keys",
+        ));
+    }
+    let keys = request
+        .keys
+        .into_iter()
+        .map(|key| decode("key", &key))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut client = checkout(&state).await?;
+    let values = client
+        .multi_get(keys)
+        .await?
+        .into_iter()
+        .map(|value| value.map(|value| STANDARD.encode(value)))
+        .collect();
+    checkin(&state, client).await;
+    Ok(Json(ValuesResponse { values }))
+}
+
+async fn put_value(
+    State(state): State<AppState>,
+    Json(request): Json<PutRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut client = checkout(&state).await?;
+    client
+        .put(
+            decode("key", &request.key)?,
+            decode("value", &request.value)?,
+        )
+        .await?;
+    checkin(&state, client).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_value(
+    State(state): State<AppState>,
+    Json(request): Json<KeyRequest>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let mut client = checkout(&state).await?;
+    let existed = client.delete(decode("key", &request.key)?).await?;
+    checkin(&state, client).await;
+    Ok(Json(DeleteResponse { existed }))
+}
+
+async fn scan(
+    State(state): State<AppState>,
+    Json(request): Json<ScanRequest>,
+) -> Result<Json<RowsResponse>, ApiError> {
+    let limit = request.limit.unwrap_or(1_000);
+    if limit == 0 || limit > MAX_SCAN_LIMIT {
+        return Err(ApiError::bad_request("limit must be between 1 and 10000"));
+    }
+    let mut client = checkout(&state).await?;
+    let rows = client
+        .scan(
+            request
+                .start
+                .map(|value| decode("start", &value))
+                .transpose()?,
+            request.end.map(|value| decode("end", &value)).transpose()?,
+            Some(limit),
+        )
+        .await?
+        .into_iter()
+        .map(|(key, value)| RowResponse {
+            key: STANDARD.encode(key),
+            value: STANDARD.encode(value),
+        })
+        .collect();
+    checkin(&state, client).await;
+    Ok(Json(RowsResponse { rows }))
+}
+
+async fn transaction(
+    State(state): State<AppState>,
+    Json(request): Json<TransactionRequest>,
+) -> Result<Json<TransactionResponse>, ApiError> {
+    if request.operations.is_empty() {
+        return Err(ApiError::bad_request(
+            "transaction must contain an operation",
+        ));
+    }
+    if request.operations.len() > 10_000 {
+        return Err(ApiError::bad_request(
+            "transaction exceeds 10000 operations",
+        ));
+    }
+    let mut client = checkout(&state).await?;
+    let mut transaction = client.transaction().await?;
+    let mut deleted = Vec::new();
+    for operation in request.operations {
+        match operation {
+            OperationRequest::Put { key, value } => {
+                transaction
+                    .put(decode("key", &key)?, decode("value", &value)?)
+                    .await?;
+            }
+            OperationRequest::Delete { key } => {
+                deleted.push(transaction.delete(decode("key", &key)?).await?);
+            }
+        }
+    }
+    transaction.commit().await?;
+    checkin(&state, client).await;
+    Ok(Json(TransactionResponse { deleted }))
+}
+
+async fn subscribe(
+    State(state): State<AppState>,
+    Query(query): Query<SubscribeQuery>,
+) -> Result<Response, ApiError> {
+    let client = connect_api(&state).await?;
+    let mut subscription = client.subscribe(decode("prefix", &query.prefix)?).await?;
+    let stream = async_stream::stream! {
+        loop {
+            match subscription.next().await {
+                Ok(Some(change)) => {
+                    let payload = serde_json::to_string(&ChangeResponse {
+                        sequence: change.sequence,
+                        key: STANDARD.encode(change.key),
+                        value: change.value.map(|value| STANDARD.encode(value)),
+                    }).unwrap();
+                    yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let payload = serde_json::json!({
+                        "error": { "code": "subscription_closed", "message": error.to_string() }
+                    });
