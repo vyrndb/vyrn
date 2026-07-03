@@ -598,3 +598,164 @@ fn document_limit(limit: Option<u32>) -> Result<u32, ApiError> {
 }
 
 fn documents_response(documents: Vec<vyrn_client::Document>) -> DocumentsResponse {
+    DocumentsResponse {
+        documents: documents
+            .into_iter()
+            .map(|document| DocumentResponse {
+                id: document.id,
+                document: document.value,
+            })
+            .collect(),
+    }
+}
+
+async fn connect(state: &AppState) -> Result<Client, ClientError> {
+    Client::connect_with_ca(&state.connection_url, state.tls_ca_file.as_deref()).await
+}
+
+async fn connect_api(state: &AppState) -> Result<Client, ApiError> {
+    connect(state).await.map_err(ApiError::from)
+}
+
+async fn checkout(state: &AppState) -> Result<Client, ApiError> {
+    match state.clients.idle.lock().await.pop() {
+        Some(client) => Ok(client),
+        None => connect_api(state).await,
+    }
+}
+
+async fn checkin(state: &AppState, client: Client) {
+    let mut idle = state.clients.idle.lock().await;
+    if idle.len() < state.clients.maximum {
+        idle.push(client);
+    }
+}
+
+fn decode(field: &'static str, value: &str) -> Result<Vec<u8>, ApiError> {
+    STANDARD.decode(value).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_base64",
+            format!("{field} is not valid base64"),
+        )
+    })
+}
+
+impl ApiError {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+    }
+}
+
+impl From<ClientError> for ApiError {
+    fn from(error: ClientError) -> Self {
+        match error {
+            ClientError::Server { code, message } => {
+                let (status, code) = match code {
+                    vyrn_protocol::ErrorCode::AuthenticationFailed => {
+                        (StatusCode::BAD_GATEWAY, "database_authentication_failed")
+                    }
+                    vyrn_protocol::ErrorCode::InvalidRequest => {
+                        (StatusCode::BAD_REQUEST, "invalid_request")
+                    }
+                    vyrn_protocol::ErrorCode::Conflict => {
+                        (StatusCode::CONFLICT, "transaction_conflict")
+                    }
+                    _ => (StatusCode::SERVICE_UNAVAILABLE, "database_error"),
+                };
+                Self::new(status, code, message)
+            }
+            error => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                error.to_string(),
+            ),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let body = Json(ErrorBody {
+            error: ErrorContent {
+                code: self.code,
+                message: &self.message,
+            },
+        });
+        (self.status, body).into_response()
+    }
+}
+
+fn read_secret_file(path: &PathBuf) -> Result<String> {
+    let secret = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let secret = secret.trim_end_matches(['\r', '\n']);
+    if secret.is_empty() || secret.contains(['\r', '\n']) {
+        bail!("secret file must contain exactly one non-empty line");
+    }
+    Ok(secret.to_owned())
+}
+
+fn insert_password(url: &str, password: &str) -> Result<String> {
+    let mut parsed = Url::parse(url).context("invalid Vyrn URL")?;
+    parsed
+        .set_password(Some(password))
+        .map_err(|_| anyhow::anyhow!("URL cannot contain a password"))?;
+    Ok(parsed.into())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    sleep(Duration::from_millis(10)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_comparison_checks_contents_and_length() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secrex"));
+        assert!(!constant_time_eq(b"secret", b"secret-long"));
+    }
+
+    #[test]
+    fn base64_validation_names_the_field() {
+        let error = decode("key", "!!!").unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("key"));
+    }
+}
