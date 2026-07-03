@@ -448,3 +448,153 @@ async fn subscribe(
                     let payload = serde_json::json!({
                         "error": { "code": "subscription_closed", "message": error.to_string() }
                     });
+                    yield Ok(format!("event: error\ndata: {payload}\n\n"));
+                    break;
+                }
+            }
+        }
+    };
+    Ok(event_stream(Body::from_stream(stream)))
+}
+
+fn event_stream(body: Body) -> Response {
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response
+}
+
+async fn create_collection(
+    State(state): State<AppState>,
+    Json(request): Json<CreateCollectionRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.indexes.len() > MAX_DOCUMENT_INDEXES {
+        return Err(ApiError::bad_request("too many document indexes"));
+    }
+    let indexes: Vec<_> = request
+        .indexes
+        .into_iter()
+        .map(|index| CollectionIndex::new(index.field, index.unique))
+        .collect();
+    let mut client = checkout(&state).await?;
+    client
+        .create_collection(&request.collection, &indexes)
+        .await?;
+    checkin(&state, client).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_document(
+    State(state): State<AppState>,
+    Json(request): Json<DocumentRequest>,
+) -> Result<Json<OptionalDocumentResponse>, ApiError> {
+    let mut client = checkout(&state).await?;
+    let document = client
+        .get_document(&request.collection, &request.id)
+        .await?
+        .map(|document| document.value);
+    checkin(&state, client).await;
+    Ok(Json(OptionalDocumentResponse { document }))
+}
+
+async fn put_document(
+    State(state): State<AppState>,
+    Json(request): Json<PutDocumentRequest>,
+) -> Result<StatusCode, ApiError> {
+    let mut client = checkout(&state).await?;
+    client
+        .put_document(&request.collection, &request.id, &request.document)
+        .await?;
+    checkin(&state, client).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_document(
+    State(state): State<AppState>,
+    Json(request): Json<DocumentRequest>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let mut client = checkout(&state).await?;
+    let existed = client
+        .delete_document(&request.collection, &request.id)
+        .await?;
+    checkin(&state, client).await;
+    Ok(Json(DeleteResponse { existed }))
+}
+
+async fn list_documents(
+    State(state): State<AppState>,
+    Json(request): Json<ListDocumentsRequest>,
+) -> Result<Json<DocumentsResponse>, ApiError> {
+    let limit = document_limit(request.limit)?;
+    let mut client = checkout(&state).await?;
+    let documents = client
+        .list_documents(&request.collection, Some(limit))
+        .await?;
+    checkin(&state, client).await;
+    Ok(Json(documents_response(documents)))
+}
+
+async fn query_documents(
+    State(state): State<AppState>,
+    Json(request): Json<QueryDocumentsRequest>,
+) -> Result<Json<DocumentsResponse>, ApiError> {
+    let limit = document_limit(request.limit)?;
+    let mut client = checkout(&state).await?;
+    let documents = client
+        .query_documents(
+            &request.collection,
+            &request.field,
+            &request.value,
+            Some(limit),
+        )
+        .await?;
+    checkin(&state, client).await;
+    Ok(Json(documents_response(documents)))
+}
+
+async fn subscribe_collection(
+    State(state): State<AppState>,
+    Query(query): Query<SubscribeCollectionQuery>,
+) -> Result<Response, ApiError> {
+    let client = connect_api(&state).await?;
+    let mut subscription = client.subscribe_collection(&query.collection).await?;
+    let stream = async_stream::stream! {
+        loop {
+            match subscription.next().await {
+                Ok(Some(change)) => {
+                    let payload = serde_json::to_string(&DocumentChangeResponse {
+                        sequence: change.sequence,
+                        id: change.id,
+                        document: change.value,
+                    }).unwrap();
+                    yield Ok::<_, Infallible>(format!("data: {payload}\n\n"));
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let payload = serde_json::json!({
+                        "error": { "code": "subscription_closed", "message": error.to_string() }
+                    });
+                    yield Ok(format!("event: error\ndata: {payload}\n\n"));
+                    break;
+                }
+            }
+        }
+    };
+    Ok(event_stream(Body::from_stream(stream)))
+}
+
+fn document_limit(limit: Option<u32>) -> Result<u32, ApiError> {
+    let limit = limit.unwrap_or(1_000);
+    if limit == 0 || limit > MAX_SCAN_LIMIT {
+        return Err(ApiError::bad_request("limit must be between 1 and 10000"));
+    }
+    Ok(limit)
+}
+
+fn documents_response(documents: Vec<vyrn_client::Document>) -> DocumentsResponse {
