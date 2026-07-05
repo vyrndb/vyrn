@@ -118,3 +118,123 @@ export class VyrnClient {
             ? { type: "put", key: encode(operation.key), value: encode(operation.value) }
             : { type: "delete", key: encode(operation.key) },
         ),
+      },
+      signal,
+    );
+    return body.deleted;
+  }
+
+  async createCollection(
+    collection: string,
+    indexes: CollectionIndex[] = [],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#request(
+      "/v1/collections/create",
+      {
+        collection,
+        indexes: indexes.map((index) => ({ field: index.field, unique: index.unique ?? false })),
+      },
+      signal,
+    );
+  }
+
+  async getDocument<T = JsonValue>(
+    collection: string,
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<T | null> {
+    const body = await this.#request<{ document: T | null }>(
+      "/v1/documents/get",
+      { collection, id },
+      signal,
+    );
+    return body.document;
+  }
+
+  async putDocument(
+    collection: string,
+    id: string,
+    document: unknown,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await this.#request("/v1/documents/put", { collection, id, document }, signal);
+  }
+
+  async deleteDocument(collection: string, id: string, signal?: AbortSignal): Promise<boolean> {
+    const body = await this.#request<{ existed: boolean }>(
+      "/v1/documents/delete",
+      { collection, id },
+      signal,
+    );
+    return body.existed;
+  }
+
+  async listDocuments<T = JsonValue>(
+    collection: string,
+    options: DocumentQueryOptions = {},
+    signal?: AbortSignal,
+  ): Promise<Array<VyrnDocument<T>>> {
+    const body = await this.#request<{ documents: Array<VyrnDocument<T>> }>(
+      "/v1/documents/list",
+      { collection, ...(options.limit === undefined ? {} : { limit: options.limit }) },
+      signal,
+    );
+    return body.documents;
+  }
+
+  async queryDocuments<T = JsonValue>(
+    collection: string,
+    field: string,
+    value: JsonValue,
+    options: DocumentQueryOptions = {},
+    signal?: AbortSignal,
+  ): Promise<Array<VyrnDocument<T>>> {
+    const body = await this.#request<{ documents: Array<VyrnDocument<T>> }>(
+      "/v1/documents/query",
+      {
+        collection,
+        field,
+        value,
+        ...(options.limit === undefined ? {} : { limit: options.limit }),
+      },
+      signal,
+    );
+    return body.documents;
+  }
+
+  async *subscribeCollection<T = JsonValue>(
+    collection: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<VyrnDocumentChange<T>> {
+    const path = `/v1/documents/subscribe?collection=${encodeURIComponent(collection)}`;
+    for await (const parsed of this.#events(path, signal)) {
+      const change = parsed as { sequence: number; id: string; document: T | null };
+      yield { sequence: change.sequence, id: change.id, document: change.document };
+    }
+  }
+
+  async *subscribe(prefix: VyrnBytes, signal?: AbortSignal): AsyncGenerator<VyrnChange> {
+    const path = `/v1/subscribe?prefix=${encodeURIComponent(encode(prefix))}`;
+    for await (const parsed of this.#events(path, signal)) {
+      const change = parsed as { sequence: number; key: string; value: string | null };
+      yield {
+        sequence: change.sequence,
+        key: decode(change.key),
+        value: change.value === null ? null : decode(change.value),
+      };
+    }
+  }
+
+  async *#events(path: string, signal?: AbortSignal): AsyncGenerator<unknown> {
+    const response = await this.#fetch(`${this.#url}${path}`, {
+      headers: { authorization: `Bearer ${this.#token}`, accept: "text/event-stream" },
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (!response.ok) throw await responseError(response);
+    if (!response.body) throw new VyrnError(0, "invalid_response", "subscription response has no body");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
