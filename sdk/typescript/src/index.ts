@@ -238,3 +238,83 @@ export class VyrnClient {
     let buffer = "";
     try {
       while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+        let boundary: number;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const event = parseEvent(block);
+          if (!event.data) continue;
+          const parsed = JSON.parse(event.data) as { error?: { code: string; message: string } };
+          if (parsed.error) throw new VyrnError(0, parsed.error.code, parsed.error.message);
+          yield parsed;
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        reader.releaseLock();
+      }
+    }
+  }
+
+  async #request<T = unknown>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    const response = await this.#fetch(`${this.#url}${path}`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${this.#token}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (!response.ok) throw await responseError(response);
+    if (response.status === 204) return undefined as T;
+    return (await response.json()) as T;
+  }
+}
+
+export function text(value: Uint8Array): string {
+  return new TextDecoder().decode(value);
+}
+
+function encode(value: VyrnBytes): string {
+  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+  if (typeof Buffer !== "undefined") return Buffer.from(bytes).toString("base64");
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function decode(value: string): Uint8Array {
+  if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(value, "base64"));
+  const binary = atob(value);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function parseEvent(block: string): { event: string; data: string } {
+  let event = "message";
+  const data: string[] = [];
+  for (const line of block.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trimStart();
+    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+  }
+  return { event, data: data.join("\n") };
+}
+
+async function responseError(response: Response): Promise<VyrnError> {
+  try {
+    const body = (await response.json()) as { error?: { code?: string; message?: string } };
+    return new VyrnError(
+      response.status,
+      body.error?.code ?? "request_failed",
+      body.error?.message ?? `request failed with status ${response.status}`,
+    );
+  } catch {
+    return new VyrnError(response.status, "request_failed", `request failed with status ${response.status}`);
+  }
+}
+
+declare const Buffer:
+  | { from(value: Uint8Array | string, encoding?: string): { toString(encoding: string): string; [index: number]: number; length: number } }
+  | undefined;
