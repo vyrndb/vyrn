@@ -1,0 +1,57 @@
+services:
+  vyrn:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7432:7432"
+      - "127.0.0.1:7433:7433"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/vyrn-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - vyrn-data:/var/lib/vyrn
+    secrets:
+      - vyrn_password_hash
+      - vyrn_tls_cert
+      - vyrn_tls_key
+    read_only: true
+
+  vyrn-http:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["vyrn-http"]
+    environment:
+      VYRN_HTTP_BIND: 0.0.0.0:7434
+      VYRN_URL: vyrn://vyrn@vyrn:7432/default
+      VYRN_PASSWORD_FILE: /run/secrets/vyrn_password
+      VYRN_TLS_CA_FILE: /run/secrets/vyrn_tls_ca
+      VYRN_HTTP_TOKEN_FILE: /run/secrets/vyrn_http_token
+    ports:
+      - "127.0.0.1:7434:7434"
+    depends_on:
+      vyrn:
+        condition: service_healthy
+    secrets:
+      - vyrn_password
+      - vyrn_tls_ca
+      - vyrn_http_token
+    read_only: true
+
+secrets:
+  vyrn_password_hash:
+    file: ./secrets/password.phc
+  vyrn_tls_cert:
+    file: ./secrets/server.crt.pem
+  vyrn_tls_key:
+    file: ./secrets/server.key.pem
+  vyrn_password:
+    file: ./secrets/password.txt
+  vyrn_tls_ca:
+    file: ./secrets/ca.crt.pem
+  vyrn_http_token:
+    file: ./secrets/http-token.txt
+
+volumes:
+  vyrn-data:
