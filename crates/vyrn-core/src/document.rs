@@ -78,3 +78,83 @@ impl Engine {
         Ok(Collection {
             engine: self,
             name,
+            indexes: definitions,
+        })
+    }
+
+    pub fn collection_indexes(&self, name: &str) -> Result<Vec<(String, bool)>> {
+        validate_segment("collection", name)?;
+        Ok(stored_indexes(self, name)?.into_iter().collect())
+    }
+
+    pub fn open_collection(&self, name: impl Into<String>) -> Result<CollectionView<'_>> {
+        let name = name.into();
+        validate_segment("collection", &name)?;
+        let indexes = stored_indexes(self, &name)?;
+        Ok(CollectionView {
+            engine: self,
+            name,
+            indexes,
+        })
+    }
+}
+
+pub struct CollectionView<'a> {
+    engine: &'a Engine,
+    name: String,
+    indexes: BTreeMap<String, bool>,
+}
+
+impl CollectionView<'_> {
+    pub fn get(&self, id: &str) -> Result<Option<Document>> {
+        get_document(self.engine, &self.name, id)
+    }
+
+    pub fn find(&self, field: &str, value: &Value, limit: usize) -> Result<Vec<Document>> {
+        find_documents(self.engine, &self.name, &self.indexes, field, value, limit)
+    }
+
+    pub fn all(&self, limit: usize) -> Result<Vec<Document>> {
+        all_documents(self.engine, &self.name, limit)
+    }
+}
+
+impl Collection<'_> {
+    pub fn get(&self, id: &str) -> Result<Option<Document>> {
+        get_document(self.engine, &self.name, id)
+    }
+
+    pub fn put<T: Serialize>(&mut self, id: &str, value: &T) -> Result<()> {
+        let value = serde_json::to_value(value)
+            .map_err(|error| invalid_document(format!("document is not valid JSON: {error}")))?;
+        let Value::Object(value) = value else {
+            return Err(invalid_document("document must be a JSON object"));
+        };
+        self.put_object(id, value)
+    }
+
+    pub fn delete(&mut self, id: &str) -> Result<bool> {
+        let key = document_key(&self.name, id)?;
+        let Some(previous) = self.engine.get_internal(&key)? else {
+            return Ok(false);
+        };
+        let previous = decode_object(&previous)?;
+        let updates = self.index_updates(&key, Some(&previous), None)?;
+        let results = self
+            .engine
+            .write_indexed_internal(vec![BatchOperation::Delete(key)], updates)?;
+        Ok(matches!(
+            results.first(),
+            Some(crate::BatchResult::Delete { existed: true })
+        ))
+    }
+
+    pub fn find(&self, field: &str, value: &Value, limit: usize) -> Result<Vec<Document>> {
+        find_documents(self.engine, &self.name, &self.indexes, field, value, limit)
+    }
+
+    pub fn all(&self, limit: usize) -> Result<Vec<Document>> {
+        all_documents(self.engine, &self.name, limit)
+    }
+
+    fn put_object(&mut self, id: &str, value: Map<String, Value>) -> Result<()> {
