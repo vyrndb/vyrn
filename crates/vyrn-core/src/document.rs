@@ -318,3 +318,111 @@ fn document_key(collection: &str, id: &str) -> Result<Vec<u8>> {
         return Err(Error::KeyTooLarge);
     }
     Ok(key)
+}
+
+fn index_name(collection: &str, field: &str) -> Result<Vec<u8>> {
+    validate_segment("collection", collection)?;
+    validate_segment("field", field)?;
+    let mut name = index_prefix(collection)?;
+    append_segment(&mut name, field)?;
+    Ok(name)
+}
+
+fn index_prefix(collection: &str) -> Result<Vec<u8>> {
+    validate_segment("collection", collection)?;
+    let mut name = INDEX_PREFIX.to_vec();
+    append_segment(&mut name, collection)?;
+    Ok(name)
+}
+
+fn stored_indexes(engine: &Engine, collection: &str) -> Result<BTreeMap<String, bool>> {
+    let prefix = index_prefix(collection)?;
+    let mut definitions = BTreeMap::new();
+    for (name, unique) in engine
+        .indexes
+        .range(prefix.clone()..)
+        .take_while(|(name, _)| name.starts_with(&prefix))
+    {
+        let encoded = &name[prefix.len()..];
+        if encoded.len() < 2 {
+            return Err(invalid_document("stored document index has no field"));
+        }
+        let length = u16::from_be_bytes([encoded[0], encoded[1]]) as usize;
+        if length == 0 || encoded.len() != length + 2 {
+            return Err(invalid_document(
+                "stored document index has an invalid field",
+            ));
+        }
+        let field = String::from_utf8(encoded[2..].to_vec())
+            .map_err(|_| invalid_document("stored document index field is not UTF-8"))?;
+        definitions.insert(field, *unique);
+    }
+    Ok(definitions)
+}
+
+fn append_segment(output: &mut Vec<u8>, value: &str) -> Result<()> {
+    let length: u16 = value.len().try_into().map_err(|_| Error::KeyTooLarge)?;
+    output.extend_from_slice(&length.to_be_bytes());
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn decode_document_id(collection: &str, key: &[u8]) -> Result<String> {
+    let prefix = collection_prefix(collection)?;
+    let encoded = key
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(|| invalid_document("document key is outside its collection"))?;
+    if encoded.len() < 2 {
+        return Err(invalid_document("document key has no ID"));
+    }
+    let length = u16::from_be_bytes([encoded[0], encoded[1]]) as usize;
+    if length == 0 || encoded.len() != length + 2 {
+        return Err(invalid_document("document key has an invalid ID"));
+    }
+    String::from_utf8(encoded[2..].to_vec())
+        .map_err(|_| invalid_document("document ID is not UTF-8"))
+}
+
+fn decode_document(id: String, bytes: &[u8]) -> Result<Document> {
+    Ok(Document {
+        id,
+        value: decode_object(bytes)?,
+    })
+}
+
+fn decode_object(bytes: &[u8]) -> Result<Map<String, Value>> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| invalid_document(format!("stored document is invalid JSON: {error}")))?;
+    match value {
+        Value::Object(object) => Ok(object),
+        _ => Err(invalid_document("stored document is not a JSON object")),
+    }
+}
+
+fn encode_index_value(value: &Value) -> Result<Vec<u8>> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_vec(value)
+                .map_err(|error| invalid_document(format!("index value encoding failed: {error}")))
+        }
+        Value::Array(_) | Value::Object(_) => Err(invalid_document(
+            "indexed document fields must be null, boolean, number, or string",
+        )),
+    }
+}
+
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn invalid_document(message: impl Into<String>) -> Error {
+    Error::InvalidDocument(message.into())
+}
