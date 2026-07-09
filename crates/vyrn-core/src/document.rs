@@ -238,3 +238,83 @@ fn read_segment(encoded: &[u8]) -> Option<(String, &[u8])> {
     }
     let value = String::from_utf8(encoded[2..2 + length].to_vec()).ok()?;
     Some((value, &encoded[2 + length..]))
+}
+
+fn get_document(engine: &Engine, collection: &str, id: &str) -> Result<Option<Document>> {
+    let key = document_key(collection, id)?;
+    engine
+        .get_internal(&key)?
+        .map(|bytes| decode_document(id.to_owned(), &bytes))
+        .transpose()
+}
+
+fn find_documents(
+    engine: &Engine,
+    collection: &str,
+    indexes: &BTreeMap<String, bool>,
+    field: &str,
+    value: &Value,
+    limit: usize,
+) -> Result<Vec<Document>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !indexes.contains_key(field) {
+        return Err(Error::IndexNotFound);
+    }
+    let index = index_name(collection, field)?;
+    let value = encode_index_value(value)?;
+    engine
+        .lookup_index(&index, &value, limit)?
+        .into_iter()
+        .map(|key| {
+            let id = decode_document_id(collection, &key)?;
+            let bytes = engine
+                .get_internal(&key)?
+                .ok_or_else(|| invalid_document("document index references a missing document"))?;
+            decode_document(id, &bytes)
+        })
+        .collect()
+}
+
+fn all_documents(engine: &Engine, collection: &str, limit: usize) -> Result<Vec<Document>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let prefix = collection_prefix(collection)?;
+    let end = prefix_end(&prefix);
+    engine
+        .scan_internal(Some(&prefix), end.as_deref(), limit)?
+        .into_iter()
+        .map(|(key, value)| {
+            let id = decode_document_id(collection, &key)?;
+            decode_document(id, &value)
+        })
+        .collect()
+}
+
+fn validate_segment(kind: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(invalid_document(format!("{kind} cannot be empty")));
+    }
+    if value.len() > u16::MAX as usize {
+        return Err(Error::KeyTooLarge);
+    }
+    Ok(())
+}
+
+fn collection_prefix(collection: &str) -> Result<Vec<u8>> {
+    validate_segment("collection", collection)?;
+    let mut key = DOCUMENT_PREFIX.to_vec();
+    append_segment(&mut key, collection)?;
+    Ok(key)
+}
+
+fn document_key(collection: &str, id: &str) -> Result<Vec<u8>> {
+    validate_segment("document ID", id)?;
+    let mut key = collection_prefix(collection)?;
+    append_segment(&mut key, id)?;
+    if key.len() > MAX_KEY_SIZE {
+        return Err(Error::KeyTooLarge);
+    }
+    Ok(key)
