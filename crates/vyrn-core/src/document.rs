@@ -158,3 +158,83 @@ impl Collection<'_> {
     }
 
     fn put_object(&mut self, id: &str, value: Map<String, Value>) -> Result<()> {
+        let key = document_key(&self.name, id)?;
+        let previous = self
+            .engine
+            .get_internal(&key)?
+            .map(|bytes| decode_object(&bytes))
+            .transpose()?;
+        let updates = self.index_updates(&key, previous.as_ref(), Some(&value))?;
+        let bytes = serde_json::to_vec(&Value::Object(value))
+            .map_err(|error| invalid_document(format!("document encoding failed: {error}")))?;
+        self.engine
+            .write_indexed_internal(vec![BatchOperation::Put(key, bytes)], updates)?;
+        Ok(())
+    }
+
+    fn index_updates(
+        &self,
+        primary_key: &[u8],
+        old: Option<&Map<String, Value>>,
+        new: Option<&Map<String, Value>>,
+    ) -> Result<Vec<IndexUpdate>> {
+        self.indexes
+            .keys()
+            .map(|field| {
+                Ok(IndexUpdate {
+                    index: index_name(&self.name, field)?,
+                    primary_key: primary_key.to_vec(),
+                    old_value: old
+                        .and_then(|object| object.get(field))
+                        .map(encode_index_value)
+                        .transpose()?,
+                    new_value: new
+                        .and_then(|object| object.get(field))
+                        .map(encode_index_value)
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+}
+
+pub fn collection_key_prefix(collection: &str) -> Result<Vec<u8>> {
+    collection_prefix(collection)
+}
+
+pub fn document_change_key(collection: &str, id: &str) -> Result<Vec<u8>> {
+    document_key(collection, id)
+}
+
+pub fn document_id_from_key(collection: &str, key: &[u8]) -> Result<String> {
+    decode_document_id(collection, key)
+}
+
+/// Decodes a stored document key into its collection and ID.
+///
+/// Returns `None` for any key that is not a well-formed document key, so the
+/// change log can fall back to publishing the raw key.
+pub fn change_target(key: &[u8]) -> Option<crate::change_log::DocumentTarget> {
+    target_from_key(key)
+}
+
+pub(crate) fn target_from_key(key: &[u8]) -> Option<crate::change_log::DocumentTarget> {
+    let encoded = key.strip_prefix(DOCUMENT_KEY_PREFIX)?;
+    let (collection, rest) = read_segment(encoded)?;
+    let (id, rest) = read_segment(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(crate::change_log::DocumentTarget { collection, id })
+}
+
+fn read_segment(encoded: &[u8]) -> Option<(String, &[u8])> {
+    if encoded.len() < 2 {
+        return None;
+    }
+    let length = u16::from_be_bytes([encoded[0], encoded[1]]) as usize;
+    if length == 0 || encoded.len() < 2 + length {
+        return None;
+    }
+    let value = String::from_utf8(encoded[2..2 + length].to_vec()).ok()?;
+    Some((value, &encoded[2 + length..]))
