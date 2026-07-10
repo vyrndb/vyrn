@@ -68,3 +68,73 @@ impl Cursor {
         let mut suffix = Vec::with_capacity(SUFFIX_LEN);
         suffix.extend_from_slice(&self.sequence.to_be_bytes());
         suffix.extend_from_slice(&self.index.to_be_bytes());
+        suffix
+    }
+
+    pub(crate) fn from_suffix(suffix: &[u8]) -> Result<Self> {
+        if suffix.len() != SUFFIX_LEN {
+            return Err(corrupt("change log key has an invalid cursor"));
+        }
+        Ok(Self {
+            sequence: u64::from_be_bytes(suffix[0..8].try_into().unwrap()),
+            index: u32::from_be_bytes(suffix[8..12].try_into().unwrap()),
+        })
+    }
+}
+
+pub(crate) const SUFFIX_LEN: usize = 12;
+
+pub(crate) fn encode_entry(key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len() + value.map_or(0, <[u8]>::len) + 5);
+    encoded.push(u8::from(value.is_some()));
+    encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(key);
+    if let Some(value) = value {
+        encoded.extend_from_slice(value);
+    }
+    encoded
+}
+
+pub(crate) fn decode_entry(suffix: &[u8], encoded: &[u8]) -> Result<ChangeRecord> {
+    let cursor = Cursor::from_suffix(suffix)?;
+    if encoded.len() < 5 {
+        return Err(corrupt("change log entry is truncated"));
+    }
+    let present = match encoded[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(corrupt("change log entry has an invalid presence flag")),
+    };
+    let key_len = u32::from_be_bytes(encoded[1..5].try_into().unwrap()) as usize;
+    if key_len == 0 || key_len > MAX_KEY_SIZE || encoded.len() < 5 + key_len {
+        return Err(corrupt("change log entry has an invalid key length"));
+    }
+    if !present && encoded.len() != 5 + key_len {
+        return Err(corrupt("change log deletion carries a value"));
+    }
+    let key = encoded[5..5 + key_len].to_vec();
+    Ok(ChangeRecord {
+        sequence: cursor.sequence,
+        index: cursor.index,
+        document: crate::document::target_from_key(&key),
+        key,
+        value: present.then(|| encoded[5 + key_len..].to_vec()),
+    })
+}
+
+fn corrupt(reason: &str) -> Error {
+    Error::CorruptManifest(reason.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entries_round_trip_with_cursors() {
+        let cursor = Cursor::new(7, 2);
+        let encoded = encode_entry(b"users/1", Some(b"active"));
+        let record = decode_entry(&cursor.suffix(), &encoded).unwrap();
+        assert_eq!(record.cursor(), cursor);
+        assert_eq!(record.key, b"users/1");
+        assert_eq!(record.value.as_deref(), Some(&b"active"[..]));
