@@ -138,3 +138,28 @@ mod tests {
         assert_eq!(record.cursor(), cursor);
         assert_eq!(record.key, b"users/1");
         assert_eq!(record.value.as_deref(), Some(&b"active"[..]));
+
+        let deletion = decode_entry(&cursor.suffix(), &encode_entry(b"users/1", None)).unwrap();
+        assert_eq!(deletion.value, None);
+    }
+
+    #[test]
+    fn cursor_tokens_round_trip_and_order() {
+        let cursor = Cursor::new(4_294_967_296, 5);
+        assert_eq!(Cursor::parse_token(&cursor.to_token()).unwrap(), cursor);
+        assert!(Cursor::new(1, 2) < Cursor::new(1, 3));
+        assert!(Cursor::new(1, 9) < Cursor::new(2, 0));
+        assert!(Cursor::parse_token("nope").is_err());
+        assert!(Cursor::parse_token("zz-01").is_err());
+    }
+
+    #[test]
+    fn rejects_corrupt_entries() {
+        let suffix = Cursor::new(1, 0).suffix();
+        assert!(decode_entry(&suffix[..4], b"\x00\x00\x00\x00\x01a").is_err());
+        assert!(decode_entry(&suffix, b"").is_err());
+        assert!(decode_entry(&suffix, b"\x02\x00\x00\x00\x01a").is_err());
+        assert!(decode_entry(&suffix, b"\x00\x00\x00\x00\x00").is_err());
+        assert!(decode_entry(&suffix, b"\x00\x00\x00\x00\x01ab").is_err());
+    }
+}
