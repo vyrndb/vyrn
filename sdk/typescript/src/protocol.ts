@@ -128,3 +128,133 @@ class Writer {
   }
 
   bytes(value: Uint8Array): void {
+    this.u32(value.length);
+    this.#push(value);
+  }
+
+  string(value: string): void {
+    this.bytes(new TextEncoder().encode(value));
+  }
+
+  optionalBytes(value: Uint8Array | null): void {
+    if (value === null) {
+      this.u8(0);
+      return;
+    }
+    this.u8(1);
+    this.bytes(value);
+  }
+
+  optionalString(value: string | null): void {
+    this.optionalBytes(value === null ? null : new TextEncoder().encode(value));
+  }
+
+  finish(): Uint8Array {
+    const output = new Uint8Array(this.#length);
+    let offset = 0;
+    for (const chunk of this.#chunks) {
+      output.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return output;
+  }
+
+  #push(chunk: Uint8Array): void {
+    this.#chunks.push(chunk);
+    this.#length += chunk.length;
+  }
+}
+
+class Reader {
+  readonly #view: DataView;
+  #offset = 0;
+
+  constructor(private readonly source: Uint8Array) {
+    this.#view = new DataView(source.buffer, source.byteOffset, source.byteLength);
+  }
+
+  u8(): number {
+    this.#require(1);
+    return this.#view.getUint8(this.#offset++);
+  }
+
+  u16(): number {
+    this.#require(2);
+    const value = this.#view.getUint16(this.#offset, false);
+    this.#offset += 2;
+    return value;
+  }
+
+  u32(): number {
+    this.#require(4);
+    const value = this.#view.getUint32(this.#offset, false);
+    this.#offset += 4;
+    return value;
+  }
+
+  u64(): number {
+    this.#require(8);
+    const value = this.#view.getBigUint64(this.#offset, false);
+    this.#offset += 8;
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new ProtocolError("64-bit value exceeds safe integer range");
+    }
+    return Number(value);
+  }
+
+  bytes(): Uint8Array {
+    const length = this.u32();
+    if (length > MAX_FRAME_SIZE) throw new ProtocolError("byte field exceeds limit");
+    this.#require(length);
+    const value = this.source.subarray(this.#offset, this.#offset + length);
+    this.#offset += length;
+    return new Uint8Array(value);
+  }
+
+  string(): string {
+    return new TextDecoder("utf-8", { fatal: true }).decode(this.bytes());
+  }
+
+  optionalBytes(): Uint8Array | null {
+    const present = this.u8();
+    if (present === 0) return null;
+    if (present !== 1) throw new ProtocolError("invalid optional value");
+    return this.bytes();
+  }
+
+  bool(): boolean {
+    const value = this.u8();
+    if (value > 1) throw new ProtocolError("invalid boolean");
+    return value === 1;
+  }
+
+  count(limit: number, label: string): number {
+    const count = this.u32();
+    if (count > limit) throw new ProtocolError(`too many ${label}`);
+    return count;
+  }
+
+  get done(): boolean {
+    return this.#offset === this.source.length;
+  }
+
+  #require(length: number): void {
+    if (this.#offset + length > this.source.length) {
+      throw new ProtocolError("truncated message");
+    }
+  }
+}
+
+export function encodeEnvelope(envelope: Envelope): Uint8Array {
+  const writer = new Writer();
+  writer.u16(envelope.version);
+  writer.u64(envelope.requestId);
+  encodeMessage(envelope.message, writer);
+  const payload = writer.finish();
+  if (payload.length > MAX_FRAME_SIZE) {
+    throw new ProtocolError("message exceeds frame limit");
+  }
+  const frame = new Uint8Array(4 + payload.length);
+  new DataView(frame.buffer).setUint32(0, payload.length, false);
+  frame.set(payload, 4);
+  return frame;
