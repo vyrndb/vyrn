@@ -388,3 +388,133 @@ export function decodeEnvelope(payload: Uint8Array): Envelope {
   const version = reader.u16();
   const requestId = reader.u64();
   const message = decodeMessage(reader);
+  if (!reader.done) throw new ProtocolError("trailing bytes");
+  return { version, requestId, message };
+}
+
+function decodeMessage(reader: Reader): Message {
+  const kind = reader.u8();
+  switch (kind) {
+    case 6:
+      return { type: "authenticated" };
+    case 7:
+      return { type: "value", value: reader.optionalBytes() };
+    case 8:
+      return { type: "written" };
+    case 9:
+      return { type: "deleted", existed: reader.bool() };
+    case 10: {
+      const count = reader.count(MAX_SCAN_LIMIT, "rows");
+      const rows: Array<[Uint8Array, Uint8Array]> = [];
+      for (let index = 0; index < count; index += 1) rows.push([reader.bytes(), reader.bytes()]);
+      return { type: "rows", rows };
+    }
+    case 11: {
+      const code = reader.u8();
+      const mapped = ERROR_CODES[code];
+      if (!mapped) throw new ProtocolError("unknown error code");
+      return { type: "error", code: mapped, message: reader.string() };
+    }
+    case 13:
+      return { type: "subscribed" };
+    case 14:
+      return {
+        type: "change",
+        sequence: reader.u64(),
+        key: reader.bytes(),
+        value: reader.optionalBytes(),
+      };
+    case 18:
+      return { type: "begun" };
+    case 19:
+      return { type: "committed" };
+    case 20:
+      return { type: "rolledBack" };
+    case 25:
+      return { type: "indexCreated" };
+    case 26:
+      return { type: "indexDropped" };
+    case 27:
+      return { type: "indexUpdated" };
+    case 28: {
+      const count = reader.count(MAX_SCAN_LIMIT, "keys");
+      const keys: Uint8Array[] = [];
+      for (let index = 0; index < count; index += 1) keys.push(reader.bytes());
+      return { type: "keys", keys };
+    }
+    case 30: {
+      const count = reader.count(MAX_SCAN_LIMIT, "values");
+      const values: Array<Uint8Array | null> = [];
+      for (let index = 0; index < count; index += 1) values.push(reader.optionalBytes());
+      return { type: "values", values };
+    }
+    case 38:
+      return { type: "collectionCreated" };
+    case 39:
+      return { type: "documentValue", document: reader.optionalBytes() };
+    case 40:
+      return { type: "documentWritten" };
+    case 41:
+      return { type: "documentDeleted", existed: reader.bool() };
+    case 42: {
+      const count = reader.count(MAX_SCAN_LIMIT, "documents");
+      const documents: Array<[string, Uint8Array]> = [];
+      for (let index = 0; index < count; index += 1) documents.push([reader.string(), reader.bytes()]);
+      return { type: "documents", documents };
+    }
+    case 43:
+      return { type: "collectionSubscribed" };
+    case 44:
+      return {
+        type: "documentChange",
+        sequence: reader.u64(),
+        id: reader.string(),
+        document: reader.optionalBytes(),
+      };
+    case 47:
+      return {
+        type: "cursorChange",
+        cursor: reader.string(),
+        key: reader.bytes(),
+        value: reader.optionalBytes(),
+      };
+    case 48:
+      return {
+        type: "cursorDocumentChange",
+        cursor: reader.string(),
+        collection: reader.string(),
+        id: reader.string(),
+        document: reader.optionalBytes(),
+      };
+    case 49:
+      return { type: "caught", cursor: reader.string() };
+    default:
+      throw new ProtocolError(`unexpected server message type ${kind}`);
+  }
+}
+
+export class FrameDecoder {
+  #buffer = new Uint8Array(0);
+
+  push(chunk: Uint8Array): void {
+    const combined = new Uint8Array(this.#buffer.length + chunk.length);
+    combined.set(this.#buffer);
+    combined.set(chunk, this.#buffer.length);
+    this.#buffer = combined;
+  }
+
+  next(): Envelope | null {
+    if (this.#buffer.length < 4) return null;
+    const length = new DataView(
+      this.#buffer.buffer,
+      this.#buffer.byteOffset,
+      this.#buffer.byteLength,
+    ).getUint32(0, false);
+    if (length > MAX_FRAME_SIZE) throw new ProtocolError("frame exceeds maximum size");
+    if (this.#buffer.length < 4 + length) return null;
+    const payload = this.#buffer.subarray(4, 4 + length);
+    const envelope = decodeEnvelope(new Uint8Array(payload));
+    this.#buffer = new Uint8Array(this.#buffer.subarray(4 + length));
+    return envelope;
+  }
+}
