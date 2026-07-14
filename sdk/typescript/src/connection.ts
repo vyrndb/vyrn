@@ -98,3 +98,103 @@ export function parseConnectionUrl(url: string, passwordOverride?: string): Pars
     tlsRequired,
   };
 }
+
+interface Pending {
+  requestId: number;
+  resolve: (message: Message) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+/**
+ * One authenticated connection over Vyrn's native protocol.
+ *
+ * Requests are strictly serialized: the server answers one request per
+ * connection at a time, so callers must not issue concurrent requests on a
+ * single connection. Use a pool for concurrency.
+ */
+export class Connection {
+  readonly #socket: Socket;
+  readonly #decoder = new FrameDecoder();
+  readonly #timeoutMs: number;
+  #pending: Pending | null = null;
+  #streamHandler: ((envelope: Envelope) => void) | null = null;
+  #streamClose: ((error: Error) => void) | null = null;
+  #nextRequestId = 1;
+  #closed: Error | null = null;
+
+  private constructor(socket: Socket, timeoutMs: number) {
+    this.#socket = socket;
+    this.#timeoutMs = timeoutMs;
+    socket.on("data", (chunk: Buffer) => this.#onData(chunk));
+    socket.on("error", (error: Error) => this.#fail(new VyrnConnectionError(error.message)));
+    socket.on("close", () => this.#fail(new VyrnConnectionError("connection closed by server")));
+  }
+
+  static async connect(options: ConnectionOptions): Promise<Connection> {
+    const parsed = parseConnectionUrl(options.url, options.password);
+    const timeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    let ca: string | Buffer | undefined = options.ca;
+    if (ca === undefined && options.caFile !== undefined) {
+      ca = await readFile(options.caFile);
+    }
+    if (parsed.tlsRequired && ca === undefined) {
+      throw new VyrnConnectionError("TLS requires a CA certificate; pass ca or caFile");
+    }
+
+    const socket = await new Promise<Socket>((resolve, reject) => {
+      const pending: Socket = parsed.tlsRequired
+        ? tlsConnect({
+            host: parsed.host,
+            port: parsed.port,
+            servername: parsed.host,
+            ca,
+            minVersion: "TLSv1.3",
+          })
+        : netConnect({ host: parsed.host, port: parsed.port });
+      const onReady = () => {
+        pending.removeListener("error", onError);
+        resolve(pending);
+      };
+      const onError = (error: Error) => {
+        pending.removeListener(parsed.tlsRequired ? "secureConnect" : "connect", onReady);
+        pending.destroy();
+        reject(new VyrnConnectionError(error.message));
+      };
+      pending.setNoDelay(true);
+      pending.once(parsed.tlsRequired ? "secureConnect" : "connect", onReady);
+      pending.once("error", onError);
+    });
+
+    const connection = new Connection(socket, timeoutMs);
+    const response = await connection.request({
+      type: "authenticate",
+      username: parsed.username,
+      password: parsed.password,
+      database: parsed.database,
+    });
+    if (response.type !== "authenticated") {
+      connection.close();
+      throw new VyrnConnectionError("unexpected authentication response");
+    }
+    return connection;
+  }
+
+  get closed(): boolean {
+    return this.#closed !== null;
+  }
+
+  async request(message: Message): Promise<Message> {
+    if (this.#closed) throw this.#closed;
+    if (this.#pending) {
+      throw new VyrnConnectionError("a request is already in flight on this connection");
+    }
+    const requestId = this.#nextRequestId;
+    this.#nextRequestId = requestId >= Number.MAX_SAFE_INTEGER ? 1 : requestId + 1;
+
+    return new Promise<Message>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending = null;
+        this.#fail(new VyrnConnectionError("request timed out"));
+      }, this.#timeoutMs);
+      timer.unref?.();
