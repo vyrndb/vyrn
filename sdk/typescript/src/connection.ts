@@ -198,3 +198,93 @@ export class Connection {
         this.#fail(new VyrnConnectionError("request timed out"));
       }, this.#timeoutMs);
       timer.unref?.();
+      this.#pending = { requestId, resolve, reject, timer };
+      try {
+        this.#socket.write(encodeEnvelope({ version: PROTOCOL_VERSION, requestId, message }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.#pending = null;
+        reject(new VyrnConnectionError((error as Error).message));
+      }
+    });
+  }
+
+  /** Converts an error response into a thrown VyrnServerError. */
+  async call(message: Message): Promise<Message> {
+    const response = await this.request(message);
+    if (response.type === "error") throw new VyrnServerError(response.code, response.message);
+    return response;
+  }
+
+  /**
+   * Switches this connection into server-push mode for subscriptions. The
+   * connection can no longer be used for requests afterwards.
+   */
+  stream(onEnvelope: (envelope: Envelope) => void, onClose: (error: Error) => void): void {
+    this.#streamHandler = onEnvelope;
+    this.#streamClose = onClose;
+  }
+
+  close(): void {
+    this.#fail(new VyrnConnectionError("connection closed"));
+    this.#socket.destroy();
+  }
+
+  #onData(chunk: Buffer): void {
+    try {
+      this.#decoder.push(new Uint8Array(chunk));
+      let envelope = this.#decoder.next();
+      while (envelope !== null) {
+        this.#dispatch(envelope);
+        envelope = this.#decoder.next();
+      }
+    } catch (error) {
+      this.#fail(
+        error instanceof ProtocolError ? error : new VyrnConnectionError((error as Error).message),
+      );
+      this.#socket.destroy();
+    }
+  }
+
+  #dispatch(envelope: Envelope): void {
+    if (envelope.version !== PROTOCOL_VERSION) {
+      this.#fail(new ProtocolError("server used an unsupported protocol version"));
+      this.#socket.destroy();
+      return;
+    }
+    const pending = this.#pending;
+    if (pending) {
+      if (envelope.requestId !== pending.requestId) {
+        this.#fail(new ProtocolError("response request ID did not match"));
+        this.#socket.destroy();
+        return;
+      }
+      clearTimeout(pending.timer);
+      this.#pending = null;
+      pending.resolve(envelope.message);
+      return;
+    }
+    if (this.#streamHandler) {
+      this.#streamHandler(envelope);
+      return;
+    }
+    this.#fail(new ProtocolError("server sent an unsolicited message"));
+    this.#socket.destroy();
+  }
+
+  #fail(error: Error): void {
+    if (this.#closed) return;
+    this.#closed = error;
+    const pending = this.#pending;
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.#pending = null;
+      pending.reject(error);
+    }
+    this.#streamClose?.(error);
+  }
+}
+
+export function decodeFrame(payload: Uint8Array): Envelope {
+  return decodeEnvelope(payload);
+}
