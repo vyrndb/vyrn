@@ -258,3 +258,133 @@ export function encodeEnvelope(envelope: Envelope): Uint8Array {
   new DataView(frame.buffer).setUint32(0, payload.length, false);
   frame.set(payload, 4);
   return frame;
+}
+
+function encodeMessage(message: Message, writer: Writer): void {
+  switch (message.type) {
+    case "authenticate":
+      writer.u8(1);
+      writer.string(message.username);
+      writer.string(message.password);
+      writer.string(message.database);
+      return;
+    case "get":
+      writer.u8(2);
+      writer.bytes(message.key);
+      return;
+    case "put":
+      writer.u8(3);
+      writer.bytes(message.key);
+      writer.bytes(message.value);
+      return;
+    case "delete":
+      writer.u8(4);
+      writer.bytes(message.key);
+      return;
+    case "scan":
+      writer.u8(5);
+      writer.optionalBytes(message.start);
+      writer.optionalBytes(message.end);
+      writer.u32(message.limit);
+      return;
+    case "subscribe":
+      writer.u8(12);
+      writer.bytes(message.prefix);
+      return;
+    case "begin":
+      writer.u8(15);
+      return;
+    case "commit":
+      writer.u8(16);
+      return;
+    case "rollback":
+      writer.u8(17);
+      return;
+    case "createIndex":
+      writer.u8(21);
+      writer.bytes(message.name);
+      writer.u8(message.unique ? 1 : 0);
+      return;
+    case "dropIndex":
+      writer.u8(22);
+      writer.bytes(message.name);
+      return;
+    case "indexUpdate":
+      writer.u8(23);
+      writer.bytes(message.index);
+      writer.bytes(message.primaryKey);
+      writer.optionalBytes(message.oldValue);
+      writer.optionalBytes(message.newValue);
+      return;
+    case "indexLookup":
+      writer.u8(24);
+      writer.bytes(message.index);
+      writer.bytes(message.value);
+      writer.u32(message.limit);
+      return;
+    case "multiGet":
+      writer.u8(29);
+      writer.u32(message.keys.length);
+      for (const key of message.keys) writer.bytes(key);
+      return;
+    case "createCollection":
+      writer.u8(31);
+      writer.string(message.collection);
+      writer.u32(message.indexes.length);
+      for (const index of message.indexes) {
+        writer.string(index.field);
+        writer.u8(index.unique ? 1 : 0);
+      }
+      return;
+    case "getDocument":
+      writer.u8(32);
+      writer.string(message.collection);
+      writer.string(message.id);
+      return;
+    case "putDocument":
+      writer.u8(33);
+      writer.string(message.collection);
+      writer.string(message.id);
+      writer.bytes(message.document);
+      return;
+    case "deleteDocument":
+      writer.u8(34);
+      writer.string(message.collection);
+      writer.string(message.id);
+      return;
+    case "listDocuments":
+      writer.u8(35);
+      writer.string(message.collection);
+      writer.u32(message.limit);
+      return;
+    case "queryDocuments":
+      writer.u8(36);
+      writer.string(message.collection);
+      writer.string(message.field);
+      writer.bytes(message.value);
+      writer.u32(message.limit);
+      return;
+    case "subscribeCollection":
+      writer.u8(37);
+      writer.string(message.collection);
+      return;
+    case "subscribeFrom":
+      writer.u8(45);
+      writer.bytes(message.prefix);
+      writer.optionalString(message.cursor);
+      return;
+    case "subscribeCollectionFrom":
+      writer.u8(46);
+      writer.string(message.collection);
+      writer.optionalString(message.cursor);
+      return;
+    default:
+      throw new ProtocolError(`message type ${message.type} is not a client request`);
+  }
+}
+
+export function decodeEnvelope(payload: Uint8Array): Envelope {
+  const reader = new Reader(payload);
+  const version = reader.u16();
+  const requestId = reader.u64();
+  const message = decodeMessage(reader);
