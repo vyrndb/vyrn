@@ -178,3 +178,183 @@ class Operations {
  * A serializable transaction pinned to one connection.
  *
  * Reads observe the snapshot taken at begin plus this transaction's own writes.
+ * `commit` throws a VyrnServerError with code "conflict" if another commit
+ * touched a key, point read, or scanned range after that snapshot; retry the
+ * whole transaction from the start.
+ */
+export class Transaction extends Operations {
+  #finished = false;
+
+  constructor(connection: Connection, private readonly release: () => void) {
+    super(connection);
+  }
+
+  get finished(): boolean {
+    return this.#finished;
+  }
+
+  async updateIndex(
+    index: VyrnBytes,
+    primaryKey: VyrnBytes,
+    oldValue: VyrnBytes | null,
+    newValue: VyrnBytes | null,
+  ): Promise<void> {
+    const response = await this.connection.call({
+      type: "indexUpdate",
+      index: bytes(index),
+      primaryKey: bytes(primaryKey),
+      oldValue: oldValue === null ? null : bytes(oldValue),
+      newValue: newValue === null ? null : bytes(newValue),
+    });
+    if (response.type !== "indexUpdated") throw unexpected(response);
+  }
+
+  async commit(): Promise<void> {
+    this.#finish();
+    try {
+      const response = await this.connection.call({ type: "commit" });
+      if (response.type !== "committed") throw unexpected(response);
+    } finally {
+      this.release();
+    }
+  }
+
+  async rollback(): Promise<void> {
+    this.#finish();
+    try {
+      const response = await this.connection.call({ type: "rollback" });
+      if (response.type !== "rolledBack") throw unexpected(response);
+    } finally {
+      this.release();
+    }
+  }
+
+  #finish(): void {
+    if (this.#finished) throw new VyrnConnectionError("transaction is already finished");
+    this.#finished = true;
+  }
+}
+
+/** A single native connection with document, KV, and transaction APIs. */
+export class Session extends Operations {
+  static async connect(options: ConnectionOptions): Promise<Session> {
+    return new Session(await Connection.connect(options));
+  }
+
+  get closedConnection(): boolean {
+    return this.connection.closed;
+  }
+
+  close(): void {
+    this.connection.close();
+  }
+
+  async createIndex(name: VyrnBytes, unique: boolean): Promise<void> {
+    const response = await this.connection.call({
+      type: "createIndex",
+      name: bytes(name),
+      unique,
+    });
+    if (response.type !== "indexCreated") throw unexpected(response);
+  }
+
+  async dropIndex(name: VyrnBytes): Promise<void> {
+    const response = await this.connection.call({ type: "dropIndex", name: bytes(name) });
+    if (response.type !== "indexDropped") throw unexpected(response);
+  }
+
+  async createCollection(collection: string, indexes: CollectionIndex[] = []): Promise<void> {
+    const response = await this.connection.call({
+      type: "createCollection",
+      collection,
+      indexes: indexes.map((index) => ({ field: index.field, unique: index.unique ?? false })),
+    });
+    if (response.type !== "collectionCreated") throw unexpected(response);
+  }
+
+  async getDocument<T = JsonValue>(collection: string, id: string): Promise<T | null> {
+    const response = await this.connection.call({ type: "getDocument", collection, id });
+    if (response.type !== "documentValue") throw unexpected(response);
+    return response.document === null ? null : (decodeJson(response.document) as T);
+  }
+
+  async putDocument(collection: string, id: string, document: unknown): Promise<void> {
+    const response = await this.connection.call({
+      type: "putDocument",
+      collection,
+      id,
+      document: encodeJson(document),
+    });
+    if (response.type !== "documentWritten") throw unexpected(response);
+  }
+
+  async deleteDocument(collection: string, id: string): Promise<boolean> {
+    const response = await this.connection.call({ type: "deleteDocument", collection, id });
+    if (response.type !== "documentDeleted") throw unexpected(response);
+    return response.existed;
+  }
+
+  async listDocuments<T = JsonValue>(
+    collection: string,
+    options: DocumentQueryOptions = {},
+  ): Promise<Array<VyrnDocument<T>>> {
+    const response = await this.connection.call({
+      type: "listDocuments",
+      collection,
+      limit: limitOf(options.limit),
+    });
+    if (response.type !== "documents") throw unexpected(response);
+    return response.documents.map(([id, document]) => ({ id, document: decodeJson(document) as T }));
+  }
+
+  async queryDocuments<T = JsonValue>(
+    collection: string,
+    field: string,
+    value: JsonValue,
+    options: DocumentQueryOptions = {},
+  ): Promise<Array<VyrnDocument<T>>> {
+    const response = await this.connection.call({
+      type: "queryDocuments",
+      collection,
+      field,
+      value: encodeJson(value),
+      limit: limitOf(options.limit),
+    });
+    if (response.type !== "documents") throw unexpected(response);
+    return response.documents.map(([id, document]) => ({ id, document: decodeJson(document) as T }));
+  }
+
+  async begin(): Promise<Transaction> {
+    const response = await this.connection.call({ type: "begin" });
+    if (response.type !== "begun") throw unexpected(response);
+    return new Transaction(this.connection, () => {});
+  }
+
+  /**
+   * Runs `body` in a transaction, rolling back if it throws. Conflicts are
+   * retried up to `attempts` times with the transaction restarted from scratch.
+   */
+  async transaction<T>(body: (tx: Transaction) => Promise<T>, attempts = 3): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const tx = await this.begin();
+      try {
+        const result = await body(tx);
+        await tx.commit();
+        return result;
+      } catch (error) {
+        if (!tx.finished && !this.connection.closed) {
+          await tx.rollback().catch(() => {});
+        }
+        const retryable =
+          error instanceof VyrnServerError && error.code === "conflict" && !this.connection.closed;
+        if (!retryable) throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+}
+
+/**
+ * Pooled client for backend servers.
