@@ -538,3 +538,174 @@ export class VyrnClient {
   ): AsyncGenerator<VyrnStreamEvent<T>> {
     return subscribeCollectionFrom<T>(this.#options, collection, resume, signal);
   }
+}
+
+async function* streamEnvelopes(
+  connection: Connection,
+  signal?: AbortSignal,
+): AsyncGenerator<Envelope> {
+  const queue: Envelope[] = [];
+  let notify: (() => void) | null = null;
+  let failure: Error | null = null;
+
+  connection.stream(
+    (envelope) => {
+      queue.push(envelope);
+      notify?.();
+    },
+    (error) => {
+      failure = error;
+      notify?.();
+    },
+  );
+  const onAbort = () => connection.close();
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    while (true) {
+      while (queue.length > 0) {
+        yield queue.shift() as Envelope;
+      }
+      if (failure) throw failure;
+      if (signal?.aborted) return;
+      await new Promise<void>((resolve) => {
+        notify = () => {
+          notify = null;
+          resolve();
+        };
+      });
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    connection.close();
+  }
+}
+
+/**
+ * Subscribes to key changes with durable cursors, resuming after
+ * `options.cursor`.
+ *
+ * Changes committed while the subscriber was disconnected are replayed from the
+ * durable change log before live events, so nothing is missed. A cursor older
+ * than the retained log fails with `VyrnServerError` instead of silently
+ * skipping changes.
+ */
+export async function* subscribeFrom(
+  options: ConnectionOptions,
+  prefix: VyrnBytes,
+  resume: ResumeOptions = {},
+  signal?: AbortSignal,
+): AsyncGenerator<VyrnStreamEvent> {
+  const connection = await Connection.connect(options);
+  const response = await connection.call({
+    type: "subscribeFrom",
+    prefix: bytes(prefix),
+    cursor: resume.cursor ?? null,
+  });
+  if (response.type !== "subscribed") {
+    connection.close();
+    throw unexpected(response);
+  }
+  yield* cursorEvents(connection, signal);
+}
+
+/** Subscribes to document changes in one collection with durable cursors. */
+export async function* subscribeCollectionFrom<T = JsonValue>(
+  options: ConnectionOptions,
+  collection: string,
+  resume: ResumeOptions = {},
+  signal?: AbortSignal,
+): AsyncGenerator<VyrnStreamEvent<T>> {
+  const connection = await Connection.connect(options);
+  const response = await connection.call({
+    type: "subscribeCollectionFrom",
+    collection,
+    cursor: resume.cursor ?? null,
+  });
+  if (response.type !== "collectionSubscribed") {
+    connection.close();
+    throw unexpected(response);
+  }
+  yield* cursorEvents<T>(connection, signal);
+}
+
+async function* cursorEvents<T = JsonValue>(
+  connection: Connection,
+  signal?: AbortSignal,
+): AsyncGenerator<VyrnStreamEvent<T>> {
+  for await (const envelope of streamEnvelopes(connection, signal)) {
+    const message = envelope.message;
+    if (message.type === "error") throw new VyrnServerError(message.code, message.message);
+    if (message.type === "cursorChange") {
+      yield { type: "change", cursor: message.cursor, key: message.key, value: message.value };
+      continue;
+    }
+    if (message.type === "cursorDocumentChange") {
+      yield {
+        type: "document",
+        cursor: message.cursor,
+        collection: message.collection,
+        id: message.id,
+        document: message.document === null ? null : (decodeJson(message.document) as T),
+      };
+      continue;
+    }
+    if (message.type === "caught") {
+      yield { type: "caught", cursor: message.cursor };
+      continue;
+    }
+    throw unexpected(message);
+  }
+}
+
+/**
+ * Subscribes to committed changes under a key prefix on a dedicated connection.
+ *
+ * Delivery begins when the subscription is established, so a reconnecting
+ * subscriber can miss changes. Prefer `subscribeFrom` when gaps matter.
+ */
+export async function* subscribe(
+  options: ConnectionOptions,
+  prefix: VyrnBytes,
+  signal?: AbortSignal,
+): AsyncGenerator<VyrnChange> {
+  const connection = await Connection.connect(options);
+  const response = await connection.call({ type: "subscribe", prefix: bytes(prefix) });
+  if (response.type !== "subscribed") {
+    connection.close();
+    throw unexpected(response);
+  }
+  for await (const envelope of streamEnvelopes(connection, signal)) {
+    const message = envelope.message;
+    if (message.type === "error") throw new VyrnServerError(message.code, message.message);
+    if (message.type !== "change") throw unexpected(message);
+    yield { sequence: message.sequence, key: message.key, value: message.value };
+  }
+}
+
+/**
+ * Subscribes to committed document changes in one collection on a dedicated
+ * connection. Resynchronize with `listDocuments` after reconnecting.
+ */
+export async function* subscribeCollection<T = JsonValue>(
+  options: ConnectionOptions,
+  collection: string,
+  signal?: AbortSignal,
+): AsyncGenerator<VyrnDocumentChange<T>> {
+  const connection = await Connection.connect(options);
+  const response = await connection.call({ type: "subscribeCollection", collection });
+  if (response.type !== "collectionSubscribed") {
+    connection.close();
+    throw unexpected(response);
+  }
+  for await (const envelope of streamEnvelopes(connection, signal)) {
+    const message = envelope.message;
+    if (message.type === "error") throw new VyrnServerError(message.code, message.message);
+    if (message.type !== "documentChange") throw unexpected(message);
+    yield {
+      sequence: message.sequence,
+      id: message.id,
+      document: message.document === null ? null : (decodeJson(message.document) as T),
+    };
+  }
+}
