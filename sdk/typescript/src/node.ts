@@ -358,3 +358,183 @@ export class Session extends Operations {
 
 /**
  * Pooled client for backend servers.
+ *
+ * Each native connection handles one request at a time, so every call leases a
+ * connection for its duration. Concurrent calls use separate connections, up to
+ * `maxConnections`; further callers queue until one is returned.
+ */
+export class VyrnClient {
+  readonly #options: ConnectionOptions;
+  readonly #maximum: number;
+  readonly #idle: Session[] = [];
+  readonly #waiting: Array<(session: Session) => void> = [];
+  #open = 0;
+  #closed = false;
+
+  constructor(options: PoolOptions) {
+    const { maxConnections, ...connectionOptions } = options;
+    this.#options = connectionOptions;
+    this.#maximum = maxConnections ?? 10;
+    if (!Number.isInteger(this.#maximum) || this.#maximum < 1) {
+      throw new RangeError("maxConnections must be a positive integer");
+    }
+  }
+
+  /** Verifies credentials and connectivity by opening one connection. */
+  async connect(): Promise<void> {
+    const session = await this.#acquire();
+    this.#release(session);
+  }
+
+  async close(): Promise<void> {
+    this.#closed = true;
+    while (this.#idle.length > 0) {
+      this.#idle.pop()?.close();
+    }
+  }
+
+  async #acquire(): Promise<Session> {
+    if (this.#closed) throw new VyrnConnectionError("client is closed");
+    const idle = this.#idle.pop();
+    if (idle && !idle.closedConnection) return idle;
+    if (this.#open < this.#maximum) {
+      this.#open += 1;
+      try {
+        return await Session.connect(this.#options);
+      } catch (error) {
+        this.#open -= 1;
+        throw error;
+      }
+    }
+    return new Promise<Session>((resolve) => this.#waiting.push(resolve));
+  }
+
+  #release(session: Session): void {
+    if (session.closedConnection || this.#closed) {
+      this.#open -= 1;
+      session.close();
+      void this.#refill();
+      return;
+    }
+    const next = this.#waiting.shift();
+    if (next) {
+      next(session);
+      return;
+    }
+    this.#idle.push(session);
+  }
+
+  async #refill(): Promise<void> {
+    const next = this.#waiting.shift();
+    if (!next) return;
+    try {
+      this.#open += 1;
+      next(await Session.connect(this.#options));
+    } catch {
+      this.#open -= 1;
+    }
+  }
+
+  /** Runs `body` with a leased connection, returning it afterwards. */
+  async use<T>(body: (session: Session) => Promise<T>): Promise<T> {
+    const session = await this.#acquire();
+    try {
+      return await body(session);
+    } finally {
+      this.#release(session);
+    }
+  }
+
+  get(key: VyrnBytes): Promise<Uint8Array | null> {
+    return this.use((session) => session.get(key));
+  }
+
+  put(key: VyrnBytes, value: VyrnBytes): Promise<void> {
+    return this.use((session) => session.put(key, value));
+  }
+
+  delete(key: VyrnBytes): Promise<boolean> {
+    return this.use((session) => session.delete(key));
+  }
+
+  scan(options: ScanOptions = {}): Promise<VyrnRow[]> {
+    return this.use((session) => session.scan(options));
+  }
+
+  createIndex(name: VyrnBytes, unique: boolean): Promise<void> {
+    return this.use((session) => session.createIndex(name, unique));
+  }
+
+  dropIndex(name: VyrnBytes): Promise<void> {
+    return this.use((session) => session.dropIndex(name));
+  }
+
+  lookupIndex(index: VyrnBytes, value: VyrnBytes, limit?: number): Promise<Uint8Array[]> {
+    return this.use((session) => session.lookupIndex(index, value, limit));
+  }
+
+  createCollection(collection: string, indexes: CollectionIndex[] = []): Promise<void> {
+    return this.use((session) => session.createCollection(collection, indexes));
+  }
+
+  getDocument<T = JsonValue>(collection: string, id: string): Promise<T | null> {
+    return this.use((session) => session.getDocument<T>(collection, id));
+  }
+
+  putDocument(collection: string, id: string, document: unknown): Promise<void> {
+    return this.use((session) => session.putDocument(collection, id, document));
+  }
+
+  deleteDocument(collection: string, id: string): Promise<boolean> {
+    return this.use((session) => session.deleteDocument(collection, id));
+  }
+
+  listDocuments<T = JsonValue>(
+    collection: string,
+    options: DocumentQueryOptions = {},
+  ): Promise<Array<VyrnDocument<T>>> {
+    return this.use((session) => session.listDocuments<T>(collection, options));
+  }
+
+  queryDocuments<T = JsonValue>(
+    collection: string,
+    field: string,
+    value: JsonValue,
+    options: DocumentQueryOptions = {},
+  ): Promise<Array<VyrnDocument<T>>> {
+    return this.use((session) => session.queryDocuments<T>(collection, field, value, options));
+  }
+
+  /** Runs a serializable transaction on one pinned connection, retrying conflicts. */
+  transaction<T>(body: (tx: Transaction) => Promise<T>, attempts = 3): Promise<T> {
+    return this.use((session) => session.transaction(body, attempts));
+  }
+
+  subscribe(prefix: VyrnBytes, signal?: AbortSignal): AsyncGenerator<VyrnChange> {
+    return subscribe(this.#options, prefix, signal);
+  }
+
+  subscribeCollection<T = JsonValue>(
+    collection: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<VyrnDocumentChange<T>> {
+    return subscribeCollection<T>(this.#options, collection, signal);
+  }
+
+  /** Resumable key subscription; see `subscribeFrom`. */
+  subscribeFrom(
+    prefix: VyrnBytes,
+    resume: ResumeOptions = {},
+    signal?: AbortSignal,
+  ): AsyncGenerator<VyrnStreamEvent> {
+    return subscribeFrom(this.#options, prefix, resume, signal);
+  }
+
+  /** Resumable collection subscription; see `subscribeCollectionFrom`. */
+  subscribeCollectionFrom<T = JsonValue>(
+    collection: string,
+    resume: ResumeOptions = {},
+    signal?: AbortSignal,
+  ): AsyncGenerator<VyrnStreamEvent<T>> {
+    return subscribeCollectionFrom<T>(this.#options, collection, resume, signal);
+  }
