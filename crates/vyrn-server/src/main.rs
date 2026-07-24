@@ -242,6 +242,9 @@ struct WriteWorkerConfig {
     readers: Arc<Vec<RwLock<ReadEngine>>>,
     changes: broadcast::Sender<ChangeEvent>,
     metrics: Arc<Metrics>,
+    /// Set when accumulated writes have crossed the checkpoint threshold, so the
+    /// background task compacts instead of a client's commit paying for it.
+    checkpoint_due: Arc<AtomicBool>,
 }
 
 enum DocumentWrite {
@@ -357,11 +360,14 @@ async fn main() -> Result<()> {
             Arc::clone(&metrics),
         );
     }
+    let checkpoint_due = Arc::new(AtomicBool::new(false));
     start_mvcc_gc(
         Arc::clone(&engine),
         Duration::from_millis(args.mvcc_gc_ms),
         args.mvcc_gc_checkpoint_versions,
         Arc::clone(&metrics),
+        Arc::clone(&checkpoint_due),
+        Arc::clone(&readers),
     );
     start_write_worker(
         Arc::clone(&engine),
@@ -373,6 +379,7 @@ async fn main() -> Result<()> {
             readers: Arc::clone(&readers),
             changes: change_sender.clone(),
             metrics: Arc::clone(&metrics),
+            checkpoint_due: Arc::clone(&checkpoint_due),
         },
     );
     let state = Arc::new(ServerState {
@@ -1629,24 +1636,53 @@ fn start_mvcc_gc(
     interval: Duration,
     checkpoint_versions: usize,
     metrics: Arc<Metrics>,
+    checkpoint_due: Arc<AtomicBool>,
+    readers: Arc<Vec<RwLock<ReadEngine>>>,
 ) {
     tokio::spawn(async move {
         loop {
             sleep(interval).await;
+            let engine_for_refresh = Arc::clone(&engine);
             let engine = Arc::clone(&engine);
+            // Take the pending flag before compacting so writes that arrive
+            // during the checkpoint schedule the next one instead of being lost.
+            let due = checkpoint_due.swap(false, Ordering::AcqRel);
             let result = task::spawn_blocking(move || {
                 engine
                     .write()
                     .map_err(|_| StorageError::Poisoned)
                     .and_then(|mut engine| {
                         let collected = engine.collect_versions();
-                        if collected >= checkpoint_versions {
+                        if due || collected >= checkpoint_versions {
                             engine.checkpoint()?;
                         }
                         Ok(collected)
                     })
             })
             .await;
+            // Republish the compacted generation to the read handles; otherwise
+            // they keep serving the old generation's pages.
+            if matches!(result, Ok(Ok(_))) && due {
+                let engine = Arc::clone(&engine_for_refresh);
+                let readers = Arc::clone(&readers);
+                let refreshed = task::spawn_blocking(move || {
+                    let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
+                    let (generation, root, len) = engine.committed_root();
+                    for reader in readers.iter() {
+                        reader
+                            .write()
+                            .map_err(|_| StorageError::Poisoned)?
+                            .refresh(generation, root, len)?;
+                    }
+                    Ok::<_, StorageError>(())
+                })
+                .await;
+                if !matches!(refreshed, Ok(Ok(()))) {
+                    metrics.storage_failed.store(true, Ordering::Release);
+                    metrics.ready.store(false, Ordering::Release);
+                    return;
+                }
+            }
             if let Ok(Ok(collected)) = result {
                 metrics.mvcc_gc_runs.fetch_add(1, Ordering::Relaxed);
                 metrics
@@ -1941,8 +1977,16 @@ fn start_write_worker(
                 .metrics
                 .batched_writes
                 .fetch_add(operation_count, Ordering::Relaxed);
+            // Checkpoint compaction rewrites the whole tree, so it is handed to
+            // the background task rather than run inline. Otherwise the client
+            // whose commit happened to cross the threshold pays for compacting
+            // everyone else's writes, which is what produced the write-path p95
+            // spikes.
             let should_checkpoint =
                 writes_since_checkpoint + operation_count >= config.checkpoint_writes;
+            if should_checkpoint {
+                config.checkpoint_due.store(true, Ordering::Release);
+            }
             let commit_operations = operations.clone();
             let commit_index_updates = index_updates.clone();
             let engine = Arc::clone(&engine);
@@ -1956,9 +2000,6 @@ fn start_write_worker(
                 // The engine records what it published, so no change-log scan is
                 // needed on the commit path.
                 let published = engine.last_published().to_vec();
-                if should_checkpoint {
-                    engine.checkpoint()?;
-                }
                 let (generation, root, len) = engine.committed_root();
                 Ok::<_, StorageError>((
                     results,
