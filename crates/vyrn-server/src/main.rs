@@ -4,7 +4,7 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
@@ -699,11 +699,16 @@ async fn handle_connection(
     }
 }
 
+/// Registers a transaction's snapshot using only a read lock.
+///
+/// Beginning a transaction just reads the committed sequence and bumps a
+/// refcount, so taking the write lock here would make every transaction queue
+/// behind the writer before doing any work.
 async fn register_transaction_snapshot(state: &ServerState) -> std::result::Result<u64, String> {
     let engine = Arc::clone(&state.engine);
     task::spawn_blocking(move || {
-        let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-        Ok::<_, StorageError>(engine.register_snapshot())
+        let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
+        Ok::<_, StorageError>(engine.register_snapshot_shared())
     })
     .await
     .map_err(|_| "snapshot registration task failed".to_owned())?
@@ -718,8 +723,8 @@ async fn register_transaction_snapshot(state: &ServerState) -> std::result::Resu
 async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
     let engine = Arc::clone(&state.engine);
     let _ = task::spawn_blocking(move || {
-        if let Ok(mut engine) = engine.write() {
-            engine.release_snapshot(sequence);
+        if let Ok(engine) = engine.read() {
+            engine.release_snapshot_shared(sequence);
         }
     })
     .await;
@@ -1892,12 +1897,15 @@ fn start_write_worker(
                 let verdict = task::spawn_blocking(move || {
                     let engine = conflict_engine.read().map_err(|_| StorageError::Poisoned)?;
                     let mut rejected = Vec::new();
-                    let mut committed_keys: Vec<Vec<u8>> = Vec::new();
+                    // A hash set rather than a list: scanning every earlier write
+                    // for each read key made validation quadratic in batch size,
+                    // which capped transaction throughput as queue depth grew.
+                    let mut committed_keys: HashSet<Vec<u8>> = HashSet::new();
                     for check in &checks {
                         let overlaps_batch = check
                             .read_keys
                             .iter()
-                            .any(|key| committed_keys.iter().any(|written| written == key));
+                            .any(|key| committed_keys.contains(key));
                         if overlaps_batch
                             || has_conflict(
                                 &engine,
