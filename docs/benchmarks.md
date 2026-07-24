@@ -34,37 +34,46 @@ The PostgreSQL runner needs Docker and publishes its temporary instance on port 
 with `fsync` and `synchronous_commit` enabled. These are development-machine
 numbers on WSL2, not deployment guarantees.
 
-| Workload | Vyrn | PostgreSQL 17 |
-| --- | ---: | ---: |
-| Point reads | 42,431/s (p50 137 µs) | 9,781/s (p50 942 µs) |
-| Durable writes | 1,864/s (p50 8.4 ms) | 6,268/s (p50 2.2 ms) |
-| 70/30 mixed | 3,872/s | 3,628/s |
-| Four-key transactions | 103/s | 1,379/s |
-| Index equality lookup | 24/s | 10,268/s |
+| Workload | Vyrn | PostgreSQL 17 | Ratio |
+| --- | ---: | ---: | ---: |
+| Point reads | 76,844/s (p50 204 µs) | 9,404/s (p50 968 µs) | 8.2× faster |
+| Index equality lookup | 11,302/s (p50 1.4 ms) | 9,708/s (p50 960 µs) | 1.2× faster |
+| 70/30 mixed | 4,919/s | 4,820/s | about even |
+| Durable writes | 1,088/s (p50 10 ms) | 5,066/s (p50 2.4 ms) | 4.7× slower |
+| Four-key transactions | 65/s (p50 295 ms) | 1,303/s (p50 6.9 ms) | 20× slower |
 
-Vyrn is roughly 4× faster on point reads, which use dedicated reader handles and
-the bounded page cache. It is slower on durable writes, substantially slower on
-multi-key transactions, and far slower on index lookups.
+Vyrn leads on point reads and index lookups and roughly matches PostgreSQL on the
+mixed workload. It remains behind on durable single-row writes and well behind on
+multi-key transactions.
 
-### Known performance defects
+### Fixed
 
-Running each mode against a fresh database isolates two problems that the
-sequential matrix compounds:
+- **Page cache thrashing.** Copy-on-write appends entered the cache and evicted
+  read-hot pages under FIFO replacement, so index lookups degraded from ~42k/s to
+  ~24/s once unrelated writes had run. The cache is now a second-chance clock
+  where a reader touch protects a page for one eviction pass.
+- **Index lookups on the write lock.** `IndexLookup` and the document read paths
+  went through the shared `Engine` behind an `RwLock`; they now run on the same
+  dedicated `ReadEngine` handles as `get` and `scan`.
+- **A change-log scan on every commit.** `latest_published_cursor` scanned the
+  whole change log with `usize::MAX` to find its last key, making each commit cost
+  O(total changes). The engine now records what a commit published, and the tree
+  can seek the greatest key under a prefix directly.
+- **Per-commit MVCC sweep.** Releasing a transaction snapshot ran a full history
+  collection under the write lock; that is left to the background GC task.
+- **No group commit for transactions.** The write worker batched single-key writes
+  but not transactions, so every transaction paid its own `fsync`. Transactions
+  now group-commit, with each one still validated against its own snapshot and
+  against earlier writes in the same batch.
 
-- **Index lookup cost scales with total row count, not matching rows.** A
-  single-match lookup takes 186 µs on an empty database and 1,622 µs after 9,600
-  unrelated writes, measured at one client. Point reads over the same data stay
-  at ~150 µs, so this is specific to the index path.
-- **Index lookups serialize on the shared engine lock.** They run through the
-  engine's `RwLock` rather than the dedicated reader handles used by `get` and
-  `scan`. Concurrency scales normally while each lookup is fast (16 clients reach
-  38k/s on an empty database), but once a lookup costs ~1.6 ms, 16 clients queue
-  behind each other for a 23 ms p50 and ~681/s aggregate.
+### Remaining bottlenecks
 
-Fresh-database figures for comparison: index 42,022/s, reads 48,127/s, writes
-1,890/s, mixed 5,190/s, transactions 147/s.
-
-Transaction throughput is also low because commit validation re-checks every
-read key and scanned range against the tree.
+- **Multi-key transactions are the largest gap.** Each commit still serializes on
+  the single writer, and the durable change log doubles the writes per commit.
+  PostgreSQL amortizes far more aggressively across concurrent committers.
+- **Durable single-row writes** are bounded by one `fsync` per group; the batch
+  window (`VYRN_WRITE_BATCH_DELAY_US`) trades latency for throughput.
+- Write-heavy p95/p99 latencies remain spiky (46–50 ms at p95) because
+  checkpoint compaction runs under the write lock.
 
 Treat the included matrix as the in-memory baseline. For larger-than-memory testing, prefill both databases to the target size, restart them to remove warm process caches, and run the same binaries against datasets sized to 1×, 4×, and 10× host RAM. Record host CPU, RSS, disk bytes, and database-directory growth alongside the CSV; those measurements are host-specific and intentionally are not guessed by the client harness.
