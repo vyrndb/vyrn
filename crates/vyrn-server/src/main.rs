@@ -165,6 +165,33 @@ enum ReadRequest {
         limit: usize,
         response: oneshot::Sender<vyrn_core::Result<Rows>>,
     },
+    IndexLookup {
+        index: Vec<u8>,
+        value: Vec<u8>,
+        limit: usize,
+        response: oneshot::Sender<vyrn_core::Result<Vec<Vec<u8>>>>,
+    },
+    Document {
+        request: DocumentRead,
+        response: oneshot::Sender<vyrn_core::Result<Message>>,
+    },
+}
+
+enum DocumentRead {
+    Get {
+        collection: String,
+        id: String,
+    },
+    List {
+        collection: String,
+        limit: usize,
+    },
+    Query {
+        collection: String,
+        field: String,
+        value: serde_json::Value,
+        limit: usize,
+    },
 }
 
 enum WriteRequest {
@@ -194,6 +221,18 @@ enum WriteRequest {
         index_updates: Vec<IndexUpdate>,
         response: oneshot::Sender<std::result::Result<Vec<BatchResult>, String>>,
     },
+}
+
+/// One batched transaction's validation inputs, pulled out of the queue so the
+/// check can run on a blocking thread without holding the request.
+struct TransactionCheck {
+    index: usize,
+    snapshot_sequence: u64,
+    read_keys: Vec<Vec<u8>>,
+    read_ranges: Vec<ReadRange>,
+    index_reads: Vec<(Vec<u8>, Vec<u8>)>,
+    operations: Vec<BatchOperation>,
+    index_updates: Vec<IndexUpdate>,
 }
 
 struct WriteWorkerConfig {
@@ -664,12 +703,16 @@ async fn register_transaction_snapshot(state: &ServerState) -> std::result::Resu
     .map_err(|error| error.to_string())
 }
 
+/// Releases a transaction's snapshot.
+///
+/// Version collection is deliberately left to the background MVCC task: running
+/// a full history sweep here would put an O(retained versions) scan under the
+/// write lock on every single commit.
 async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
     let engine = Arc::clone(&state.engine);
     let _ = task::spawn_blocking(move || {
         if let Ok(mut engine) = engine.write() {
             engine.release_snapshot(sequence);
-            engine.collect_versions();
         }
     })
     .await;
@@ -983,25 +1026,20 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
         }
         Message::GetDocument { collection, id } => {
             state.metrics.reads.fetch_add(1, Ordering::Relaxed);
-            execute_engine(&state, move |engine| {
-                Ok(Message::DocumentValue {
-                    document: engine
-                        .open_collection(collection)?
-                        .get(&id)?
-                        .map(|document| encode_document(&document.value))
-                        .transpose()?,
-                })
-            })
-            .await
+            submit_document_read(&state, DocumentRead::Get { collection, id }).await
         }
         Message::ListDocuments { collection, limit } => {
             if limit == 0 || limit > MAX_SCAN_LIMIT {
                 return server_error(ErrorCode::InvalidRequest, "document limit is out of range");
             }
             state.metrics.reads.fetch_add(1, Ordering::Relaxed);
-            execute_engine(&state, move |engine| {
-                encode_documents(engine.open_collection(collection)?.all(limit as usize)?)
-            })
+            submit_document_read(
+                &state,
+                DocumentRead::List {
+                    collection,
+                    limit: limit as usize,
+                },
+            )
             .await
         }
         Message::QueryDocuments {
@@ -1020,13 +1058,15 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
                     "document query value is not valid JSON",
                 );
             };
-            execute_engine(&state, move |engine| {
-                encode_documents(engine.open_collection(collection)?.find(
-                    &field,
-                    &value,
-                    limit as usize,
-                )?)
-            })
+            submit_document_read(
+                &state,
+                DocumentRead::Query {
+                    collection,
+                    field,
+                    value,
+                    limit: limit as usize,
+                },
+            )
             .await
         }
         Message::CreateIndex { name, unique } => submit_create_index(&state, name, unique).await,
@@ -1039,12 +1079,8 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
             if limit == 0 || limit > MAX_SCAN_LIMIT {
                 return server_error(ErrorCode::InvalidRequest, "index limit is out of range");
             }
-            execute_engine(&state, move |engine| {
-                Ok(Message::Keys {
-                    keys: engine.lookup_index(&index, &value, limit as usize)?,
-                })
-            })
-            .await
+            state.metrics.reads.fetch_add(1, Ordering::Relaxed);
+            submit_index_lookup(&state, index, value, limit as usize).await
         }
         Message::Scan { start, end, limit } => {
             state.metrics.reads.fetch_add(1, Ordering::Relaxed);
@@ -1101,6 +1137,17 @@ fn start_read_workers(
                                     end.as_deref(),
                                     limit,
                                 ));
+                            }
+                            ReadRequest::IndexLookup {
+                                index,
+                                value,
+                                limit,
+                                response,
+                            } => {
+                                let _ = response.send(reader.lookup_index(&index, &value, limit));
+                            }
+                            ReadRequest::Document { request, response } => {
+                                let _ = response.send(read_document(&reader, request));
                             }
                         }
                     }
@@ -1172,11 +1219,69 @@ async fn submit_scan(
     }
 }
 
-async fn execute_engine<F>(state: &ServerState, operation: F) -> Message
-where
-    F: FnOnce(&Engine) -> vyrn_core::Result<Message> + Send + 'static,
-{
-    execute_engine_shared(&state.engine, operation).await
+/// Dispatches to a reader thread, round-robin across the read handles.
+fn next_reader(state: &ServerState) -> usize {
+    state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len()
+}
+
+fn read_document(reader: &ReadEngine, request: DocumentRead) -> vyrn_core::Result<Message> {
+    match request {
+        DocumentRead::Get { collection, id } => Ok(Message::DocumentValue {
+            document: reader
+                .get_document(&collection, &id)?
+                .map(|document| encode_document(&document.value))
+                .transpose()?,
+        }),
+        DocumentRead::List { collection, limit } => {
+            encode_documents(reader.list_documents(&collection, limit)?)
+        }
+        DocumentRead::Query {
+            collection,
+            field,
+            value,
+            limit,
+        } => encode_documents(reader.find_documents(&collection, &field, &value, limit)?),
+    }
+}
+
+async fn submit_document_read(state: &ServerState, request: DocumentRead) -> Message {
+    let (response, receiver) = oneshot::channel();
+    if state.read_queues[next_reader(state)]
+        .try_send(ReadRequest::Document { request, response })
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    }
+    match receiver.await {
+        Ok(Ok(message)) => message,
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
+    }
+}
+
+async fn submit_index_lookup(
+    state: &ServerState,
+    index: Vec<u8>,
+    value: Vec<u8>,
+    limit: usize,
+) -> Message {
+    let (response, receiver) = oneshot::channel();
+    if state.read_queues[next_reader(state)]
+        .try_send(ReadRequest::IndexLookup {
+            index,
+            value,
+            limit,
+            response,
+        })
+        .is_err()
+    {
+        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    }
+    match receiver.await {
+        Ok(Ok(keys)) => Message::Keys { keys },
+        Ok(Err(error)) => storage_error_message(error),
+        Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
+    }
 }
 
 async fn execute_engine_shared<F>(engine: &Arc<RwLock<Engine>>, operation: F) -> Message
@@ -1598,9 +1703,8 @@ fn start_write_worker(
                 let engine = Arc::clone(&engine);
                 let result = task::spawn_blocking(move || {
                     let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-                    let before = engine.latest_published_cursor()?;
                     let outcome = apply_document_write(&mut engine, request);
-                    let published = engine.read_changes(before, CHANGE_REPLAY_BATCH)?;
+                    let published = engine.last_published().to_vec();
                     let (generation, root, len) = engine.committed_root();
                     Ok::<_, StorageError>((outcome, published, generation, root, len))
                 })
@@ -1692,13 +1796,23 @@ fn start_write_worker(
                 }
                 continue;
             }
-            if matches!(requests.first(), Some(WriteRequest::Operation { .. })) {
+            // Group-commit: collect more single writes or transactions so one
+            // page/WAL flush covers many clients. Each transaction is still
+            // validated against its own snapshot below, so batching does not
+            // weaken serializability.
+            if matches!(
+                requests.first(),
+                Some(WriteRequest::Operation { .. } | WriteRequest::Transaction { .. })
+            ) {
                 if !config.delay.is_zero() {
                     sleep(config.delay).await;
                 }
                 while requests.len() < config.maximum_batch {
                     match receiver.try_recv() {
-                        Ok(request @ WriteRequest::Operation { .. }) => requests.push(request),
+                        Ok(
+                            request @ (WriteRequest::Operation { .. }
+                            | WriteRequest::Transaction { .. }),
+                        ) => requests.push(request),
                         Ok(request) => {
                             pending = Some(request);
                             break;
@@ -1707,60 +1821,88 @@ fn start_write_worker(
                     }
                 }
             }
-            let (snapshot_sequence, read_keys, read_ranges, index_reads) = match requests.first() {
-                Some(WriteRequest::Transaction {
-                    snapshot_sequence,
-                    read_keys,
-                    read_ranges,
-                    index_reads,
-                    ..
-                }) => (
-                    Some(*snapshot_sequence),
-                    read_keys.clone(),
-                    read_ranges.clone(),
-                    index_reads.clone(),
-                ),
-                _ => (None, Vec::new(), Vec::new(), Vec::new()),
-            };
-            let operations: Vec<_> = requests
+            // Validate every batched transaction against its own snapshot, and
+            // also against the writes of earlier transactions in this same batch
+            // so grouping cannot let two conflicting commits through together.
+            if requests
                 .iter()
-                .flat_map(|request| match request {
-                    WriteRequest::Operation { operation, .. } => vec![operation.clone()],
-                    WriteRequest::Transaction { operations, .. } => operations.clone(),
-                    WriteRequest::Document { .. }
-                    | WriteRequest::CreateIndex { .. }
-                    | WriteRequest::DropIndex { .. } => {
-                        unreachable!()
-                    }
-                })
-                .collect();
-            let index_updates = match requests.first() {
-                Some(WriteRequest::Transaction { index_updates, .. }) => index_updates.clone(),
-                _ => Vec::new(),
-            };
-            if let Some(snapshot_sequence) = snapshot_sequence {
+                .any(|request| matches!(request, WriteRequest::Transaction { .. }))
+            {
+                let checks: Vec<_> = requests
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, request)| match request {
+                        WriteRequest::Transaction {
+                            snapshot_sequence,
+                            read_keys,
+                            read_ranges,
+                            index_reads,
+                            operations,
+                            index_updates,
+                            ..
+                        } => Some(TransactionCheck {
+                            index,
+                            snapshot_sequence: *snapshot_sequence,
+                            read_keys: read_keys.clone(),
+                            read_ranges: read_ranges.clone(),
+                            index_reads: index_reads.clone(),
+                            operations: operations.clone(),
+                            index_updates: index_updates.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
                 let conflict_engine = Arc::clone(&engine);
-                let conflict_operations = operations.clone();
-                let conflict_index_updates = index_updates.clone();
-                let conflict = task::spawn_blocking(move || {
+                let verdict = task::spawn_blocking(move || {
                     let engine = conflict_engine.read().map_err(|_| StorageError::Poisoned)?;
-                    has_conflict(
-                        &engine,
-                        snapshot_sequence,
-                        &read_keys,
-                        &read_ranges,
-                        &index_reads,
-                        &conflict_operations,
-                        &conflict_index_updates,
-                    )
+                    let mut rejected = Vec::new();
+                    let mut committed_keys: Vec<Vec<u8>> = Vec::new();
+                    for check in &checks {
+                        let overlaps_batch = check
+                            .read_keys
+                            .iter()
+                            .any(|key| committed_keys.iter().any(|written| written == key));
+                        if overlaps_batch
+                            || has_conflict(
+                                &engine,
+                                check.snapshot_sequence,
+                                &check.read_keys,
+                                &check.read_ranges,
+                                &check.index_reads,
+                                &check.operations,
+                                &check.index_updates,
+                            )?
+                        {
+                            rejected.push(check.index);
+                        } else {
+                            committed_keys.extend(
+                                check.operations.iter().map(|op| operation_key(op).to_vec()),
+                            );
+                        }
+                    }
+                    Ok::<_, StorageError>(rejected)
                 })
                 .await;
-                match conflict {
-                    Ok(Ok(true)) => {
-                        respond_writes(requests, Err(StorageError::Conflict.to_string()));
-                        continue;
+                match verdict {
+                    Ok(Ok(rejected)) if !rejected.is_empty() => {
+                        // Answer the conflicted transactions now and re-queue the
+                        // rest of the batch for this same loop iteration.
+                        let mut survivors = Vec::with_capacity(requests.len());
+                        let mut conflicted = Vec::with_capacity(rejected.len());
+                        for (index, request) in requests.into_iter().enumerate() {
+                            if rejected.contains(&index) {
+                                conflicted.push(request);
+                            } else {
+                                survivors.push(request);
+                            }
+                        }
+                        respond_writes(conflicted, Err(StorageError::Conflict.to_string()));
+                        requests = survivors;
+                        if requests.is_empty() {
+                            continue;
+                        }
                     }
-                    Ok(Ok(false)) => {}
+                    Ok(Ok(_)) => {}
                     Ok(Err(error)) => {
                         record_storage_error(&config.metrics, &error);
                         respond_writes(requests, Err(error.to_string()));
@@ -1774,6 +1916,25 @@ fn start_write_worker(
                     }
                 }
             }
+            let operations: Vec<_> = requests
+                .iter()
+                .flat_map(|request| match request {
+                    WriteRequest::Operation { operation, .. } => vec![operation.clone()],
+                    WriteRequest::Transaction { operations, .. } => operations.clone(),
+                    WriteRequest::Document { .. }
+                    | WriteRequest::CreateIndex { .. }
+                    | WriteRequest::DropIndex { .. } => {
+                        unreachable!()
+                    }
+                })
+                .collect();
+            let index_updates: Vec<_> = requests
+                .iter()
+                .flat_map(|request| match request {
+                    WriteRequest::Transaction { index_updates, .. } => index_updates.clone(),
+                    _ => Vec::new(),
+                })
+                .collect();
             let operation_count = operations.len() as u64;
             config.metrics.write_batches.fetch_add(1, Ordering::Relaxed);
             config
@@ -1787,15 +1948,14 @@ fn start_write_worker(
             let engine = Arc::clone(&engine);
             let result = task::spawn_blocking(move || {
                 let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-                // Read the change log position before committing so the records
-                // this batch publishes can be read back with their real cursors.
-                let before = engine.latest_published_cursor()?;
                 let results = if commit_index_updates.is_empty() {
                     engine.write_batch(commit_operations)?
                 } else {
                     engine.write_indexed(commit_operations, commit_index_updates)?
                 };
-                let published = engine.read_changes(before, CHANGE_REPLAY_BATCH)?;
+                // The engine records what it published, so no change-log scan is
+                // needed on the commit path.
+                let published = engine.last_published().to_vec();
                 if should_checkpoint {
                     engine.checkpoint()?;
                 }
