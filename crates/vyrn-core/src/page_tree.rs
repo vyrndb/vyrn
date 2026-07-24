@@ -49,8 +49,16 @@ struct NodeRef {
 }
 
 struct PageCache {
-    pages: HashMap<u64, Arc<Page>>,
+    pages: HashMap<u64, CachedPage>,
     clock: VecDeque<u64>,
+    hand: usize,
+}
+
+struct CachedPage {
+    page: Arc<Page>,
+    /// Set when a reader touches the page, cleared when the clock hand passes
+    /// it. Pages referenced since the last sweep survive one eviction round.
+    referenced: bool,
 }
 
 struct PageManager {
@@ -58,6 +66,58 @@ struct PageManager {
     page_count: u64,
     cache: Mutex<PageCache>,
     cache_capacity: usize,
+}
+
+impl PageCache {
+    /// Inserts a page, evicting one victim when the cache is full.
+    ///
+    /// Second-chance clock: a referenced page gets its bit cleared and survives
+    /// this pass, an unreferenced page is evicted and the newcomer takes its
+    /// slot. Reusing the slot keeps this O(1) amortized; removing from the
+    /// middle of the ring would cost a memmove on every write.
+    fn admit(&mut self, page_id: u64, page: Arc<Page>, referenced: bool, capacity: usize) {
+        if let Some(existing) = self.pages.get_mut(&page_id) {
+            existing.page = page;
+            existing.referenced = referenced || existing.referenced;
+            return;
+        }
+        let entry = CachedPage { page, referenced };
+        if self.clock.len() < capacity {
+            self.pages.insert(page_id, entry);
+            self.clock.push_back(page_id);
+            return;
+        }
+        // Sweep for a victim. Bounded by one full lap plus the clearing pass, so
+        // it terminates even when every page was recently referenced.
+        for _ in 0..=self.clock.len() {
+            if self.hand >= self.clock.len() {
+                self.hand = 0;
+            }
+            let candidate = self.clock[self.hand];
+            match self.pages.get_mut(&candidate) {
+                Some(cached) if cached.referenced => {
+                    cached.referenced = false;
+                    self.hand += 1;
+                }
+                _ => {
+                    self.pages.remove(&candidate);
+                    self.clock[self.hand] = page_id;
+                    self.pages.insert(page_id, entry);
+                    self.hand += 1;
+                    return;
+                }
+            }
+        }
+        // Every page survived its second chance; replace at the hand anyway.
+        if self.hand >= self.clock.len() {
+            self.hand = 0;
+        }
+        let victim = self.clock[self.hand];
+        self.pages.remove(&victim);
+        self.clock[self.hand] = page_id;
+        self.pages.insert(page_id, entry);
+        self.hand += 1;
+    }
 }
 
 impl PageManager {
@@ -89,6 +149,7 @@ impl PageManager {
             cache: Mutex::new(PageCache {
                 pages: HashMap::new(),
                 clock: VecDeque::new(),
+                hand: 0,
             }),
             cache_capacity: cache_capacity.max(1),
         };
@@ -98,15 +159,17 @@ impl PageManager {
     }
 
     fn read(&self, page_id: u64) -> Result<Arc<Page>> {
-        if let Some(page) = self
+        if let Some(cached) = self
             .cache
             .lock()
             .map_err(|_| Error::Poisoned)?
             .pages
-            .get(&page_id)
-            .cloned()
+            .get_mut(&page_id)
         {
-            return Ok(page);
+            // Mark the page as recently used so a burst of writes cannot evict
+            // pages that readers are actively hitting.
+            cached.referenced = true;
+            return Ok(Arc::clone(&cached.page));
         }
         if page_id >= self.page_count {
             return Err(Error::CorruptPage {
@@ -129,7 +192,10 @@ impl PageManager {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&page)?;
         self.page_count += 1;
-        self.insert_cache(page_id, Arc::new(page))?;
+        // Freshly appended pages are usually on the next commit's copy-on-write
+        // path, so they enter referenced. Read-hot pages are protected by the
+        // clock's second-chance bit rather than by insert order.
+        self.insert_cache_with(page_id, Arc::new(page), true)?;
         Ok(page_id)
     }
 
@@ -155,15 +221,20 @@ impl PageManager {
     }
 
     fn insert_cache(&self, page_id: u64, page: Arc<Page>) -> Result<()> {
-        let mut cache = self.cache.lock().map_err(|_| Error::Poisoned)?;
-        if cache.pages.insert(page_id, page).is_none() {
-            cache.clock.push_back(page_id);
-        }
-        while cache.pages.len() > self.cache_capacity {
-            if let Some(candidate) = cache.clock.pop_front() {
-                cache.pages.remove(&candidate);
-            }
-        }
+        self.insert_cache_with(page_id, page, true)
+    }
+
+    /// Inserts a page, marking it referenced only when a reader asked for it.
+    ///
+    /// Newly appended pages enter unreferenced so a stream of copy-on-write
+    /// commits evicts its own pages first instead of the read-hot ones.
+    fn insert_cache_with(&self, page_id: u64, page: Arc<Page>, referenced: bool) -> Result<()> {
+        self.cache.lock().map_err(|_| Error::Poisoned)?.admit(
+            page_id,
+            page,
+            referenced,
+            self.cache_capacity,
+        );
         Ok(())
     }
 }
@@ -397,6 +468,56 @@ impl PageTree {
         limit: usize,
     ) -> Result<Vec<VersionedRow>> {
         self.scan_with_revisions_excluding_prefix(start, end, limit, None)
+    }
+
+    /// Returns the greatest key in `[start, end)`, without reading values.
+    ///
+    /// Descends the rightmost child that can contain a matching key, so the cost
+    /// is proportional to tree height rather than to the number of keys in range.
+    pub(crate) fn last_key_in(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        self.last_key_in_node(self.root, start, end)
+    }
+
+    fn last_key_in_node(
+        &self,
+        page_id: u64,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => Ok(self
+                .decode_leaf(&page, page_id)?
+                .into_iter()
+                .filter(|entry| {
+                    entry.key.as_slice() >= start
+                        && end.is_none_or(|end| entry.key.as_slice() < end)
+                })
+                .next_back()
+                .map(|entry| entry.key)),
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                for (index, child) in children.iter().enumerate().rev() {
+                    // Skip subtrees that start at or after the exclusive end.
+                    if end.is_some_and(|end| child.min_key.as_slice() >= end) {
+                        continue;
+                    }
+                    // Skip subtrees that end at or before the inclusive start.
+                    let child_end = children.get(index + 1).map(|next| next.min_key.as_slice());
+                    if child_end.is_some_and(|child_end| child_end <= start) {
+                        continue;
+                    }
+                    if let Some(found) = self.last_key_in_node(child.page_id, start, end)? {
+                        return Ok(Some(found));
+                    }
+                }
+                Ok(None)
+            }
+            page_type => Err(unexpected_type(page_id, page_type)),
+        }
     }
 
     pub(crate) fn changed_since(
