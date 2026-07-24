@@ -66,6 +66,9 @@ struct PageManager {
     page_count: u64,
     cache: Mutex<PageCache>,
     cache_capacity: usize,
+    /// Whether pages have been appended since the last successful sync, so a
+    /// read-only commit does not pay for an `fsync` of an unchanged file.
+    dirty: bool,
 }
 
 impl PageCache {
@@ -152,6 +155,7 @@ impl PageManager {
                 hand: 0,
             }),
             cache_capacity: cache_capacity.max(1),
+            dirty: false,
         };
         let super_page = manager.read(0)?;
         require_type(&super_page, 0, SUPER)?;
@@ -191,6 +195,7 @@ impl PageManager {
         finalize_page(&mut page);
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&page)?;
+        self.dirty = true;
         self.page_count += 1;
         // Freshly appended pages are usually on the next commit's copy-on-write
         // path, so they enter referenced. Read-hot pages are protected by the
@@ -199,8 +204,12 @@ impl PageManager {
         Ok(page_id)
     }
 
-    fn sync(&self) -> Result<()> {
+    fn sync(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
         self.file.sync_data()?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -301,7 +310,7 @@ impl PageTree {
         Ok(())
     }
 
-    pub(crate) fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&mut self) -> Result<()> {
         self.values.sync()?;
         self.pages.sync()
     }

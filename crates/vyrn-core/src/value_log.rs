@@ -26,6 +26,11 @@ pub(crate) struct ValueRef {
 
 pub(crate) struct ValueLog {
     file: File,
+    /// Whether anything has been appended since the last successful sync.
+    ///
+    /// Values below the inline limit never reach this log, so most commits leave
+    /// it untouched and must not pay for an `fsync` of an unchanged file.
+    dirty: bool,
 }
 
 impl ValueLog {
@@ -38,7 +43,7 @@ impl ValueLog {
             .open(path)?;
         recover_tail(&mut file)?;
         file.seek(SeekFrom::End(0))?;
-        Ok(Self { file })
+        Ok(Self { file, dirty: false })
     }
 
     pub(crate) fn append(&mut self, value: &[u8], revision: u64) -> Result<ValueRef> {
@@ -56,6 +61,7 @@ impl ValueLog {
         write_u32(&mut record, total_len - FOOTER_LEN, total_len_u32);
         record[total_len - 4..].copy_from_slice(END);
         self.file.write_all(&record)?;
+        self.dirty = true;
         Ok(ValueRef {
             offset,
             len,
@@ -91,8 +97,13 @@ impl ValueLog {
         Ok(record[HEADER_LEN..total_len - FOOTER_LEN].to_vec())
     }
 
-    pub(crate) fn sync(&self) -> Result<()> {
+    /// Flushes appended values, skipping the barrier when nothing was written.
+    pub(crate) fn sync(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
         self.file.sync_data()?;
+        self.dirty = false;
         Ok(())
     }
 }
