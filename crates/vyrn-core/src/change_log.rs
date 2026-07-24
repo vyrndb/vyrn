@@ -84,42 +84,70 @@ impl Cursor {
 
 pub(crate) const SUFFIX_LEN: usize = 12;
 
-pub(crate) fn encode_entry(key: &[u8], value: Option<&[u8]>) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(key.len() + value.map_or(0, <[u8]>::len) + 5);
-    encoded.push(u8::from(value.is_some()));
-    encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    encoded.extend_from_slice(key);
-    if let Some(value) = value {
-        encoded.extend_from_slice(value);
+/// Encodes every mutation of one commit into a single change-log value.
+///
+/// One record per commit rather than one per mutation keeps the change log to a
+/// single tree insert per commit, which halves the copy-on-write page churn the
+/// log would otherwise add to the write path.
+pub(crate) fn encode_batch(entries: &[(&[u8], Option<&[u8]>)]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(64);
+    encoded.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (key, value) in entries {
+        encoded.push(u8::from(value.is_some()));
+        encoded.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&(value.map_or(0, <[u8]>::len) as u32).to_be_bytes());
+        encoded.extend_from_slice(key);
+        if let Some(value) = value {
+            encoded.extend_from_slice(value);
+        }
     }
     encoded
 }
 
-pub(crate) fn decode_entry(suffix: &[u8], encoded: &[u8]) -> Result<ChangeRecord> {
-    let cursor = Cursor::from_suffix(suffix)?;
-    if encoded.len() < 5 {
-        return Err(corrupt("change log entry is truncated"));
+/// Decodes one commit's change record into its individual changes.
+pub(crate) fn decode_batch(sequence: u64, encoded: &[u8]) -> Result<Vec<ChangeRecord>> {
+    if encoded.len() < 4 {
+        return Err(corrupt("change log record is truncated"));
     }
-    let present = match encoded[0] {
-        0 => false,
-        1 => true,
-        _ => return Err(corrupt("change log entry has an invalid presence flag")),
-    };
-    let key_len = u32::from_be_bytes(encoded[1..5].try_into().unwrap()) as usize;
-    if key_len == 0 || key_len > MAX_KEY_SIZE || encoded.len() < 5 + key_len {
-        return Err(corrupt("change log entry has an invalid key length"));
+    let count = u32::from_be_bytes(encoded[0..4].try_into().unwrap()) as usize;
+    let mut offset = 4;
+    let mut records = Vec::with_capacity(count);
+    for index in 0..count {
+        if encoded.len() < offset + 9 {
+            return Err(corrupt("change log entry header is truncated"));
+        }
+        let present = match encoded[offset] {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt("change log entry has an invalid presence flag")),
+        };
+        let key_len =
+            u32::from_be_bytes(encoded[offset + 1..offset + 5].try_into().unwrap()) as usize;
+        let value_len =
+            u32::from_be_bytes(encoded[offset + 5..offset + 9].try_into().unwrap()) as usize;
+        offset += 9;
+        if key_len == 0 || key_len > MAX_KEY_SIZE || (!present && value_len != 0) {
+            return Err(corrupt("change log entry has invalid lengths"));
+        }
+        if encoded.len() < offset + key_len + value_len {
+            return Err(corrupt("change log entry is truncated"));
+        }
+        let key = encoded[offset..offset + key_len].to_vec();
+        offset += key_len;
+        let value = present.then(|| encoded[offset..offset + value_len].to_vec());
+        offset += value_len;
+        records.push(ChangeRecord {
+            sequence,
+            index: index as u32,
+            document: crate::document::target_from_key(&key),
+            key,
+            value,
+        });
     }
-    if !present && encoded.len() != 5 + key_len {
-        return Err(corrupt("change log deletion carries a value"));
+    if offset != encoded.len() {
+        return Err(corrupt("change log record has trailing data"));
     }
-    let key = encoded[5..5 + key_len].to_vec();
-    Ok(ChangeRecord {
-        sequence: cursor.sequence,
-        index: cursor.index,
-        document: crate::document::target_from_key(&key),
-        key,
-        value: present.then(|| encoded[5 + key_len..].to_vec()),
-    })
+    Ok(records)
 }
 
 fn corrupt(reason: &str) -> Error {
@@ -131,16 +159,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entries_round_trip_with_cursors() {
-        let cursor = Cursor::new(7, 2);
-        let encoded = encode_entry(b"users/1", Some(b"active"));
-        let record = decode_entry(&cursor.suffix(), &encoded).unwrap();
-        assert_eq!(record.cursor(), cursor);
-        assert_eq!(record.key, b"users/1");
-        assert_eq!(record.value.as_deref(), Some(&b"active"[..]));
+    fn commit_batches_round_trip_with_cursors() {
+        let entries: Vec<(&[u8], Option<&[u8]>)> = vec![
+            (b"users/1", Some(&b"active"[..])),
+            (b"users/2", None),
+            (b"users/3", Some(&b""[..])),
+        ];
+        let records = decode_batch(7, &encode_batch(&entries)).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].cursor(), Cursor::new(7, 0));
+        assert_eq!(records[0].key, b"users/1");
+        assert_eq!(records[0].value.as_deref(), Some(&b"active"[..]));
+        assert_eq!(records[1].cursor(), Cursor::new(7, 1));
+        assert_eq!(records[1].value, None, "deletions carry no value");
+        assert_eq!(
+            records[2].value.as_deref(),
+            Some(&b""[..]),
+            "an empty value is distinct from a deletion"
+        );
+    }
 
-        let deletion = decode_entry(&cursor.suffix(), &encode_entry(b"users/1", None)).unwrap();
-        assert_eq!(deletion.value, None);
+    #[test]
+    fn empty_batches_round_trip() {
+        assert!(decode_batch(1, &encode_batch(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_corrupt_batches() {
+        assert!(decode_batch(1, b"").is_err(), "missing count");
+        assert!(
+            decode_batch(1, b"\x00\x00\x00\x01").is_err(),
+            "missing entry"
+        );
+        // Claims one entry with a zero-length key.
+        assert!(decode_batch(1, b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00").is_err());
+        // A deletion that claims a value length.
+        assert!(decode_batch(1, b"\x00\x00\x00\x01\x00\x00\x00\x00\x01\x00\x00\x00\x01a").is_err());
+        let mut trailing = encode_batch(&[(b"a", None)]);
+        trailing.push(0);
+        assert!(decode_batch(1, &trailing).is_err(), "trailing data");
     }
 
     #[test]
@@ -154,12 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_corrupt_entries() {
-        let suffix = Cursor::new(1, 0).suffix();
-        assert!(decode_entry(&suffix[..4], b"\x00\x00\x00\x00\x01a").is_err());
-        assert!(decode_entry(&suffix, b"").is_err());
-        assert!(decode_entry(&suffix, b"\x02\x00\x00\x00\x01a").is_err());
-        assert!(decode_entry(&suffix, b"\x00\x00\x00\x00\x00").is_err());
-        assert!(decode_entry(&suffix, b"\x00\x00\x00\x00\x01ab").is_err());
+    fn rejects_invalid_cursor_suffixes() {
+        assert!(Cursor::from_suffix(&[]).is_err());
+        assert!(Cursor::from_suffix(&Cursor::new(1, 0).suffix()[..4]).is_err());
+        assert_eq!(
+            Cursor::from_suffix(&Cursor::new(9, 3).suffix()).unwrap(),
+            Cursor::new(9, 3)
+        );
     }
 }

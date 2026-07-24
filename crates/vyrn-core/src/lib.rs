@@ -1024,11 +1024,9 @@ impl Engine {
             .last_lsn
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
-        let mut records = Vec::new();
-        let mut published = Vec::new();
-        let mut index: u32 = 0;
-        for operation in &operations {
-            let candidate = match operation {
+        let entries: Vec<(&[u8], Option<&[u8]>)> = operations
+            .iter()
+            .filter_map(|operation| match operation {
                 BatchOperation::Put(key, value) if is_published_key(key) => {
                     Some((key.as_slice(), Some(value.as_slice())))
                 }
@@ -1036,33 +1034,33 @@ impl Engine {
                     Some((key.as_slice(), None))
                 }
                 _ => None,
-            };
-            let Some((key, value)) = candidate else {
-                continue;
-            };
-            let cursor = change_log::Cursor::new(sequence, index);
-            records.push(BatchOperation::Put(
-                change_log_key(cursor),
-                change_log::encode_entry(key, value),
-            ));
-            published.push(change_log::ChangeRecord {
+            })
+            .collect();
+        if entries.is_empty() {
+            self.last_published = Vec::new();
+            return Ok(operations);
+        }
+        if entries.len() > u32::MAX as usize {
+            return Err(Error::Io(io::Error::other(
+                "too many changes in one commit",
+            )));
+        }
+        let record = change_log::encode_batch(&entries);
+        self.last_published = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| change_log::ChangeRecord {
                 sequence,
-                index,
+                index: index as u32,
                 document: document::change_target(key),
                 key: key.to_vec(),
                 value: value.map(<[u8]>::to_vec),
-            });
-            index = index
-                .checked_add(1)
-                .ok_or_else(|| Error::Io(io::Error::other("too many changes in one commit")))?;
-        }
-        // Remember what this commit publishes so callers can broadcast it without
-        // re-reading the change log from the tree on every commit.
-        self.last_published = published;
-        // Change records are appended after the caller's operations so their
-        // results stay contiguous at the front of the batch.
+            })
+            .collect();
+        // One change record per commit, appended after the caller's operations so
+        // their results stay contiguous at the front of the batch.
         let mut combined = operations;
-        combined.extend(records);
+        combined.push(BatchOperation::Put(change_log_key(sequence), record));
         Ok(combined)
     }
 
@@ -1088,19 +1086,21 @@ impl Engine {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut start = CHANGE_LOG_PREFIX.to_vec();
-        start.extend_from_slice(&cursor.suffix());
+        // Start at the commit the cursor points into: its remaining mutations
+        // still need delivering, and the per-mutation index is filtered below.
+        let start = change_log_key(cursor.sequence);
         let end = prefix_end(CHANGE_LOG_PREFIX);
         let mut records = Vec::new();
         for (key, value) in self.tree.scan(Some(&start), end.as_deref(), limit + 1)? {
-            let suffix = &key[CHANGE_LOG_PREFIX.len()..];
-            let record = change_log::decode_entry(suffix, &value)?;
-            if record.cursor() <= cursor && cursor != change_log::Cursor::start() {
-                continue;
-            }
-            records.push(record);
-            if records.len() == limit {
-                break;
+            let sequence = change_log_sequence(&key)?;
+            for record in change_log::decode_batch(sequence, &value)? {
+                if cursor != change_log::Cursor::start() && record.cursor() <= cursor {
+                    continue;
+                }
+                records.push(record);
+                if records.len() == limit {
+                    return Ok(records);
+                }
             }
         }
         Ok(records)
@@ -1129,10 +1129,21 @@ impl Engine {
         // Seek the greatest key under the prefix. Scanning the whole log here
         // would make every commit cost O(total changes).
         let end = prefix_end(CHANGE_LOG_PREFIX);
-        match self.tree.last_key_in(CHANGE_LOG_PREFIX, end.as_deref())? {
-            Some(key) => change_log::Cursor::from_suffix(&key[CHANGE_LOG_PREFIX.len()..]),
-            None => Ok(change_log::Cursor::start()),
-        }
+        let Some(key) = self.tree.last_key_in(CHANGE_LOG_PREFIX, end.as_deref())? else {
+            return Ok(change_log::Cursor::start());
+        };
+        let sequence = change_log_sequence(&key)?;
+        // Point just past the last mutation of that commit.
+        let count = self
+            .tree
+            .get(&key)?
+            .map(|value| change_log::decode_batch(sequence, &value))
+            .transpose()?
+            .map_or(0, |records| records.len());
+        Ok(change_log::Cursor::new(
+            sequence,
+            count.saturating_sub(1) as u32,
+        ))
     }
 
     /// The oldest cursor still retained; anything earlier has been trimmed.
@@ -1143,13 +1154,17 @@ impl Engine {
         }
     }
 
-    /// Number of retained change records.
+    /// Number of retained individual changes across all retained commits.
     pub fn change_log_len(&self) -> Result<usize> {
         let end = prefix_end(CHANGE_LOG_PREFIX);
-        Ok(self
+        let mut total = 0;
+        for (key, value) in self
             .tree
             .scan(Some(CHANGE_LOG_PREFIX), end.as_deref(), usize::MAX)?
-            .len())
+        {
+            total += change_log::decode_batch(change_log_sequence(&key)?, &value)?.len();
+        }
+        Ok(total)
     }
 
     /// Drops change records at or before `cursor` and records the new retention
@@ -1158,16 +1173,23 @@ impl Engine {
         self.ensure_healthy()?;
         let end = prefix_end(CHANGE_LOG_PREFIX);
         let mut operations = Vec::new();
-        for (key, _) in self
+        let mut removed = 0;
+        for (key, value) in self
             .tree
             .scan(Some(CHANGE_LOG_PREFIX), end.as_deref(), usize::MAX)?
         {
-            let position = change_log::Cursor::from_suffix(&key[CHANGE_LOG_PREFIX.len()..])?;
-            if position <= cursor {
+            let sequence = change_log_sequence(&key)?;
+            let records = change_log::decode_batch(sequence, &value)?;
+            // A commit record is only dropped once every change in it has been
+            // consumed, so a cursor mid-commit never loses undelivered changes.
+            if records
+                .last()
+                .is_some_and(|record| record.cursor() <= cursor)
+            {
+                removed += records.len();
                 operations.push(BatchOperation::Delete(key));
             }
         }
-        let removed = operations.len();
         if removed == 0 {
             return Ok(0);
         }
@@ -1763,10 +1785,22 @@ fn is_published_key(key: &[u8]) -> bool {
     !key.starts_with(INTERNAL_PREFIX) || key.starts_with(document::DOCUMENT_KEY_PREFIX)
 }
 
-fn change_log_key(cursor: change_log::Cursor) -> Vec<u8> {
+/// Change records are keyed by commit sequence; the per-mutation index lives
+/// inside the record, so one commit costs one tree insert.
+fn change_log_key(sequence: u64) -> Vec<u8> {
     let mut key = CHANGE_LOG_PREFIX.to_vec();
-    key.extend_from_slice(&cursor.suffix());
+    key.extend_from_slice(&sequence.to_be_bytes());
     key
+}
+
+fn change_log_sequence(key: &[u8]) -> Result<u64> {
+    let suffix = &key[CHANGE_LOG_PREFIX.len()..];
+    if suffix.len() != 8 {
+        return Err(Error::CorruptManifest(
+            "change log key has an invalid sequence".into(),
+        ));
+    }
+    Ok(u64::from_be_bytes(suffix.try_into().unwrap()))
 }
 
 fn tombstone_key(key: &[u8]) -> Vec<u8> {
