@@ -34,21 +34,19 @@ The PostgreSQL runner needs Docker and publishes its temporary instance on port 
 with `fsync` and `synchronous_commit` enabled. These are development-machine
 numbers on WSL2, not deployment guarantees.
 
+Median of three consecutive runs:
+
 | Workload | Vyrn | PostgreSQL 17 | Ratio |
 | --- | ---: | ---: | ---: |
-| Point reads | 76,248/s (p50 203 µs) | 10,104/s (p50 913 µs) | 7.5× faster |
-| Index equality lookup | 26,626/s (p50 591 µs) | 10,032/s (p50 938 µs) | 2.7× faster |
-| 70/30 mixed | 3,900/s (p50 316 µs) | 8,960/s (p50 1.1 ms) | 2.3× slower |
-| Durable writes | 1,040/s (p50 10.8 ms) | 4,725/s (p50 2.3 ms) | 4.5× slower |
-| Four-key transactions | 197/s (p50 74.8 ms) | 1,271/s (p50 6.7 ms) | 6.5× slower |
+| Point reads | 73,356/s (p50 212 µs) | 9,903/s (p50 923 µs) | 7.4× faster |
+| Index equality lookup | 25,899/s (p50 605 µs) | 9,935/s (p50 945 µs) | 2.6× faster |
+| 70/30 mixed | 6,043/s (p50 302 µs) | 9,033/s (p50 1.1 ms) | 1.5× slower |
+| Durable writes | 2,459/s (p50 5.9 ms) | 6,485/s (p50 2.2 ms) | 2.6× slower |
+| Four-key transactions | 225/s (p50 65.8 ms) | 1,121/s (p50 7.1 ms) | 5.0× slower |
 
-Vyrn leads clearly on point reads and index lookups. It is still behind on
-durable writes and multi-key transactions, and the mixed result varies between
-runs because it is write-bound.
-
-Note the median latencies: Vyrn's p50 is lower than PostgreSQL's on every
-workload including the mixed one. The throughput gap on write-heavy modes comes
-from tail latency, where commits queue behind the single writer's `fsync` pair.
+Vyrn leads on point reads and index lookups by a wide margin, and its p50 latency
+is lower than PostgreSQL's on every workload. It remains behind on durable
+writes, the mixed workload, and multi-key transactions.
 
 ### Fixed
 
@@ -81,29 +79,44 @@ from tail latency, where commits queue behind the single writer's `fsync` pair.
   sets a flag and the background task compacts, then republishes the new
   generation to the read handles.
 
-### Remaining bottleneck: two fsyncs per commit
+### Also fixed: one fsync per commit instead of several
 
-The durable commit path syncs pages and the value log, then writes and syncs the
-WAL — two barriers per commit, serialized through one writer. That is what keeps
-durable writes and transactions behind PostgreSQL, which lets many concurrent
-committers share a single WAL flush.
+The durable commit path used to sync pages and the historical value log before
+writing and syncing the WAL. Recovery adopted the committed root straight from
+the WAL record, so those page barriers were load-bearing: without them a record
+could name a root whose pages never reached disk.
 
-Widening the group-commit window does not help; it makes things worse. Measured
-at 16 clients, 600 operations each:
+Recovery now redoes logged mutations (`redo_from_checkpoint`) when the committed
+root is unreachable, rebuilding from the last checkpoint root — which *is*
+guaranteed synced, because the checkpoint manifest is published after its pages.
+With that in place the commit path syncs only the WAL. Pages reach disk at the
+next checkpoint or on clean shutdown.
 
-| `VYRN_WRITE_BATCH_DELAY_US` | Writes | Transactions |
-| ---: | ---: | ---: |
-| 200 | 1,040/s | 193/s |
-| 500 | 929/s | 195/s |
-| 2000 | 868/s | 122/s |
-| 5000 | 833/s | 177/s |
+Two smaller barriers went with it: page and value-log files now track whether
+they are dirty and skip `fsync` entirely when untouched (values under the 1 KiB
+inline limit never reach the value log at all), and WAL rotation no longer stats
+the segment on every commit.
 
-Batching is already saturated at the default window, so the remaining work is
-structural: the page sync currently has to precede the WAL write because recovery
-adopts the committed root directly from the WAL record rather than replaying
-mutations into the tree. Removing that barrier requires redo recovery — replaying
-operations from WAL payloads — after which pages could be flushed lazily by a
-background writer and only the WAL sync would remain on the commit path. That is
-a change to the durability core and is not attempted here.
+`tests/redo_recovery.rs` covers this directly by truncating the page file to drop
+everything written after a checkpoint, then asserting the acknowledged writes —
+including a delete — come back.
+
+### Remaining bottleneck: fsync latency per transaction
+
+The floor on this host is a single flush:
+
+    mean fdatasync: 1.481 ms over 200 calls
+
+At one client a single durable write takes 3.1 ms and a four-key transaction
+6.1 ms, so both are dominated by sync barriers rather than by round-trips or
+validation. Transaction throughput peaks near 816/s at 16 clients and falls off
+at 64, so concurrency past that point adds queueing rather than throughput.
+
+PostgreSQL stays ahead on write-heavy workloads because many concurrent
+committers share one WAL flush more effectively than Vyrn's current group commit
+does. Closing that gap means coalescing independent transactions into a single
+barrier — a genuine concurrent commit pipeline, not further micro-optimisation.
+Measurements on a host with faster durable writes than WSL2 would also shift
+these ratios.
 
 Treat the included matrix as the in-memory baseline. For larger-than-memory testing, prefill both databases to the target size, restart them to remove warm process caches, and run the same binaries against datasets sized to 1×, 4×, and 10× host RAM. Record host CPU, RSS, disk bytes, and database-directory growth alongside the CSV; those measurements are host-specific and intentionally are not guessed by the client harness.
