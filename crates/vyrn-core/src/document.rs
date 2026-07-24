@@ -240,6 +240,60 @@ fn read_segment(encoded: &[u8]) -> Option<(String, &[u8])> {
     Some((value, &encoded[2 + length..]))
 }
 
+pub(crate) fn get_on_reader(
+    reader: &crate::ReadEngine,
+    collection: &str,
+    id: &str,
+) -> Result<Option<Document>> {
+    let key = document_key(collection, id)?;
+    reader
+        .read_raw(&key)?
+        .map(|bytes| decode_document(id.to_owned(), &bytes))
+        .transpose()
+}
+
+pub(crate) fn list_on_reader(
+    reader: &crate::ReadEngine,
+    collection: &str,
+    limit: usize,
+) -> Result<Vec<Document>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let prefix = collection_prefix(collection)?;
+    let end = prefix_end(&prefix);
+    reader
+        .scan_raw(Some(&prefix), end.as_deref(), limit)?
+        .into_iter()
+        .map(|(key, value)| decode_document(decode_document_id(collection, &key)?, &value))
+        .collect()
+}
+
+pub(crate) fn find_on_reader(
+    reader: &crate::ReadEngine,
+    collection: &str,
+    field: &str,
+    value: &Value,
+    limit: usize,
+) -> Result<Vec<Document>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let index = index_name(collection, field)?;
+    let encoded = encode_index_value(value)?;
+    reader
+        .lookup_index(&index, &encoded, limit)?
+        .into_iter()
+        .map(|key| {
+            let id = decode_document_id(collection, &key)?;
+            let bytes = reader
+                .read_raw(&key)?
+                .ok_or_else(|| invalid_document("document index references a missing document"))?;
+            decode_document(id, &bytes)
+        })
+        .collect()
+}
+
 fn get_document(engine: &Engine, collection: &str, id: &str) -> Result<Option<Document>> {
     let key = document_key(collection, id)?;
     engine

@@ -257,6 +257,65 @@ impl ReadEngine {
         self.tree
             .scan_excluding_prefix(start, end, limit, Some(INTERNAL_PREFIX))
     }
+
+    /// Looks up primary keys by secondary index value.
+    ///
+    /// Runs on a read-only handle so index queries do not contend with the
+    /// writer. The index definition is read from the committed tree rather than
+    /// an in-memory map, so a reader needs no coordination to see new indexes.
+    pub fn lookup_index(&self, name: &[u8], value: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
+        validate_index_name(name)?;
+        validate_index_value(Some(value))?;
+        if self.tree.get(&index_definition_key(name))?.is_none() {
+            return Err(Error::IndexNotFound);
+        }
+        let prefix = index_value_prefix(name, value);
+        let end = prefix_end(&prefix);
+        self.tree
+            .scan(Some(&prefix), end.as_deref(), limit)?
+            .into_iter()
+            .map(|(key, _)| decode_index_primary(&key, &prefix))
+            .collect()
+    }
+
+    /// Reads documents from a collection by indexed field value.
+    pub fn find_documents(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &serde_json::Value,
+        limit: usize,
+    ) -> Result<Vec<document::Document>> {
+        document::find_on_reader(self, collection, field, value, limit)
+    }
+
+    /// Reads one document by collection and ID.
+    pub fn get_document(&self, collection: &str, id: &str) -> Result<Option<document::Document>> {
+        document::get_on_reader(self, collection, id)
+    }
+
+    /// Lists documents in a collection in key order.
+    pub fn list_documents(
+        &self,
+        collection: &str,
+        limit: usize,
+    ) -> Result<Vec<document::Document>> {
+        document::list_on_reader(self, collection, limit)
+    }
+
+    pub(crate) fn read_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        validate_key(key)?;
+        self.tree.get(key)
+    }
+
+    pub(crate) fn scan_raw(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.tree.scan(start, end, limit)
+    }
 }
 
 pub struct Engine {
@@ -277,6 +336,9 @@ pub struct Engine {
     user_len: usize,
     pending_wal: Vec<Vec<u8>>,
     failure: Option<FailureInjector>,
+    /// Change records published by the most recent commit, so subscribers can be
+    /// notified without re-reading the change log.
+    last_published: Vec<change_log::ChangeRecord>,
 }
 
 impl Engine {
@@ -367,6 +429,7 @@ impl Engine {
             user_len,
             pending_wal: Vec::new(),
             failure: None,
+            last_published: Vec::new(),
         })
     }
 
@@ -962,9 +1025,10 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
         let mut records = Vec::new();
+        let mut published = Vec::new();
         let mut index: u32 = 0;
         for operation in &operations {
-            let published = match operation {
+            let candidate = match operation {
                 BatchOperation::Put(key, value) if is_published_key(key) => {
                     Some((key.as_slice(), Some(value.as_slice())))
                 }
@@ -973,17 +1037,28 @@ impl Engine {
                 }
                 _ => None,
             };
-            let Some((key, value)) = published else {
+            let Some((key, value)) = candidate else {
                 continue;
             };
+            let cursor = change_log::Cursor::new(sequence, index);
             records.push(BatchOperation::Put(
-                change_log_key(change_log::Cursor::new(sequence, index)),
+                change_log_key(cursor),
                 change_log::encode_entry(key, value),
             ));
+            published.push(change_log::ChangeRecord {
+                sequence,
+                index,
+                document: document::change_target(key),
+                key: key.to_vec(),
+                value: value.map(<[u8]>::to_vec),
+            });
             index = index
                 .checked_add(1)
                 .ok_or_else(|| Error::Io(io::Error::other("too many changes in one commit")))?;
         }
+        // Remember what this commit publishes so callers can broadcast it without
+        // re-reading the change log from the tree on every commit.
+        self.last_published = published;
         // Change records are appended after the caller's operations so their
         // results stay contiguous at the front of the batch.
         let mut combined = operations;
@@ -1031,6 +1106,14 @@ impl Engine {
         Ok(records)
     }
 
+    /// Change records published by the most recent successful commit.
+    ///
+    /// Lets a caller broadcast exactly what it committed without paying for a
+    /// change-log scan on every commit.
+    pub fn last_published(&self) -> &[change_log::ChangeRecord] {
+        &self.last_published
+    }
+
     /// The newest published cursor, for subscribing to future changes only.
     pub fn latest_cursor(&self) -> Result<change_log::Cursor> {
         self.ensure_healthy()?;
@@ -1043,12 +1126,11 @@ impl Engine {
     /// a caller can commit and then read back exactly the records it published.
     pub fn latest_published_cursor(&self) -> Result<change_log::Cursor> {
         self.ensure_healthy()?;
+        // Seek the greatest key under the prefix. Scanning the whole log here
+        // would make every commit cost O(total changes).
         let end = prefix_end(CHANGE_LOG_PREFIX);
-        let records = self
-            .tree
-            .scan(Some(CHANGE_LOG_PREFIX), end.as_deref(), usize::MAX)?;
-        match records.last() {
-            Some((key, _)) => change_log::Cursor::from_suffix(&key[CHANGE_LOG_PREFIX.len()..]),
+        match self.tree.last_key_in(CHANGE_LOG_PREFIX, end.as_deref())? {
+            Some(key) => change_log::Cursor::from_suffix(&key[CHANGE_LOG_PREFIX.len()..]),
             None => Ok(change_log::Cursor::start()),
         }
     }
