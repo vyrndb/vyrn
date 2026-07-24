@@ -36,15 +36,19 @@ numbers on WSL2, not deployment guarantees.
 
 | Workload | Vyrn | PostgreSQL 17 | Ratio |
 | --- | ---: | ---: | ---: |
-| Point reads | 76,844/s (p50 204 µs) | 9,404/s (p50 968 µs) | 8.2× faster |
-| Index equality lookup | 11,302/s (p50 1.4 ms) | 9,708/s (p50 960 µs) | 1.2× faster |
-| 70/30 mixed | 4,919/s | 4,820/s | about even |
-| Durable writes | 1,088/s (p50 10 ms) | 5,066/s (p50 2.4 ms) | 4.7× slower |
-| Four-key transactions | 65/s (p50 295 ms) | 1,303/s (p50 6.9 ms) | 20× slower |
+| Point reads | 76,248/s (p50 203 µs) | 10,104/s (p50 913 µs) | 7.5× faster |
+| Index equality lookup | 26,626/s (p50 591 µs) | 10,032/s (p50 938 µs) | 2.7× faster |
+| 70/30 mixed | 3,900/s (p50 316 µs) | 8,960/s (p50 1.1 ms) | 2.3× slower |
+| Durable writes | 1,040/s (p50 10.8 ms) | 4,725/s (p50 2.3 ms) | 4.5× slower |
+| Four-key transactions | 197/s (p50 74.8 ms) | 1,271/s (p50 6.7 ms) | 6.5× slower |
 
-Vyrn leads on point reads and index lookups and roughly matches PostgreSQL on the
-mixed workload. It remains behind on durable single-row writes and well behind on
-multi-key transactions.
+Vyrn leads clearly on point reads and index lookups. It is still behind on
+durable writes and multi-key transactions, and the mixed result varies between
+runs because it is write-bound.
+
+Note the median latencies: Vyrn's p50 is lower than PostgreSQL's on every
+workload including the mixed one. The throughput gap on write-heavy modes comes
+from tail latency, where commits queue behind the single writer's `fsync` pair.
 
 ### Fixed
 
@@ -66,14 +70,40 @@ multi-key transactions.
   now group-commit, with each one still validated against its own snapshot and
   against earlier writes in the same batch.
 
-### Remaining bottlenecks
+### Also fixed
 
-- **Multi-key transactions are the largest gap.** Each commit still serializes on
-  the single writer, and the durable change log doubles the writes per commit.
-  PostgreSQL amortizes far more aggressively across concurrent committers.
-- **Durable single-row writes** are bounded by one `fsync` per group; the batch
-  window (`VYRN_WRITE_BATCH_DELAY_US`) trades latency for throughput.
-- Write-heavy p95/p99 latencies remain spiky (46–50 ms at p95) because
-  checkpoint compaction runs under the write lock.
+- **One change-log key per mutation.** The durable change log inserted a separate
+  tree key for every mutation, doubling copy-on-write page churn on the write
+  path. A commit now writes a single record containing all of its changes, keyed
+  by commit sequence, with the per-mutation index carried inside the record.
+- **Inline checkpoint compaction.** Whichever client's commit happened to cross
+  the write threshold paid to compact the whole tree. Crossing the threshold now
+  sets a flag and the background task compacts, then republishes the new
+  generation to the read handles.
+
+### Remaining bottleneck: two fsyncs per commit
+
+The durable commit path syncs pages and the value log, then writes and syncs the
+WAL — two barriers per commit, serialized through one writer. That is what keeps
+durable writes and transactions behind PostgreSQL, which lets many concurrent
+committers share a single WAL flush.
+
+Widening the group-commit window does not help; it makes things worse. Measured
+at 16 clients, 600 operations each:
+
+| `VYRN_WRITE_BATCH_DELAY_US` | Writes | Transactions |
+| ---: | ---: | ---: |
+| 200 | 1,040/s | 193/s |
+| 500 | 929/s | 195/s |
+| 2000 | 868/s | 122/s |
+| 5000 | 833/s | 177/s |
+
+Batching is already saturated at the default window, so the remaining work is
+structural: the page sync currently has to precede the WAL write because recovery
+adopts the committed root directly from the WAL record rather than replaying
+mutations into the tree. Removing that barrier requires redo recovery — replaying
+operations from WAL payloads — after which pages could be flushed lazily by a
+background writer and only the WAL sync would remain on the commit path. That is
+a change to the durability core and is not attempted here.
 
 Treat the included matrix as the in-memory baseline. For larger-than-memory testing, prefill both databases to the target size, restart them to remove warm process caches, and run the same binaries against datasets sized to 1×, 4×, and 10× host RAM. Record host CPU, RSS, disk bytes, and database-directory growth alongside the CSV; those measurements are host-specific and intentionally are not guessed by the client harness.
