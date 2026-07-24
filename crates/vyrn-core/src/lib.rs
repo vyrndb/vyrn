@@ -339,6 +339,14 @@ pub struct Engine {
     /// Change records published by the most recent commit, so subscribers can be
     /// notified without re-reading the change log.
     last_published: Vec<change_log::ChangeRecord>,
+    /// Snapshots registered without the write lock, keyed by revision.
+    ///
+    /// Behind its own mutex so beginning and ending a transaction never blocks on
+    /// the writer. MVCC collection consults this alongside `active_snapshots`.
+    shared_snapshots: std::sync::Mutex<BTreeMap<u64, usize>>,
+    /// Bytes written to the active WAL segment, tracked so the rotation check
+    /// does not stat the file on every commit.
+    wal_len: u64,
 }
 
 impl Engine {
@@ -387,6 +395,10 @@ impl Engine {
         let mut mvcc_values = value_log::ValueLog::open(&revision_value_path)?;
         let mut mvcc = mvcc::read(&revision_path, state.lsn, &mut mvcc_values)?;
         let segments = list_segments(&wal_directory)?;
+        // The checkpoint root was synced before its manifest was published, so it
+        // is the newest root recovery can rely on if the page tail was lost.
+        let checkpoint = state;
+        let mut redo = Vec::new();
         for (index, segment_id) in segments.iter().copied().enumerate() {
             replay_segment(
                 &wal_directory.join(segment_name(segment_id)),
@@ -395,10 +407,19 @@ impl Engine {
                 &mut state,
                 &mut mvcc,
                 &mut mvcc_values,
+                &mut redo,
             )?;
         }
-        let tree = PageTree::open(&page_path, &value_path, state.root, state.len)?;
-        tree.validate()?;
+        // The WAL names a committed root, but the pages behind it are only
+        // guaranteed present if they were synced before the record was written.
+        // Try to adopt the root; if it is unreachable or structurally incomplete,
+        // reapply the logged mutations onto the last known-good root instead.
+        let tree = match PageTree::open(&page_path, &value_path, state.root, state.len)
+            .and_then(|tree| tree.validate().map(|()| tree))
+        {
+            Ok(tree) => tree,
+            Err(_) => redo_from_checkpoint(&page_path, &value_path, checkpoint, &redo, &mut state)?,
+        };
         let indexes = load_indexes(&tree)?;
         let user_len = tree.count_excluding_prefix(INTERNAL_PREFIX)?;
         mvcc::collect(&mut mvcc, None, state.lsn);
@@ -409,7 +430,7 @@ impl Engine {
         } else {
             create_segment(&wal_directory, segment_id, state.lsn + 1)?
         };
-        wal.seek(SeekFrom::End(0))?;
+        let wal_len = wal.seek(SeekFrom::End(0))?;
 
         Ok(Self {
             path: path.to_owned(),
@@ -430,6 +451,8 @@ impl Engine {
             pending_wal: Vec::new(),
             failure: None,
             last_published: Vec::new(),
+            shared_snapshots: std::sync::Mutex::new(BTreeMap::new()),
+            wal_len,
         })
     }
 
@@ -482,6 +505,55 @@ impl Engine {
         let revision = self.last_lsn;
         *self.active_snapshots.entry(revision).or_default() += 1;
         revision
+    }
+
+    /// Registers a snapshot at the newest committed revision without needing
+    /// exclusive access.
+    ///
+    /// Beginning a transaction only reads the current sequence and bumps a
+    /// refcount, so forcing it through the engine's write lock would make every
+    /// transaction contend with the writer before it has done any work.
+    pub fn register_snapshot_shared(&self) -> u64 {
+        let revision = self.last_lsn;
+        *self
+            .shared_snapshots
+            .lock()
+            .expect("snapshot registry is never poisoned")
+            .entry(revision)
+            .or_default() += 1;
+        revision
+    }
+
+    /// Releases a snapshot taken by [`Engine::register_snapshot_shared`].
+    pub fn release_snapshot_shared(&self, revision: u64) {
+        let mut snapshots = self
+            .shared_snapshots
+            .lock()
+            .expect("snapshot registry is never poisoned");
+        if let Some(count) = snapshots.get_mut(&revision) {
+            *count -= 1;
+            if *count == 0 {
+                snapshots.remove(&revision);
+            }
+        }
+    }
+
+    /// The oldest revision any active reader still needs, across both registries.
+    fn oldest_active_snapshot(&self) -> Option<u64> {
+        let shared = self
+            .shared_snapshots
+            .lock()
+            .expect("snapshot registry is never poisoned")
+            .keys()
+            .next()
+            .copied();
+        match (
+            self.active_snapshots.first_key_value().map(|(key, _)| *key),
+            shared,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (value, None) | (None, value) => value,
+        }
     }
 
     pub fn register_snapshot_at(&mut self, revision: u64) -> Result<()> {
@@ -636,13 +708,10 @@ impl Engine {
     }
 
     pub fn collect_versions(&mut self) -> usize {
-        mvcc::collect(
-            &mut self.mvcc,
-            self.active_snapshots
-                .first_key_value()
-                .map(|(revision, _)| *revision),
-            self.last_lsn,
-        )
+        // Must consider both registries; collecting past a shared snapshot would
+        // drop versions a live transaction still needs to read.
+        let oldest = self.oldest_active_snapshot();
+        mvcc::collect(&mut self.mvcc, oldest, self.last_lsn)
     }
 
     pub fn retained_versions(&self) -> usize {
@@ -875,10 +944,9 @@ impl Engine {
         let original_root = self.tree.root_id();
         let original_len = self.tree.len();
         let original_user_len = self.user_len;
-        let oldest_snapshot = self
-            .active_snapshots
-            .first_key_value()
-            .map(|(revision, _)| *revision);
+        // Includes shared snapshots, so a transaction that began without the
+        // write lock still forces its prior versions to be retained.
+        let oldest_snapshot = self.oldest_active_snapshot();
         let mut previous = BTreeMap::new();
         if oldest_snapshot.is_some() {
             for operation in &operations {
@@ -1367,7 +1435,8 @@ impl Engine {
             .iter()
             .map(|record| record.len() as u64)
             .sum();
-        let current_len = self.wal.metadata()?.len() + pending_len;
+        // Tracked in memory rather than stat'ing the WAL on every commit.
+        let current_len = self.wal_len + pending_len;
         if current_len > SEGMENT_HEADER_LEN as u64
             && current_len + record.len() as u64 > self.segment_size
         {
@@ -1375,15 +1444,19 @@ impl Engine {
             self.rotate_segment()?;
         }
         if self.durability == DurabilityMode::Durable {
+            // Only the WAL is synced here. Pages and historical values are left
+            // for the background flush: redo recovery reapplies logged mutations
+            // when the committed root's pages did not survive, so a commit no
+            // longer needs a page barrier before naming its root.
             self.inject(FailurePoint::BeforePageSync)?;
-            self.tree.sync()?;
-            self.mvcc_values.sync()?;
             self.inject(FailurePoint::AfterPageSync)?;
+            self.wal_len += record.len() as u64;
             self.wal.write_all(&record)?;
             self.inject(FailurePoint::AfterWalWrite)?;
             self.inject(FailurePoint::BeforeWalSync)?;
             self.wal.sync_data()?;
         } else {
+            self.wal_len += record.len() as u64;
             self.pending_wal.push(record);
         }
         self.last_lsn = lsn;
@@ -1397,6 +1470,8 @@ impl Engine {
             .ok_or_else(|| Error::Io(io::Error::other("WAL segment number exhausted")))?;
         self.wal = create_segment(&self.path.join("wal"), next, self.last_lsn + 1)?;
         self.segment_id = next;
+        // The new segment starts at its header, so the tracked length restarts too.
+        self.wal_len = self.wal.seek(SeekFrom::End(0))?;
         Ok(())
     }
 
@@ -1452,6 +1527,55 @@ fn create_segment(directory: &Path, segment_id: u64, first_lsn: u64) -> Result<F
     Ok(file)
 }
 
+/// One committed WAL record's mutations, kept so recovery can reapply them when
+/// the committed root is not reachable in the page file.
+struct RedoRecord {
+    lsn: u64,
+    operations: Vec<(u8, Vec<u8>, Option<Vec<u8>>)>,
+}
+
+/// Rebuilds the tree by reapplying logged mutations from the checkpoint root.
+///
+/// This is the redo half of recovery. A commit's pages may be absent if the
+/// process died before they reached disk, so the root named by the WAL cannot be
+/// trusted unconditionally. Replaying the mutations reconstructs an equivalent
+/// tree from the last root that is known to be complete, which is what lets the
+/// commit path skip syncing pages before the WAL.
+fn redo_from_checkpoint(
+    page_path: &Path,
+    value_path: &Path,
+    base: TreeState,
+    redo: &[RedoRecord],
+    state: &mut TreeState,
+) -> Result<PageTree> {
+    let checkpoint_lsn = base.lsn;
+    // Start from the checkpoint root, which was synced before the manifest was
+    // published. If even that is unreachable the page file lost more than the
+    // unsynced tail, so rebuild from empty and redo everything still logged.
+    let mut tree = match PageTree::open(page_path, value_path, base.root, base.len)
+        .and_then(|tree| tree.validate().map(|()| tree))
+    {
+        Ok(tree) => tree,
+        Err(_) => PageTree::open(page_path, value_path, 0, 0)?,
+    };
+
+    for record in redo.iter().filter(|record| record.lsn > checkpoint_lsn) {
+        for (op, key, value) in &record.operations {
+            if *op == OP_PUT {
+                let value = value.as_deref().unwrap_or_default();
+                let (root, len) = tree.prepare_put(key, value, record.lsn)?;
+                tree.publish(root, len);
+            } else if let Some((root, len)) = tree.prepare_delete(key)? {
+                tree.publish(root, len);
+            }
+        }
+    }
+    tree.sync()?;
+    state.root = tree.root_id();
+    state.len = tree.len();
+    Ok(tree)
+}
+
 fn replay_segment(
     path: &Path,
     segment_id: u64,
@@ -1459,6 +1583,7 @@ fn replay_segment(
     state: &mut TreeState,
     mvcc: &mut mvcc::State,
     mvcc_values: &mut value_log::ValueLog,
+    redo: &mut Vec<RedoRecord>,
 ) -> Result<()> {
     let mut file = OpenOptions::new().read(true).write(is_last).open(path)?;
     let file_len = file.metadata()?.len();
@@ -1525,6 +1650,12 @@ fn replay_segment(
             state.len = len;
             state.lsn = lsn;
             record_versions(&payload, operation_count, lsn, mvcc, mvcc_values)?;
+            // Keep the mutations so recovery can redo them if the committed root
+            // turns out not to be reachable in the page file.
+            redo.push(RedoRecord {
+                lsn,
+                operations: decode_operations(&payload, operation_count),
+            });
         }
         offset += total_len as u64;
     }
@@ -1636,6 +1767,19 @@ fn record_versions(
     state: &mut mvcc::State,
     values: &mut value_log::ValueLog,
 ) -> Result<()> {
+    for (op, key, value) in decode_operations(payload, operation_count) {
+        mvcc::append(state, values, key, revision, value)?;
+        let _ = op;
+    }
+    Ok(())
+}
+
+/// Splits a WAL record payload back into its individual mutations.
+fn decode_operations(
+    payload: &[u8],
+    operation_count: usize,
+) -> Vec<(u8, Vec<u8>, Option<Vec<u8>>)> {
+    let mut operations = Vec::with_capacity(operation_count);
     let mut offset = 0;
     for _ in 0..operation_count {
         let op = payload[offset];
@@ -1645,10 +1789,10 @@ fn record_versions(
         let key = payload[offset..offset + key_len].to_vec();
         offset += key_len;
         let value = (op == OP_PUT).then(|| payload[offset..offset + value_len].to_vec());
-        mvcc::append(state, values, key, revision, value)?;
         offset += value_len;
+        operations.push((op, key, value));
     }
-    Ok(())
+    operations
 }
 
 fn read_manifest(path: &Path) -> Result<Option<TreeState>> {
