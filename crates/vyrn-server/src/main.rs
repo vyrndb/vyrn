@@ -1712,13 +1712,17 @@ fn start_mvcc_gc(
                 let engine = Arc::clone(&engine_for_refresh);
                 let readers = Arc::clone(&readers);
                 let refreshed = task::spawn_blocking(move || {
+                    // The engine read lock is held across the reader refreshes
+                    // so the next checkpoint cannot retire this generation and
+                    // delete its files mid-loop; every path opened here still
+                    // exists until the loop finishes.
                     let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
-                    let (generation, root, len) = engine.committed_root();
+                    let (new_generation, root, len) = engine.committed_root();
                     for reader in readers.iter() {
                         reader
                             .write()
                             .map_err(|_| StorageError::Poisoned)?
-                            .refresh(generation, root, len)?;
+                            .refresh(new_generation, root, len)?;
                     }
                     Ok::<_, StorageError>(())
                 })
