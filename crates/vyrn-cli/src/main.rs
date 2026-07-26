@@ -38,6 +38,29 @@ enum Command {
         #[arg(long)]
         target: PathBuf,
     },
+    Recover {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        archive: Option<PathBuf>,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        until_lsn: Option<u64>,
+        #[arg(long)]
+        allow_partial: bool,
+    },
+    VerifyArchive {
+        archive: PathBuf,
+    },
+    WalPrune {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        through: u64,
+    },
     Get {
         key: String,
         #[arg(long)]
