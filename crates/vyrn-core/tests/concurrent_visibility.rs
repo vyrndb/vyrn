@@ -35,15 +35,27 @@ fn read_handles_never_see_a_root_with_missing_pages() {
         handles.push(thread::spawn(move || {
             barrier.wait();
             while !stop.load(Ordering::Relaxed) {
-                let reader = readers[index].read().unwrap();
-                // Any error here means a published root referenced a page the
-                // reader could not load, which is the failure mode under test.
-                reader.scan(None, None, 64).expect("reader saw a torn root");
-                for key in 0..16_u32 {
-                    reader
-                        .get(&key.to_be_bytes())
-                        .expect("reader saw a torn page");
+                {
+                    let reader = readers[index].read().unwrap();
+                    // Any error here means a published root referenced a page the
+                    // reader could not load, which is the failure mode under test.
+                    reader.scan(None, None, 64).expect("reader saw a torn root");
+                    for key in 0..16_u32 {
+                        reader
+                            .get(&key.to_be_bytes())
+                            .expect("reader saw a torn page");
+                    }
                 }
+                // Drop the read guard and yield before reacquiring.
+                //
+                // `std::sync::RwLock` gives no writer-preference guarantee, so
+                // readers that reacquire in a tight loop can starve the writer
+                // almost indefinitely: without this the writer's four `refresh`
+                // calls measured 2.39 s per round against a 1.3 ms commit, one
+                // taking 6.96 s, and the whole test took 871 s. Yielding also
+                // matches a real workload, where requests arrive with gaps
+                // rather than back-to-back off a spinning thread.
+                thread::yield_now();
             }
         }));
     }
