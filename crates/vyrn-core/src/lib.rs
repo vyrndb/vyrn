@@ -1222,12 +1222,28 @@ impl Engine {
                 ));
             }
         }
-        if let Err(error) = self.commit_batch(&pending, self.tree.root_id(), self.tree.len()) {
-            self.tree.publish(original_root, original_len);
-            self.user_len = original_user_len;
-            self.poisoned = true;
-            return Err(error);
-        }
+        // A deferred barrier only appends here; the caller flushes once it has
+        // released the write lock, and must not acknowledge before it returns.
+        let deferred = barrier == Barrier::Deferred && self.durability == DurabilityMode::Durable;
+        let committed = match barrier {
+            Barrier::Immediate => self
+                .commit_batch(&pending, self.tree.root_id(), self.tree.len())
+                .map(|()| None),
+            Barrier::Deferred => self
+                .append_batch(&pending, self.tree.root_id(), self.tree.len())
+                // In async mode the record is buffered rather than written, so
+                // there is no barrier for the caller to wait on.
+                .map(|lsn| deferred.then_some(lsn)),
+        };
+        let lsn = match committed {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                self.tree.publish(original_root, original_len);
+                self.user_len = original_user_len;
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
         if let Some(oldest_snapshot) = oldest_snapshot {
             for (key, (revision, value)) in previous {
                 if let Some(revision) = revision.filter(|revision| *revision <= oldest_snapshot) {
@@ -1246,7 +1262,7 @@ impl Engine {
         }
         // Hide results for the change records appended by with_change_log.
         results.truncate(requested);
-        Ok(results)
+        Ok((results, lsn))
     }
 
     pub fn scan(
@@ -1479,12 +1495,23 @@ impl Engine {
         if !self.pending_wal.is_empty() {
             self.tree.sync()?;
             self.mvcc_values.sync()?;
+            let lsn = self.last_lsn;
             for record in self.pending_wal.drain(..) {
-                self.wal.write_all(&record)?;
+                self.wal.append(&record, lsn)?;
             }
-            self.wal.sync_data()?;
         }
+        // Also covers a durable commit whose flush was deferred to the caller,
+        // so a shutdown or checkpoint never leaves an acknowledged write behind.
+        self.wal.sync_through(self.wal.appended())?;
         Ok(())
+    }
+
+    /// A handle for flushing the WAL without holding the engine's write lock.
+    ///
+    /// Pair with [`Engine::write_batch_deferred`]: the returned LSN is durable
+    /// once `sync_through` has been called for it.
+    pub fn wal(&self) -> Arc<Wal> {
+        Arc::clone(&self.wal)
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
