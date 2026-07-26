@@ -2034,6 +2034,7 @@ name = "vyrn-protocol"
 version = "0.1.0-dev"
 dependencies = [
  "bytes",
+ "proptest",
  "thiserror",
  "tokio-util",
 ]
