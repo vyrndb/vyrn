@@ -3,16 +3,22 @@ pub mod change_log;
 pub mod document;
 mod mvcc;
 mod page_tree;
+pub mod recover;
 mod value_log;
+mod wal;
+pub mod wal_archive;
+
+pub use wal::Wal;
 
 use crc32fast::Hasher;
 use fs2::FileExt;
 use page_tree::PageTree;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use thiserror::Error;
 
