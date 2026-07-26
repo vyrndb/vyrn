@@ -459,9 +459,45 @@ async fn main() -> Result<()> {
         Arc::clone(&checkpoint_due),
         Arc::clone(&readers),
     );
+    // Started only after the engine is open, so the archiver can never see a
+    // WAL tail that recovery is still truncating.
+    if let (Some(archive_dir), Some(watermark)) = (&args.wal_archive_dir, &archived_through) {
+        start_wal_archiver(
+            Arc::clone(&engine),
+            args.data.join("wal"),
+            archive_dir.clone(),
+            Arc::clone(watermark),
+            Duration::from_millis(args.wal_archive_interval_ms),
+            Arc::clone(&metrics),
+        );
+    }
+    // The WAL handle is shared so the flush stage can sync without taking the
+    // engine's write lock, which is what lets one barrier cover several batches.
+    let wal = engine
+        .read()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+        .wal();
+    let (flush_sender, flush_receiver) = mpsc::channel(args.write_queue_capacity);
+    // Shared between the two stages: the write worker grows a batch only while a
+    // barrier is outstanding, and the flush stage tells it when one lands.
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let (flush_completed, _) = watch::channel(0);
+    start_flush_worker(
+        wal,
+        flush_receiver,
+        FlushWorkerConfig {
+            readers: Arc::clone(&readers),
+            changes: change_sender.clone(),
+            metrics: Arc::clone(&metrics),
+            engine: Arc::clone(&engine),
+            in_flight: Arc::clone(&in_flight),
+            flush_completed: flush_completed.clone(),
+        },
+    );
     start_write_worker(
         Arc::clone(&engine),
         write_receiver,
+        flush_sender,
         WriteWorkerConfig {
             maximum_batch: args.write_batch_size,
             delay: Duration::from_micros(args.write_batch_delay_us),
@@ -470,6 +506,8 @@ async fn main() -> Result<()> {
             changes: change_sender.clone(),
             metrics: Arc::clone(&metrics),
             checkpoint_due: Arc::clone(&checkpoint_due),
+            in_flight,
+            flush_completed,
         },
     );
     let state = Arc::new(ServerState {
