@@ -344,7 +344,8 @@ impl ReadEngine {
 pub struct Engine {
     path: PathBuf,
     tree: PageTree,
-    wal: File,
+    /// Shared so a commit's flush can run after the write lock is released.
+    wal: Arc<Wal>,
     segment_id: u64,
     last_lsn: u64,
     checkpoint_generation: u64,
@@ -370,6 +371,10 @@ pub struct Engine {
     /// Bytes written to the active WAL segment, tracked so the rotation check
     /// does not stat the file on every commit.
     wal_len: u64,
+    /// Highest segment id the archiver has durably copied out; sealed segments
+    /// above this survive checkpoints because they are the only copy of their
+    /// LSN range once the pages behind them are checkpointed.
+    archived_through: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Engine {
@@ -476,6 +481,7 @@ impl Engine {
             last_published: Vec::new(),
             shared_snapshots: std::sync::Mutex::new(BTreeMap::new()),
             wal_len,
+            archived_through: options.archived_through,
         })
     }
 
