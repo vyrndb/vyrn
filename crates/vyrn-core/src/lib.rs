@@ -858,6 +858,16 @@ impl Engine {
         operations: Vec<BatchOperation>,
         updates: Vec<IndexUpdate>,
     ) -> Result<Vec<BatchResult>> {
+        self.write_indexed_batch(operations, updates, Barrier::Immediate)
+            .map(|(results, _)| results)
+    }
+
+    fn write_indexed_batch(
+        &mut self,
+        operations: Vec<BatchOperation>,
+        updates: Vec<IndexUpdate>,
+        barrier: Barrier,
+    ) -> Result<(Vec<BatchResult>, Option<u64>)> {
         for update in &updates {
             validate_key(&update.primary_key)?;
             validate_index_value(update.old_value.as_deref())?;
@@ -911,9 +921,9 @@ impl Engine {
         let primary_count = operations.len();
         let mut combined = operations;
         combined.extend(index_operations);
-        let mut results = self.write_batch_internal(combined)?;
+        let (mut results, lsn) = self.apply_batch(combined, barrier)?;
         results.truncate(primary_count);
-        Ok(results)
+        Ok((results, lsn))
     }
 
     pub fn lookup_index(&self, name: &[u8], value: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
