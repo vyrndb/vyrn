@@ -1944,6 +1944,20 @@ fn replay_segment(
                 "transaction checksum or footer mismatch",
             ));
         }
+        // The header's first LSN is written by create_segment but was never
+        // read back, so a body spliced from another segment (or a botched
+        // archive restore) went undetected. Checked against the first verified
+        // record only: an empty segment has nothing to contradict its header.
+        if !saw_record {
+            saw_record = true;
+            if lsn != header_first_lsn {
+                return Err(corrupt(
+                    segment_id,
+                    offset,
+                    "segment first LSN does not match its header",
+                ));
+            }
+        }
         if lsn > state.lsn {
             if lsn != state.lsn + 1 {
                 return Err(corrupt(segment_id, offset, "WAL sequence is discontinuous"));
