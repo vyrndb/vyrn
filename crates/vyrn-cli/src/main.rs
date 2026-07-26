@@ -117,6 +117,50 @@ async fn main() -> Result<()> {
             println!("restored {}", target.display());
             return Ok(());
         }
+        Command::Recover {
+            base,
+            archive,
+            target,
+            until_lsn,
+            allow_partial,
+        } => {
+            vyrn_core::backup::restore_backup(base, &target)?;
+            let lsn = vyrn_core::recover::recover_to(
+                &target,
+                archive.as_deref(),
+                until_lsn,
+                allow_partial,
+            )
+            .with_context(|| {
+                format!(
+                    "recovery failed; {} is unusable and must be deleted before retrying",
+                    target.display()
+                )
+            })?;
+            println!("recovered {} to LSN {}", target.display(), lsn);
+            println!("give the recovered database a new, empty archive directory before archiving from it");
+            return Ok(());
+        }
+        Command::VerifyArchive { archive } => {
+            let summary = vyrn_core::wal_archive::verify_archive(&archive)?;
+            println!(
+                "verified {}: {} segments covering LSN {}..={}",
+                archive.display(),
+                summary.segments,
+                summary.first_lsn,
+                summary.last_lsn
+            );
+            return Ok(());
+        }
+        Command::WalPrune {
+            data,
+            archive,
+            through,
+        } => {
+            let pruned = vyrn_core::wal_archive::prune_wal(&data, &archive, through)?;
+            println!("pruned {pruned} archived segments through id {through}");
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -159,7 +203,12 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Backup { .. } | Command::VerifyBackup { .. } | Command::Restore { .. } => {
+        Command::Backup { .. }
+        | Command::VerifyBackup { .. }
+        | Command::Restore { .. }
+        | Command::Recover { .. }
+        | Command::VerifyArchive { .. }
+        | Command::WalPrune { .. } => {
             unreachable!("offline commands return before connecting")
         }
     }
