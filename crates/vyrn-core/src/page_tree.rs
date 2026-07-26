@@ -504,6 +504,155 @@ impl PageTree {
         Ok((root, self.len + u64::from(!existed)))
     }
 
+    /// Applies many mutations in a single copy-on-write pass.
+    ///
+    /// Rewrites each affected root-to-leaf path once for the whole batch instead
+    /// of once per key, so a commit's page cost is proportional to the paths it
+    /// touches rather than to the number of keys it changes. Applying keys one at
+    /// a time made a 64-key batch write ~133 pages where this writes a few dozen.
+    ///
+    /// Mutations are applied in the given order, so a later mutation of the same
+    /// key wins and sees the earlier one's effect, matching what repeated
+    /// single-key calls would have produced.
+    pub(crate) fn prepare_batch(
+        &mut self,
+        mutations: &[(Vec<u8>, Mutation)],
+    ) -> Result<BatchOutcome> {
+        if mutations.is_empty() {
+            return Ok(BatchOutcome {
+                root: self.root,
+                len: self.len,
+            });
+        }
+        // Tracks which keys were present before the batch, so the entry count can
+        // be adjusted without re-reading the tree.
+        let mut existed = vec![false; mutations.len()];
+        let mut prepared = Vec::with_capacity(mutations.len());
+        for (index, (key, mutation)) in mutations.iter().enumerate() {
+            let value = match mutation {
+                Mutation::Put { value, revision } => {
+                    let stored = if value.len() > INLINE_LIMIT {
+                        EntryValue::External(self.values.append(value, *revision)?)
+                    } else {
+                        EntryValue::Inline(value.clone())
+                    };
+                    Some((stored, *revision))
+                }
+                Mutation::Delete => None,
+            };
+            prepared.push(PreparedMutation {
+                key: key.clone(),
+                value,
+                index,
+            });
+        }
+        // Descending in key order lets one pass group each leaf's mutations
+        // together; a stable sort keeps same-key mutations in arrival order.
+        prepared.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut replacements = if self.root == 0 {
+            let entries = merge_entries(Vec::new(), &prepared, &mut existed);
+            if entries.is_empty() {
+                Vec::new()
+            } else {
+                self.write_leaf_level(&entries)?
+            }
+        } else {
+            self.apply_node(self.root, &prepared, true, &mut existed)?
+        };
+        while replacements.len() > 1 {
+            replacements = self.write_internal_level(&replacements)?;
+        }
+        // Count one delta per distinct key, not per mutation: a batch that writes
+        // and then deletes the same key changes the entry count by whatever its
+        // last mutation leaves behind, not by both of them. `prepared` is sorted
+        // by key, so each run of equal keys is contiguous.
+        let mut delta: i64 = 0;
+        let mut index = 0;
+        while index < prepared.len() {
+            let mut last = index;
+            while last + 1 < prepared.len() && prepared[last + 1].key == prepared[index].key {
+                last += 1;
+            }
+            match (&prepared[last].value, existed[prepared[index].index]) {
+                (Some(_), false) => delta += 1,
+                (None, true) => delta -= 1,
+                _ => {}
+            }
+            index = last + 1;
+        }
+        let root = replacements.first().map_or(0, |node| node.page_id);
+        let len = if root == 0 {
+            0
+        } else {
+            self.len.saturating_add_signed(delta)
+        };
+        Ok(BatchOutcome { root, len })
+    }
+
+    /// Rewrites one subtree for the mutations that fall inside it.
+    ///
+    /// Returns the nodes that replace `page_id` in its parent, which may be more
+    /// than one when a page split, or none when the subtree became empty.
+    fn apply_node(
+        &mut self,
+        page_id: u64,
+        mutations: &[PreparedMutation],
+        is_root: bool,
+        existed: &mut [bool],
+    ) -> Result<Vec<NodeRef>> {
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => {
+                let entries = self.decode_leaf(&page, page_id)?;
+                let entries = merge_entries(entries, mutations, existed);
+                if entries.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    self.write_leaf_level(&entries)
+                }
+            }
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                let mut new_children = Vec::with_capacity(children.len());
+                let mut cursor = 0;
+                for (index, child) in children.iter().enumerate() {
+                    // Child 0 owns everything below child 1's minimum, so keys
+                    // smaller than the subtree's current minimum land there.
+                    let end = match children.get(index + 1) {
+                        Some(next) => {
+                            cursor
+                                + mutations[cursor..]
+                                    .partition_point(|mutation| mutation.key < next.min_key)
+                        }
+                        None => mutations.len(),
+                    };
+                    if end > cursor {
+                        let replacements = self.apply_node(
+                            child.page_id,
+                            &mutations[cursor..end],
+                            false,
+                            existed,
+                        )?;
+                        new_children.extend(replacements);
+                    } else {
+                        new_children.push(child.clone());
+                    }
+                    cursor = end;
+                }
+                if new_children.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // Collapse a root that deletes reduced to a single child, rather
+                // than keeping an internal page that points at just one node.
+                if is_root && new_children.len() == 1 {
+                    return Ok(new_children);
+                }
+                self.write_internal_level(&new_children)
+            }
+            page_type => Err(unexpected_type(page_id, page_type)),
+        }
+    }
+
     pub(crate) fn prepare_delete(&mut self, key: &[u8]) -> Result<Option<(u64, u64)>> {
         if self.root == 0 {
             return Ok(None);
