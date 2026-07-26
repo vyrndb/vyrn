@@ -1876,23 +1876,49 @@ fn redo_from_checkpoint(
 ) -> Result<PageTree> {
     let checkpoint_lsn = base.lsn;
     // Start from the checkpoint root, which was synced before the manifest was
-    // published. If even that is unreachable the page file lost more than the
-    // unsynced tail, so rebuild from empty and redo everything still logged.
+    // published. If even that is unreachable the page file lost pre-checkpoint
+    // data that no amount of redo can reconstruct: the old fallback rebuilt
+    // from an empty tree while still filtering `lsn > checkpoint_lsn`, which
+    // silently discarded everything written before the checkpoint and
+    // returned Ok. Fail loudly instead.
     let mut tree = match PageTree::open(page_path, value_path, base.root, base.len)
         .and_then(|tree| tree.validate().map(|()| tree))
     {
         Ok(tree) => tree,
-        Err(_) => PageTree::open(page_path, value_path, 0, 0)?,
+        Err(_) => {
+            return Err(Error::CorruptManifest(
+                "checkpoint root is unreachable; the page file lost pre-checkpoint data — restore from a backup".into(),
+            ))
+        }
     };
 
+    // Tombstones ride only the page-level mutation list, never the WAL payload
+    // (a max-size key's tombstone would exceed MAX_KEY_SIZE and fail
+    // validate_payload — see MAX_STORED_KEY_SIZE), so redo must re-derive them
+    // with exactly apply_batch's rules or every redone database loses its
+    // delete revisions — and point-in-time restore makes redo the normal path,
+    // not the disaster path.
     for record in redo.iter().filter(|record| record.lsn > checkpoint_lsn) {
         for (op, key, value) in &record.operations {
             if *op == OP_PUT {
                 let value = value.as_deref().unwrap_or_default();
                 let (root, len) = tree.prepare_put(key, value, record.lsn)?;
                 tree.publish(root, len);
+                // A put clears any tombstone left by an earlier delete, so the
+                // key's revision comes from the live entry again.
+                if !key.starts_with(INTERNAL_PREFIX) {
+                    if let Some((root, len)) = tree.prepare_delete(&tombstone_key(key))? {
+                        tree.publish(root, len);
+                    }
+                }
             } else if let Some((root, len)) = tree.prepare_delete(key)? {
                 tree.publish(root, len);
+                // A delete of an existing user key records its revision on a
+                // tombstone at the deleting record's LSN.
+                if !key.starts_with(INTERNAL_PREFIX) {
+                    let (root, len) = tree.prepare_put(&tombstone_key(key), &[], record.lsn)?;
+                    tree.publish(root, len);
+                }
             }
         }
     }
