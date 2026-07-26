@@ -28,6 +28,8 @@ const DEFAULT_CACHE_PAGES: usize = 4_096;
 
 type Page = [u8; PAGE_SIZE];
 type VersionedRow = (Vec<u8>, Vec<u8>, u64);
+/// A key's stored value and the revision that wrote it, absent when the key is gone.
+type RevisionedValue = Option<(Vec<u8>, u64)>;
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -46,6 +48,28 @@ enum EntryValue {
 struct NodeRef {
     page_id: u64,
     min_key: Vec<u8>,
+}
+
+/// A single key's change within one batched tree mutation.
+#[derive(Clone, Debug)]
+pub(crate) enum Mutation {
+    Put { value: Vec<u8>, revision: u64 },
+    Delete,
+}
+
+/// The result of applying one batch.
+pub(crate) struct BatchOutcome {
+    pub(crate) root: u64,
+    pub(crate) len: u64,
+}
+
+/// A mutation with its value already written to the value log, sorted by key.
+struct PreparedMutation {
+    key: Vec<u8>,
+    /// `None` for a delete.
+    value: Option<(EntryValue, u64)>,
+    /// Position in the caller's original list, used to report `existed`.
+    index: usize,
 }
 
 struct PageCache {
