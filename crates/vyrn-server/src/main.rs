@@ -1764,6 +1764,7 @@ fn start_async_sync(engine: Arc<RwLock<Engine>>, interval: Duration, metrics: Ar
 fn start_write_worker(
     engine: Arc<RwLock<Engine>>,
     mut receiver: mpsc::Receiver<WriteRequest>,
+    flushes: mpsc::Sender<PendingFlush>,
     config: WriteWorkerConfig,
 ) {
     tokio::spawn(async move {
@@ -1886,20 +1887,52 @@ fn start_write_worker(
                 requests.first(),
                 Some(WriteRequest::Operation { .. } | WriteRequest::Transaction { .. })
             ) {
-                if !config.delay.is_zero() {
-                    sleep(config.delay).await;
-                }
-                while requests.len() < config.maximum_batch {
-                    match receiver.try_recv() {
-                        Ok(
-                            request @ (WriteRequest::Operation { .. }
-                            | WriteRequest::Transaction { .. }),
-                        ) => requests.push(request),
-                        Ok(request) => {
-                            pending = Some(request);
-                            break;
+                // Take everything already queued first. Under load the queue is
+                // rarely empty, and sleeping in that case only adds latency to a
+                // batch that was already worth committing.
+                drain_writes(
+                    &mut receiver,
+                    &mut requests,
+                    &mut pending,
+                    config.maximum_batch,
+                );
+                // Then keep accumulating for as long as a barrier is already in
+                // flight. Those clients cannot be answered until that flush
+                // finishes regardless, so the wait is free, and it is self-tuning:
+                // on slow storage the flush is long and batches grow, on fast
+                // storage it returns immediately and latency stays low.
+                //
+                // Without this, the pipeline's own success works against it. When
+                // the flush blocked the write worker, arriving requests piled up
+                // behind it and were swept into one batch; now that it does not
+                // block, each small batch would take its own barrier.
+                if requests.len() < config.maximum_batch {
+                    let mut completed = config.flush_completed.subscribe();
+                    // A hard ceiling, so a permanently busy flush stage cannot
+                    // hold a batch open indefinitely.
+                    let deadline = tokio::time::Instant::now() + config.delay;
+                    while requests.len() < config.maximum_batch
+                        && config.in_flight.load(Ordering::Acquire) > 0
+                    {
+                        let timeout = tokio::time::sleep_until(deadline);
+                        tokio::select! {
+                            biased;
+                            received = receiver.recv() => match received {
+                                Some(
+                                    request @ (WriteRequest::Operation { .. }
+                                    | WriteRequest::Transaction { .. }),
+                                ) => requests.push(request),
+                                Some(request) => {
+                                    pending = Some(request);
+                                    break;
+                                }
+                                None => break,
+                            },
+                            // The barrier this batch was waiting behind has landed,
+                            // so stop accumulating and commit what is here.
+                            _ = completed.changed() => break,
+                            _ = timeout => break,
                         }
-                        Err(_) => break,
                     }
                 }
             }
