@@ -242,7 +242,22 @@ impl ReadEngine {
         })
     }
 
+    /// Publishes a newer committed root to this read handle.
+    ///
+    /// A refresh below the handle's current generation is ignored rather than
+    /// applied: durability and checkpoints publish concurrently, so a batch
+    /// whose flush ran long can ask a reader to move back onto a generation a
+    /// checkpoint has already retired — and whose files it has already
+    /// deleted, so reopening them by path would fail (or worse, recreate them
+    /// empty). Skipping loses nothing: the retiring checkpoint compacted at a
+    /// later LSN, so the generation the reader already serves contains
+    /// everything the stale root did. The comparison happens under the
+    /// caller's exclusive borrow, leaving no window between deciding the
+    /// refresh is stale and acting on it.
     pub fn refresh(&mut self, generation: u64, root: u64, len: u64) -> Result<()> {
+        if generation < self.generation {
+            return Ok(());
+        }
         if generation != self.generation {
             self.tree = PageTree::open(
                 &self.path.join(page_file_name(generation)),
