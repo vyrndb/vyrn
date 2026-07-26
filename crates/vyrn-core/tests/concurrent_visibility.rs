@@ -106,3 +106,46 @@ fn read_handles_never_see_a_root_with_missing_pages() {
     fresh.refresh(generation, root, len).unwrap();
     assert!(!fresh.scan(None, None, 64).unwrap().is_empty());
 }
+
+/// A read handle opens from the checkpoint manifest and does not replay the WAL,
+/// so after a crash it starts behind the engine — at the empty generation-0 root
+/// when no checkpoint had run at all. The server used to leave it there until the
+/// next commit published a root, so a database that was killed and then only read
+/// from answered "not found" for writes it had acknowledged as durable. Whoever
+/// opens read handles has to publish the recovered root to them.
+#[test]
+fn a_fresh_read_handle_is_behind_the_recovered_engine_until_refreshed() {
+    let directory = tempdir().unwrap();
+    {
+        // Dropped without a checkpoint, so recovery is pure WAL replay and no
+        // manifest exists — exactly the state a kill leaves behind.
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine
+            .put(b"smoke/key".to_vec(), b"value".to_vec())
+            .unwrap();
+        engine
+            .put(b"smoke/second".to_vec(), b"durable".to_vec())
+            .unwrap();
+    }
+    assert!(
+        !directory.path().join("CURRENT").exists(),
+        "this case is only meaningful without a manifest"
+    );
+
+    let engine = Engine::open(directory.path()).unwrap();
+    assert_eq!(
+        engine.get(b"smoke/key").unwrap(),
+        Some(b"value".to_vec()),
+        "replay itself must recover the acknowledged writes"
+    );
+
+    let mut reader = ReadEngine::open(directory.path()).unwrap();
+    let (generation, root, len) = engine.committed_root();
+    reader.refresh(generation, root, len).unwrap();
+    assert_eq!(reader.get(b"smoke/key").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(
+        reader.get(b"smoke/second").unwrap(),
+        Some(b"durable".to_vec())
+    );
+    assert_eq!(reader.scan(None, None, 64).unwrap().len(), 2);
+}

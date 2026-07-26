@@ -612,7 +612,23 @@ async fn main() -> Result<()> {
             .map(|_| ReadEngine::open(&args.data).map(RwLock::new))
             .collect::<vyrn_core::Result<Vec<_>>>()?,
     );
-    // READER_FIX_PLACEHOLDER
+    // A read handle opens from the checkpoint manifest, which is the last root
+    // whose pages are known complete — it does not replay the WAL. The engine
+    // does, so after a crash it holds commits the manifest does not name, and
+    // until this refresh those reads would answer "not found" for writes that
+    // were acknowledged as durable. Only the next commit's publish used to move
+    // the readers forward, so a database that was killed and then only read from
+    // served a stale snapshot indefinitely.
+    {
+        let (generation, root, len) = engine.committed_root();
+        for reader in readers.iter() {
+            reader
+                .write()
+                .map_err(|_| anyhow::anyhow!("read handle lock poisoned during startup"))?
+                .refresh(generation, root, len)
+                .context("failed to publish the recovered root to a read handle")?;
+        }
+    }
     let read_queues = start_read_workers(&readers, args.write_queue_capacity);
     let engine = Arc::new(RwLock::new(engine));
     let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
