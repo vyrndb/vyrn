@@ -1017,13 +1017,56 @@ impl Engine {
         self.write_batch_internal(operations)
     }
 
+    /// Applies a batch and returns the LSN that must be flushed to make it
+    /// durable, without flushing it here.
+    ///
+    /// Lets a caller release the engine's write lock and only then wait on
+    /// [`Wal::sync_through`], so the next batch's tree work overlaps this batch's
+    /// flush and one barrier can cover several batches. The caller must not
+    /// acknowledge these writes before that call returns.
+    /// The returned LSN is `None` when no flush is owed, which is the case in
+    /// [`DurabilityMode::Async`]: those records are buffered for the background
+    /// sync rather than written here, so there is nothing for a caller to wait on.
+    pub fn write_batch_deferred(
+        &mut self,
+        operations: Vec<BatchOperation>,
+    ) -> Result<(Vec<BatchResult>, Option<u64>)> {
+        for operation in &operations {
+            validate_user_operation(operation)?;
+        }
+        self.apply_batch(operations, Barrier::Deferred)
+    }
+
+    /// [`Engine::write_indexed`] with the flush deferred to the caller.
+    pub fn write_indexed_deferred(
+        &mut self,
+        operations: Vec<BatchOperation>,
+        updates: Vec<IndexUpdate>,
+    ) -> Result<(Vec<BatchResult>, Option<u64>)> {
+        for operation in &operations {
+            validate_user_operation(operation)?;
+        }
+        self.write_indexed_batch(operations, updates, Barrier::Deferred)
+    }
+
     fn write_batch_internal(
         &mut self,
         operations: Vec<BatchOperation>,
     ) -> Result<Vec<BatchResult>> {
+        self.apply_batch(operations, Barrier::Immediate)
+            .map(|(results, _)| results)
+    }
+
+    /// Returns the batch's results and, when a flush is owed to the caller, the
+    /// LSN that must be made durable before those results may be acknowledged.
+    fn apply_batch(
+        &mut self,
+        operations: Vec<BatchOperation>,
+        barrier: Barrier,
+    ) -> Result<(Vec<BatchResult>, Option<u64>)> {
         self.ensure_healthy()?;
         if operations.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         for operation in &operations {
             match operation {
@@ -1042,6 +1085,28 @@ impl Engine {
         // Includes shared snapshots, so a transaction that began without the
         // write lock still forces its prior versions to be retained.
         let oldest_snapshot = self.oldest_active_snapshot();
+        // Each key's pre-batch state, read once. This doubles as the presence
+        // check below: reading the value and revision in a single descent avoids
+        // paying three separate root-to-leaf lookups per key, which is what made
+        // commits under an open transaction scale with tree depth.
+        let mut wanted: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for operation in &operations {
+            let key = match operation {
+                BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
+            };
+            wanted.insert(key.clone());
+            // A put clears any tombstone, and a delete writes one, so their
+            // presence matters too.
+            if !key.starts_with(INTERNAL_PREFIX) {
+                wanted.insert(tombstone_key(key));
+            }
+        }
+        let wanted: Vec<Vec<u8>> = wanted.into_iter().collect();
+        let existing: BTreeMap<Vec<u8>, Option<(Vec<u8>, u64)>> = wanted
+            .iter()
+            .cloned()
+            .zip(self.tree.get_many_with_revision(&wanted)?)
+            .collect();
         let mut previous = BTreeMap::new();
         if oldest_snapshot.is_some() {
             for operation in &operations {
