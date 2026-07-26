@@ -326,3 +326,82 @@ enum Op {
 }
 
 /// Small key alphabet so puts overwrite and deletes hit real keys often.
+fn op() -> impl Strategy<Value = Op> {
+    let key = prop::collection::vec(0_u8..5, 1..3);
+    let value = prop::collection::vec(any::<u8>(), 0..24);
+    prop_oneof![
+        3 => (key.clone(), value).prop_map(|(key, value)| Op::Put(key, value)),
+        1 => key.prop_map(Op::Delete),
+    ]
+}
+
+proptest! {
+    // Each case builds a source database, a base backup, an archive, and a
+    // restored target, then runs a full recovery — several engine opens and a
+    // pile of fsyncs per case. The repo's usual 48 cases would dominate the
+    // suite's runtime for no extra coverage, so this one runs 12.
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// Every commit is one dense LSN, so the state at any bound must equal the
+    /// model snapshot taken right after that commit — regardless of where the
+    /// checkpoint fell, how the ops split across 128-byte segments, or whether
+    /// the bound lands on a segment boundary. Any drift means the trim kept or
+    /// cut the wrong record, which a fixed-scenario test only catches when its
+    /// hand-picked bound happens to straddle the bug.
+    #[test]
+    fn pitr_matches_model_at_every_bound(
+        ops in prop::collection::vec(op(), 4..24),
+        checkpoint_selector in any::<prop::sample::Index>(),
+        bound_selector in any::<prop::sample::Index>(),
+    ) {
+        let source = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let total = ops.len() as u64;
+        // Checkpoint after some commit in 1..=total; the bound must lie at or
+        // above it because redo only rolls forward from the checkpoint root.
+        let checkpoint_at = 1 + checkpoint_selector.index(ops.len()) as u64;
+        let bound = checkpoint_at + bound_selector.index((total - checkpoint_at + 1) as usize) as u64;
+
+        let mut model = BTreeMap::new();
+        // snapshots[lsn - 1] is the exact expected state after commit `lsn`.
+        let mut snapshots = Vec::with_capacity(ops.len());
+        {
+            let mut engine = Engine::open_with_segment_size(source.path(), 128).unwrap();
+            for (index, operation) in ops.iter().enumerate() {
+                match operation {
+                    Op::Put(key, value) => {
+                        engine.put(key.clone(), value.clone()).unwrap();
+                        model.insert(key.clone(), value.clone());
+                    }
+                    Op::Delete(key) => {
+                        engine.delete(key).unwrap();
+                        model.remove(key);
+                    }
+                }
+                snapshots.push(model.clone());
+                if index as u64 + 1 == checkpoint_at {
+                    engine.checkpoint().unwrap();
+                }
+            }
+            prop_assert_eq!(engine.sequence(), total);
+            engine.rotate_for_archive().unwrap();
+        }
+        let backup_file = auxiliary.path().join("base.bkp");
+        backup::create_backup(source.path(), &backup_file).unwrap();
+        let archive = auxiliary.path().join("archive");
+        wal_archive::archive_pending(&source.path().join("wal"), &archive).unwrap();
+
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+        let achieved = recover::recover_to(&target, Some(&archive), Some(bound), false).unwrap();
+        prop_assert_eq!(achieved, bound);
+
+        let engine = Engine::open(&target).unwrap();
+        prop_assert_eq!(engine.sequence(), bound);
+        let expected: Vec<_> = snapshots[bound as usize - 1]
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        prop_assert_eq!(engine.scan(None, None, usize::MAX).unwrap(), expected);
+    }
+}
