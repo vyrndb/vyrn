@@ -73,6 +73,117 @@ fn recovers_acknowledged_writes_when_page_tail_is_lost() {
     assert_eq!(engine.get(b"a").unwrap(), None, "the delete was logged too");
 }
 
+/// The server applies batches with the flush deferred, then flushes once for
+/// several batches after dropping the write lock. A write acknowledged that way
+/// must be just as durable as one committed inline, including when the page tail
+/// is lost and recovery has to redo from the WAL.
+#[test]
+fn deferred_commits_survive_a_lost_page_tail_once_flushed() {
+    let directory = tempdir().unwrap();
+    let checkpointed;
+    {
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"base".to_vec(), b"zero".to_vec()).unwrap();
+        engine.checkpoint().unwrap();
+        checkpointed = std::fs::metadata(newest_page_file(directory.path()))
+            .unwrap()
+            .len();
+
+        // Three batches applied without flushing, exactly as the write worker
+        // queues them, then one barrier covering all of them.
+        let wal = engine.wal();
+        let (_, first) = engine
+            .write_batch_deferred(vec![BatchOperation::Put(b"a".to_vec(), b"one".to_vec())])
+            .unwrap();
+        let (_, second) = engine
+            .write_batch_deferred(vec![BatchOperation::Put(b"b".to_vec(), b"two".to_vec())])
+            .unwrap();
+        let (_, third) = engine
+            .write_batch_deferred(vec![
+                BatchOperation::Put(b"c".to_vec(), b"three".to_vec()),
+                BatchOperation::Delete(b"base".to_vec()),
+            ])
+            .unwrap();
+        assert!(first.is_some() && second.is_some(), "a flush is owed");
+        // One flush through the highest LSN, which is what the flush stage does.
+        wal.sync_through(third.unwrap()).unwrap();
+    }
+
+    let pages = newest_page_file(directory.path());
+    assert!(std::fs::metadata(&pages).unwrap().len() > checkpointed);
+    truncate_page_file(&pages, checkpointed);
+
+    let engine = Engine::open(directory.path()).expect("recovery should redo the flushed commits");
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(engine.get(b"b").unwrap(), Some(b"two".to_vec()));
+    assert_eq!(engine.get(b"c").unwrap(), Some(b"three".to_vec()));
+    assert_eq!(engine.get(b"base").unwrap(), None);
+}
+
+/// Tombstones never ride the WAL payload — they exist only as page-level
+/// mutations derived at apply time — so redo must re-derive them with exactly
+/// the commit path's rules. Before the fix a redone database lost every delete
+/// revision, and point-in-time restore makes redo the normal path, not the
+/// disaster path.
+#[test]
+fn redo_preserves_delete_revision() {
+    let directory = tempdir().unwrap();
+    let delete_lsn;
+    {
+        let mut engine = Engine::open(directory.path()).unwrap();
+        // Checkpoint while empty so the checkpoint image is exactly the super
+        // page and the truncation below drops only post-checkpoint pages.
+        engine.checkpoint().unwrap();
+        engine.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+        assert!(engine.delete(b"k").unwrap());
+        delete_lsn = engine.sequence();
+    }
+
+    let pages = newest_page_file(directory.path());
+    assert!(std::fs::metadata(&pages).unwrap().len() > 4096);
+    truncate_page_file(&pages, 4096);
+
+    let engine = Engine::open(directory.path()).expect("recovery should redo the lost commits");
+    assert_eq!(engine.get(b"k").unwrap(), None);
+    assert_eq!(
+        engine.revision(b"k").unwrap(),
+        Some(delete_lsn),
+        "a redone delete must keep the deleting record's LSN as the key's revision"
+    );
+    assert!(
+        engine.changed_since(b"k", delete_lsn - 1).unwrap(),
+        "a watcher standing at the put's LSN must still observe the delete after redo"
+    );
+}
+
+/// The rejected design shipped tombstones in the WAL payload, where a max-size
+/// key's tombstone key (prefix + key) would exceed MAX_KEY_SIZE and fail
+/// validate_payload on replay — an acknowledged, fsynced delete would have made
+/// the database permanently unopenable. Redo must round-trip the largest legal
+/// key instead.
+#[test]
+fn max_size_key_delete_round_trips_through_redo() {
+    let directory = tempdir().unwrap();
+    let key = vec![0x6b; MAX_KEY_SIZE];
+    let delete_lsn;
+    {
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.checkpoint().unwrap();
+        engine.put(key.clone(), b"value".to_vec()).unwrap();
+        assert!(engine.delete(&key).unwrap());
+        delete_lsn = engine.sequence();
+    }
+
+    let pages = newest_page_file(directory.path());
+    assert!(std::fs::metadata(&pages).unwrap().len() > 4096);
+    truncate_page_file(&pages, 4096);
+
+    let engine = Engine::open(directory.path())
+        .expect("an acknowledged delete must never make the database unopenable");
+    assert_eq!(engine.get(&key).unwrap(), None);
+    assert_eq!(engine.revision(&key).unwrap(), Some(delete_lsn));
+}
+
 /// Recovery must be idempotent: reopening repeatedly converges on the same state.
 #[test]
 fn repeated_recovery_is_stable() {
