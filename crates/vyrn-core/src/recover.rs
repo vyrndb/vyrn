@@ -142,3 +142,137 @@ pub fn recover_to(
 
 /// A failed recovery leaves `target` in an undefined intermediate state, so
 /// every error tells the caller to discard it rather than patch it in place.
+fn failed(message: String) -> Error {
+    Error::CorruptBackup(format!(
+        "{message}; delete the recovery target and start over"
+    ))
+}
+
+/// Unions the archive's segments into the restored wal/.
+///
+/// A segment id present in both places is not automatically a conflict: the
+/// base backup copied the then-active segment mid-write, so its copy is a
+/// legitimate partial prefix of the sealed archive copy. The comparison stops
+/// at the shorter file's last complete record boundary because the source may
+/// have truncated a torn tail after the backup was taken — a raw full-length
+/// prefix check would reject that healthy pair as foreign.
+fn merge_archive(wal_directory: &Path, archive_directory: &Path) -> Result<()> {
+    let entries = wal_archive::read_index(archive_directory)?;
+    let present: BTreeSet<u64> = wal_ids(wal_directory)?.into_iter().collect();
+    for entry in &entries {
+        let name = crate::segment_name(entry.segment_id);
+        let source = archive_directory.join(&name);
+        let destination = wal_directory.join(&name);
+        if present.contains(&entry.segment_id) {
+            let base = fs::read(&destination)?;
+            let archived = fs::read(&source)?;
+            let shorter: &[u8] = if base.len() <= archived.len() {
+                &base
+            } else {
+                &archived
+            };
+            let boundary = last_record_boundary(shorter);
+            if base[..boundary] != archived[..boundary] {
+                return Err(failed(format!(
+                    "segment {} in {} does not share a history with the archived copy in {}; the archive belongs to a different timeline",
+                    entry.segment_id,
+                    destination.display(),
+                    source.display()
+                )));
+            }
+            if archived.len() > base.len() {
+                write_segment(wal_directory, &name, &archived)?;
+            }
+        } else {
+            // Only in the archive: a checkpoint deleted the local copy after
+            // it was archived. The base's own newest segment may equally be
+            // absent from the archive (it was never sealed) — it is kept as is.
+            let archived = fs::read(&source)?;
+            write_segment(wal_directory, &name, &archived)?;
+        }
+    }
+    crate::sync_directory(wal_directory)?;
+    Ok(())
+}
+
+/// Writes a merged segment durably next to its final name before renaming it
+/// in, so an interrupted merge never leaves a half-copied segment under a name
+/// replay would trust.
+fn write_segment(wal_directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let temporary = wal_directory.join(format!("{name}.tmp"));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, wal_directory.join(name))?;
+    Ok(())
+}
+
+/// Segment ids present in a wal directory, without `list_segments`' gap
+/// check, so recovery can name exactly which ids a broken merge is missing.
+fn wal_ids(directory: &Path) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(number) = name.strip_suffix(".vwal") {
+            ids.push(
+                number.parse::<u64>().map_err(|_| {
+                    failed(format!("invalid segment name {name} in recovery target"))
+                })?,
+            );
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
+}
+
+/// Byte offset just past the last complete record frame, walking only the
+/// declared lengths. Bodies are left unverified because replay re-validates
+/// every byte it applies; the framing alone is enough to find where a torn or
+/// partial copy stops being comparable.
+fn last_record_boundary(bytes: &[u8]) -> usize {
+    let mut offset = crate::SEGMENT_HEADER_LEN.min(bytes.len());
+    while bytes.len() - offset >= crate::RECORD_HEADER_LEN {
+        let payload_len = crate::read_u32(bytes, offset + 17) as usize;
+        let Some(total_len) = crate::RECORD_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|size| size.checked_add(crate::RECORD_FOOTER_LEN))
+        else {
+            break;
+        };
+        if total_len > bytes.len() - offset {
+            break;
+        }
+        offset += total_len;
+    }
+    offset
+}
+
+/// LSN of the last complete record in a segment, or `first_lsn - 1` when it
+/// has none. The restored active segment may carry a torn tail (replay will
+/// truncate it), so an incomplete final frame is ignored rather than fatal.
+fn last_record_lsn(path: &Path, first_lsn: u64) -> Result<u64> {
+    let bytes = fs::read(path)?;
+    let mut last = first_lsn.saturating_sub(1);
+    let mut offset = crate::SEGMENT_HEADER_LEN.min(bytes.len());
+    while bytes.len() - offset >= crate::RECORD_HEADER_LEN {
+        let payload_len = crate::read_u32(&bytes, offset + 17) as usize;
+        let Some(total_len) = crate::RECORD_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|size| size.checked_add(crate::RECORD_FOOTER_LEN))
+        else {
+            break;
+        };
+        if total_len > bytes.len() - offset {
+            break;
+        }
+        last = crate::read_u64(&bytes, offset + 5);
+        offset += total_len;
+    }
+    Ok(last)
+}
+
