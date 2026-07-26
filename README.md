@@ -22,6 +22,7 @@ Vyrn is a correctness-first database built in Rust from its storage format upwar
 - Bounded authentication workers, connections, frames, and scans
 - Child-process force-kill, corruption/truncation, and randomized model testing
 - Checksummed offline backup verification and empty-directory restore
+- Continuous non-blocking WAL archiving with lag/failure metrics, archive verification, safe WAL pruning, and point-in-time recovery from a base backup plus archive
 - Readiness/liveness endpoints, Prometheus-format metrics, SIGINT/SIGTERM connection draining, and bounded server-side group commit
 - Point reads and consistent scans through the persistent B+ tree and bounded page cache, without duplicating all live values in server memory
 - Ordered prefix subscriptions/change notifications with bounded lag detection
@@ -167,6 +168,20 @@ vyrn restore ./backup.vyrn --target ./restored-data
 
 The archive stores per-file sizes and CRC32 checksums, ends with a commit footer, refuses unsafe paths, and restores only into an empty directory. Always copy verified archives off the database host and perform scheduled restore drills.
 
+### Continuous WAL archiving and point-in-time recovery
+
+Set `VYRN_WAL_ARCHIVE_DIR` to a local directory outside the data directory. `vyrnd` then rotates the active segment and copies every sealed WAL segment into that directory on each tick of `VYRN_WAL_ARCHIVE_INTERVAL_MS` (default 5000, minimum 100). Archiving takes no engine lock and never blocks writes; checkpoints simply refuse to delete a sealed segment the archiver has not durably copied yet. Progress is exported at `/metrics` as `vyrn_wal_archive_lag_segments` (sealed-but-uncopied segments; growth means the archiver is falling behind), `vyrn_wal_archived_total`, and `vyrn_wal_archive_failures_total`. With archiving enabled the data-loss window after losing the host shrinks from "since the last offline backup" to the rotation interval plus archive latency. The destination is deliberately a plain local directory: ship it off-host yourself with rsync or object-storage sync on your own schedule.
+
+Point-in-time recovery rolls a restored base backup forward through the archive to a chosen LSN:
+
+```bash
+vyrn recover --base backup.vyrn --archive /var/backups/vyrn-archive --target ./recovered --until-lsn 12345
+vyrn verify-archive /var/backups/vyrn-archive
+vyrn wal-prune --data ./data --archive /var/backups/vyrn-archive --through 41
+```
+
+`recover` restores the base backup into an empty target, merges the archived segments into its WAL, physically trims the log at the bound, and replays through the ordinary open path; omit `--until-lsn` to roll forward to the archive's end. The bound cannot be below the base checkpoint's LSN, and a bound past what the archive reaches requires `--allow-partial`. A recovered database is a new timeline: give it a new, empty archive directory before archiving from it, or the old timeline's archive would be poisoned. `verify-archive` re-reads and re-checksums every archived byte; `wal-prune` deletes local sealed segments only when the archive provably holds them and only against a stopped database.
+
 ## Storage layout
 
 ```text
@@ -302,7 +317,7 @@ cargo bench -p vyrn-core --bench storage
 2. Online index construction, covering indexes, and index statistics
 3. Adaptive group-commit timing and direct-I/O experiments
 4. Free-page accounting between compactions
-5. Online backup/PITR and operational metrics
+5. Online base backup (point-in-time recovery is implemented) and richer operational metrics
 6. Document collections, SQL planner/executor, and PostgreSQL compatibility
 7. Raft replication, sharding, and online rebalancing
 
