@@ -2069,71 +2069,56 @@ fn start_write_worker(
             if should_checkpoint {
                 config.checkpoint_due.store(true, Ordering::Release);
             }
-            let commit_operations = operations.clone();
-            let commit_index_updates = index_updates.clone();
-            let engine = Arc::clone(&engine);
+            // Moved rather than cloned: a 128-key batch of 128-byte values copied
+            // every key and value twice on the way to the engine.
+            let commit_operations = operations;
+            let commit_index_updates = index_updates;
+            let apply_engine = Arc::clone(&engine);
+            // Apply the batch and write its WAL record, but do not flush here.
+            // The flush is the most expensive part of a commit, and holding the
+            // write lock across it would stop the next batch from doing any work
+            // until this one is durable.
             let result = task::spawn_blocking(move || {
-                let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-                let results = if commit_index_updates.is_empty() {
-                    engine.write_batch(commit_operations)?
+                let mut engine = apply_engine.write().map_err(|_| StorageError::Poisoned)?;
+                let (results, lsn) = if commit_index_updates.is_empty() {
+                    engine.write_batch_deferred(commit_operations)?
                 } else {
-                    engine.write_indexed(commit_operations, commit_index_updates)?
+                    engine.write_indexed_deferred(commit_operations, commit_index_updates)?
                 };
                 // The engine records what it published, so no change-log scan is
                 // needed on the commit path.
                 let published = engine.last_published().to_vec();
                 let (generation, root, len) = engine.committed_root();
-                Ok::<_, StorageError>((
+                Ok::<_, StorageError>(PendingFlush {
+                    lsn,
+                    requests: Vec::new(),
                     results,
-                    should_checkpoint,
-                    engine.sequence(),
+                    published,
                     generation,
                     root,
                     len,
-                    published,
-                ))
+                })
             })
             .await;
             match result {
-                Ok(Ok((results, checkpointed, sequence, generation, root, len, published))) => {
-                    for reader in config.readers.iter() {
-                        match reader.write() {
-                            Ok(mut reader) => {
-                                if let Err(error) = reader.refresh(generation, root, len) {
-                                    record_storage_error(&config.metrics, &error);
-                                    respond_writes(requests, Err(error.to_string()));
-                                    return;
-                                }
-                            }
-                            Err(_) => {
-                                config.metrics.storage_failed.store(true, Ordering::Release);
-                                config.metrics.ready.store(false, Ordering::Release);
-                                respond_writes(
-                                    requests,
-                                    Err("storage reader lock poisoned".into()),
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    writes_since_checkpoint = if checkpointed {
+                Ok(Ok(mut flush)) => {
+                    flush.requests = requests;
+                    writes_since_checkpoint = if should_checkpoint {
                         config.metrics.checkpoints.fetch_add(1, Ordering::Relaxed);
                         0
                     } else {
                         writes_since_checkpoint + operation_count
                     };
-                    // Broadcast the records the commit actually published, so a
-                    // live cursor always matches a durable one.
-                    for record in published {
-                        let _ = config.changes.send(ChangeEvent {
-                            sequence: record.sequence,
-                            key: record.key,
-                            value: record.value,
-                            cursor: Some(change_log::Cursor::new(record.sequence, record.index)),
-                        });
+                    // Counted before queueing so the next iteration sees that a
+                    // barrier is outstanding and accumulates behind it.
+                    config.in_flight.fetch_add(1, Ordering::AcqRel);
+                    // Queued rather than awaited: the completion stage flushes and
+                    // acknowledges in arrival order while this loop moves on to the
+                    // next batch, so the barrier is amortised across committers.
+                    if flushes.send(flush).await.is_err() {
+                        config.in_flight.fetch_sub(1, Ordering::AcqRel);
+                        return;
                     }
-                    let _ = sequence;
-                    respond_writes(requests, Ok(results));
                 }
                 Ok(Err(error)) => {
                     record_storage_error(&config.metrics, &error);
