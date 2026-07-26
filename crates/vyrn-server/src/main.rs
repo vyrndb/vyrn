@@ -105,8 +105,17 @@ struct Metrics {
     checkpoints: AtomicU64,
     write_batches: AtomicU64,
     batched_writes: AtomicU64,
+    /// WAL barriers actually issued, and applied batches they covered. The ratio
+    /// is how much group commit is amortising the sync.
+    wal_flushes: AtomicU64,
+    flushed_batches: AtomicU64,
     mvcc_versions_collected: AtomicU64,
     mvcc_gc_runs: AtomicU64,
+    /// Sealed segments the archiver has not copied out yet (gauge). Growth
+    /// means the archiver is falling behind the write rate.
+    wal_archive_lag_segments: AtomicU64,
+    wal_archived_total: AtomicU64,
+    wal_archive_failures_total: AtomicU64,
     storage_failed: AtomicBool,
     drained: Notify,
 }
@@ -123,8 +132,13 @@ impl Default for Metrics {
             checkpoints: AtomicU64::new(0),
             write_batches: AtomicU64::new(0),
             batched_writes: AtomicU64::new(0),
+            wal_flushes: AtomicU64::new(0),
+            flushed_batches: AtomicU64::new(0),
             mvcc_versions_collected: AtomicU64::new(0),
             mvcc_gc_runs: AtomicU64::new(0),
+            wal_archive_lag_segments: AtomicU64::new(0),
+            wal_archived_total: AtomicU64::new(0),
+            wal_archive_failures_total: AtomicU64::new(0),
             storage_failed: AtomicBool::new(false),
             drained: Notify::new(),
         }
@@ -2511,7 +2525,7 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
                     "200 OK",
                     "text/plain; version=0.0.4",
                     format!(
-                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\n",
+                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\n",
                         u8::from(ready),
                         u8::from(metrics.storage_failed.load(Ordering::Relaxed)),
                         metrics.active_connections.load(Ordering::Relaxed),
@@ -2522,8 +2536,13 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
                         metrics.checkpoints.load(Ordering::Relaxed),
                         metrics.write_batches.load(Ordering::Relaxed),
                         metrics.batched_writes.load(Ordering::Relaxed),
+                        metrics.wal_flushes.load(Ordering::Relaxed),
+                        metrics.flushed_batches.load(Ordering::Relaxed),
                         metrics.mvcc_gc_runs.load(Ordering::Relaxed),
                         metrics.mvcc_versions_collected.load(Ordering::Relaxed),
+                        metrics.wal_archive_lag_segments.load(Ordering::Relaxed),
+                        metrics.wal_archived_total.load(Ordering::Relaxed),
+                        metrics.wal_archive_failures_total.load(Ordering::Relaxed),
                     ),
                 ),
                 _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
