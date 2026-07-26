@@ -28,6 +28,36 @@ RESULTS=/tmp/vyrn-comparison.csv \
 
 The PostgreSQL runner needs Docker and publishes its temporary instance on port `15432` by default. Override `POSTGRES_PORT`, `POSTGRES_CONTAINER`, or `DOCKER` when needed. The scripts delete only the temporary container and temporary Vyrn directory they create.
 
+## Where a write's time goes
+
+`scripts/profile-writes-linux.sh` runs one load mode and prints the per-request
+stage budget behind it, from the server's own counters:
+
+```bash
+MODE=write bash scripts/profile-writes-linux.sh
+```
+
+The stages are the hand-offs a durable commit crosses — queue wait, engine lock,
+apply, flush queue, `fdatasync`, publish — with a mean and a p50 for each. Read the
+p50 column: a mean on a host that intermittently stalls a flush tells you about the
+stall, not the path. `vyrn_commit_*` on the metrics endpoint exposes the same
+counters for a running server, quantiles over the process lifetime.
+
+## Comparing two builds on a noisy host
+
+`scripts/compare-builds-linux.sh` alternates two sets of binaries within one
+session and reports each paired round:
+
+```bash
+A=/tmp/bin-before B=/tmp/bin-after ROUNDS=5 MODE=write \
+  bash scripts/compare-builds-linux.sh
+```
+
+Use this for any write-path change rather than benchmarking one build after the
+other. Both directions of a spurious result have been produced on this host by
+consecutive runs of identical code; the "won N of M paired rounds" line is what
+distinguishes a real change from the host's mood.
+
 ## Measured 2026-07-26 (WSL2, 32 cores, 15 GB RAM, ext4)
 
 16 clients, 128-byte values, 600 operations per client, both databases durable
@@ -41,20 +71,22 @@ Median of three consecutive runs:
 | Point reads | 78,588/s (p50 197 µs) | 10,226/s (p50 916 µs) | 7.7× faster |
 | Index equality lookup | 75,780/s (p50 204 µs) | 9,939/s (p50 946 µs) | 7.6× faster |
 | 70/30 mixed | 11,102/s (p50 286 µs) | 8,914/s (p50 1.1 ms) | 1.25× faster |
-| Four-key transactions | 1,940/s (p50 7.4 ms) | 1,217/s (p50 7.0 ms) | 1.6× faster |
-| Durable writes | 3,362/s (p50 4.8 ms) | 6,982/s (p50 2.2 ms) | 2.1× slower |
+| Four-key transactions | 2,131/s (p50 6.0 ms) | 1,217/s (p50 7.0 ms) | p50 1.2× faster |
+| Durable writes | 5,411/s (p50 2.9 ms) | 6,914/s (p50 2.2 ms) | 1.24× slower |
 
 Vyrn leads on reads, index lookups, and the mixed workload by margins far larger
-than this host's run-to-run spread, so those three rows are solid. It is behind on
-single-key durable writes, where PostgreSQL commits roughly twice as fast, and
-that gap is wide enough to be real too.
+than this host's run-to-run spread, so those three rows are solid. It is still
+behind on single-key durable writes, but by 1.24× rather than the 2.1× recorded
+before the WAL runway change below; that row and the transaction row are the two
+this host measures least reliably, and both were re-measured by pairing the builds
+within one session rather than by consecutive runs.
 
-The transaction row is the one to be careful with. Vyrn's write-heavy throughput
-varies by roughly 2× run to run on this host (see the caveat under the flush
-change below), and 1,940/s against 1,217/s is inside that spread. The p50s beside
-it, 7.4 ms against 7.0 ms, are the more stable comparison and say something
-different from the throughput ratio: the two are close to parity per commit, and
-Vyrn's apparent lead is throughput under concurrency, not commit latency.
+The transaction row still needs care. Vyrn's write-heavy throughput varies by
+roughly 2× run to run on this host (see the caveat under the flush change below),
+so the throughput figure beside it is not quotable on its own; the p50s, 6.0 ms
+against 7.0 ms, are the stable comparison. Per commit the two are close, with Vyrn
+now slightly ahead, and Vyrn's larger edge is throughput under concurrency rather
+than commit latency.
 
 Two rows moved against the run recorded earlier on this host, both on the
 PostgreSQL side: writes measured 6,982/s here against 2,782/s before, and mixed
@@ -66,8 +98,8 @@ besides: 2,782/s across 16 clients implies a 5.8 ms mean latency against the
 2.6 ms p50 recorded beside it. Treat the numbers above as the current measurement
 and the write comparison as a genuine deficit rather than a regression.
 
-PostgreSQL also keeps the lower p50 on both write-heavy workloads. Vyrn's
-remaining edge on transactions is throughput, not single-commit latency.
+PostgreSQL keeps the lower p50 on single-key writes. On transactions the two are
+close enough per commit that the ordering depends on the round.
 
 ### Fixed: the WAL flush held the write lock
 
@@ -253,27 +285,137 @@ the segment on every commit.
 everything written after a checkpoint, then asserting the acknowledged writes —
 including a delete — come back.
 
+### Fixed: every commit extended the WAL file
+
+The stage budget above says where a write's 4.5 ms went. Instrumenting the six
+hand-offs a commit crosses — `vyrn_commit_*_nanoseconds` on the metrics endpoint,
+with p50 and p99 per stage, since a mean on this host is dominated by whichever
+run stalled — gave this for a 16-client single-key run:
+
+    stage          mean      p50      p99
+    front          1358 us  1180 us  2359 us
+    lock             41 us    37 us    74 us
+    apply           561 us   426 us  1180 us
+    flush_queue     536 us     8 us  1966 us
+    sync           2095 us  1704 us  4719 us
+    publish          44 us    37 us    90 us
+
+`sync` is the barrier and `front` is the queue wait ahead of it, which is mostly
+the barrier again seen from the client's side. So the earlier guess that ~2.5–3 ms
+was scaffolding around the flush was wrong: the flush itself was that big, and the
+question was why a 1.5 ms `fdatasync` floor was costing 1.7–2.1 ms per commit.
+
+Because the floor was not 1.5 ms. Every commit appended to the segment, so every
+barrier had an extent-tree update to journal along with the data. Writing the same
+1.5 KiB records into blocks that were already allocated and already initialised
+measured, on this host, alternating the two within one process:
+
+    appending (file grows)     p50 1444 us   p95 1860 us
+    sparse set_len ahead       p50  712 us   p95 2143 us
+    preallocated and zeroed    p50  593 us   p95  904 us
+
+`set_len` is not enough — a sparse file still updates its extents on first write
+into each hole. The blocks have to be really written.
+
+`Wal` therefore keeps a zero-filled runway ahead of the write point and writes
+records into it positionally, rather than appending. The runway is pushed forward
+1 MiB at a time; that fill costs one expensive sync (4.6 ms measured) which the
+several hundred records it covers then amortise. Segment rotation restarts the
+runway at the new segment's header.
+
+The cost is that end of file stops meaning end of log. Three places that read the
+log had to learn the difference, and one of them is a durability property rather
+than a detail:
+
+- **A torn tail no longer runs past end of file.** That was how recovery
+  recognised a commit interrupted by a crash. With zeros after the records, a
+  half-written record instead looks like a complete record with a corrupt body —
+  which recovery is required to refuse, so an ordinary crash would have made the
+  database unopenable. The replacement is exact rather than heuristic: replay
+  finds the last non-zero byte in the segment, and because every record ends with
+  the four non-zero bytes of `RECORD_END`, a frame reaching past that point cannot
+  have been written in full. Frames that end at or before it are validated as
+  strictly as before, so damage to a complete record is still corruption.
+- **The archiver** scans a sealed segment to confirm it is the segment it claims
+  to be. It now stops at the records and requires every remaining byte to be zero,
+  so a splice into the unused tail is still caught.
+- **Point-in-time restore** compared a base backup's copy of a segment against the
+  archived copy by file length. Both copies now carry a runway, and the archived
+  one wrote further records into bytes the backup copied as zeros, so the two can
+  be the same size with different amounts of history. The comparison is by record
+  boundary now, not by length.
+
+Running `scripts/smoke-linux.sh` against this change also surfaced two durability
+bugs that predate it and reproduce on the unmodified commit. Neither is caused by
+the runway; both are fixed here because the script cannot pass otherwise:
+
+- **A read handle opened behind the recovered engine and stayed there.**
+  `ReadEngine::open` reads the checkpoint manifest and does not replay the WAL, so
+  after a crash it starts at the last checkpoint — at the empty generation-0 root
+  when no checkpoint had run. Nothing published the recovered root to the readers
+  at startup; only the next commit did. A database that was killed and then only
+  read from therefore answered `not found` for writes it had acknowledged as
+  durable. The engine itself had them the whole time, which is why the crash tests
+  never caught it: they call `Engine::open` directly, and only the server uses read
+  handles. Fixed by refreshing every handle to the engine's recovered root during
+  startup, covered by `concurrent_visibility.rs`.
+- **Backup refused any database that had not checkpointed yet.** No checkpoint
+  means no `CURRENT`, and `create_backup` treated that as corruption
+  ("checkpoint it first"). It is an ordinary early state: the backup includes the
+  WAL, and restore replays it onto the empty base root exactly as a normal open
+  would. So the first backup of a new deployment was impossible, including right
+  after a clean shutdown. The guard now rejects only a directory with no page
+  file, and `recover_to` treats a manifest-less base as a floor of LSN 0 rather
+  than an error.
+
+Measured by alternating the two builds within one session, five paired rounds,
+fresh server and fresh database per round:
+
+| Workload | Baseline (p50) | Runway (p50) | Paired rounds won |
+| --- | ---: | ---: | ---: |
+| Single-key durable writes | 4,495 µs | 2,838 µs | 5 of 5 |
+| Four-key transactions | 7,187 µs | 5,953 µs | 5 of 5 |
+| 70/30 mixed | 332 µs | 331 µs | 4 of 6 |
+| Point reads | 199 µs | 203 µs | 1 of 5 |
+
+Writes improve 1.58× and transactions 1.21×, and both moved the same way in every
+paired round, with the per-round spread narrow on both sides (writes 4,358–4,605
+against 2,781–2,960). Re-running the write pairing against the unmodified commit
+after the two bug fixes below reproduced it at 1.56×, again 5 of 5. Mixed and reads are parity, as expected — reads never touch
+the barrier. The stage budget after the change confirms where the gain came from:
+`sync` p50 1,704 µs → 721 µs, `front` 1,180 µs → 852 µs, everything else within
+noise of itself.
+
+The tail improves too, on the rounds where this host was not stalling: write p99
+went from 5,991–6,665 µs to 4,308–4,425 µs. The 34–53 ms p99 rounds occur on both
+builds at the same rate and are the host, as documented above.
+
+Against PostgreSQL 17 on the same host and settings, three runs each, this closes
+most of the write deficit: PostgreSQL 2,220–2,329 µs p50 against Vyrn's
+2,781–2,960 µs. That is 1.24× behind rather than 1.97× behind.
+
 ### Remaining bottleneck: single-key write latency
 
-The barrier is now off the write lock and shared between committers, so the
-remaining write-path gap is per-commit latency rather than throughput. The floor
-on this host is one flush:
+The barrier is off the write lock, shared between committers, and no longer
+extends the file, so a single-key durable write now measures 2.8–3.0 ms p50 with
+its stage budget at:
 
-    mean fdatasync: 1.529 ms over 200 calls
+    front  852 us    lock  45 us    apply  426 us
+    sync   721 us    flush_queue 8 us    publish 37 us
 
-A single-key durable write measures a 3.9–4.8 ms p50 against that 1.5 ms floor,
-and PostgreSQL commits the same workload at 2.2 ms. So roughly 2.5–3 ms per write
-is still not the barrier, and closing that is the next piece of work — group commit
-cannot help here, because this path offers it nothing to group. Two candidates,
-neither yet measured:
+Two things are left, in order of size:
 
-- **The request's own round trip.** A write crosses an `mpsc` queue to the write
-  worker, a `spawn_blocking` hop to take the engine lock, a channel to the flush
-  stage, another `spawn_blocking` for the sync, and a `oneshot` back. Point reads
-  show what that scaffolding costs at minimum: ~197 µs p50 with no barrier at all.
-- **Per-commit work that scales with the tree rather than the batch.** The
-  pre-state read and MVCC prepare measured 161 µs and 79 µs at benchmark size;
-  both grow with depth, and neither has been profiled on a large tree.
+- **`front` and `sync` are the same barrier counted twice.** A client waits for
+  the batch ahead of it to flush (`front`) and then for its own (`sync`). Together
+  that is about 1.6 ms of a 2.9 ms write, against a 593 µs floor for one flush
+  into allocated blocks. The remaining multiple is queueing: at 16 clients and 8
+  requests per batch, a request waits roughly one barrier before its own. Group
+  commit already covers this for concurrent writers; what it cannot fix is a
+  single writer's serial latency, which is one flush plus `apply`.
+- **`apply` at 426 µs.** Change log, pre-state read, tree apply, MVCC prepare, and
+  WAL encode, all under the engine write lock. The pre-state read and MVCC prepare
+  grow with tree depth and have still not been profiled on a large tree, which is
+  the honest gap in this table.
 
 An `fdatasync` is also not independent of what else is dirty. Appending 200 MB to
 an unrelated file and never syncing it moved the same WAL flush from 1.73 ms to

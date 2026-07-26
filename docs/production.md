@@ -41,6 +41,13 @@ vyrn restore backup.vyrn --target /var/lib/vyrn-restored
 
 Restore refuses non-empty targets and verifies every file checksum before completing.
 
+A database that has not checkpointed yet has no `CURRENT` manifest, which is a
+normal early state rather than a fault: backup includes the WAL, and both restore
+and point-in-time recovery replay it onto the empty base root. Backup refuses only
+a directory with no page file at all, which is not a Vyrn database. Earlier builds
+refused any database without a manifest, so the first backup of a new deployment
+had to wait for a checkpoint.
+
 ### Continuous WAL archiving
 
 Offline backups bound loss to the backup interval. Add continuous archiving to shrink the loss window to the rotation interval plus archive latency:
@@ -74,8 +81,12 @@ If readiness becomes false or a storage error is logged:
 2. Stop the process; do not repeatedly retry writes against a poisoned engine.
 3. Preserve a copy of the data directory.
 4. Restart once to run normal WAL recovery.
-5. If corruption prevents startup, restore the latest verified backup.
-6. Do not delete or edit WAL/page files manually.
+5. Read back a key known to have been acknowledged shortly before the failure.
+   Recovery replays the WAL, but read handles open from the checkpoint manifest,
+   so this is the check that the two agree; earlier builds could serve
+   `not found` for an acknowledged write after a crash until the next commit.
+6. If corruption prevents startup, restore the latest verified backup.
+7. Do not delete or edit WAL/page files manually.
 
 ## Upgrade policy
 
