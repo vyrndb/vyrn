@@ -18,7 +18,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     signal,
-    sync::{broadcast, mpsc, oneshot, Notify, Semaphore},
+    sync::{broadcast, mpsc, oneshot, watch, Notify, Semaphore},
     task,
     time::{sleep, timeout, Duration},
 };
@@ -245,6 +245,47 @@ struct WriteWorkerConfig {
     /// Set when accumulated writes have crossed the checkpoint threshold, so the
     /// background task compacts instead of a client's commit paying for it.
     checkpoint_due: Arc<AtomicBool>,
+    /// Batches applied but not yet durable. Non-zero means a barrier is in
+    /// flight, which is when accumulating a larger batch costs nothing.
+    in_flight: Arc<AtomicU64>,
+    /// Bumped by the flush stage whenever a barrier lands.
+    flush_completed: watch::Sender<u64>,
+}
+
+struct FlushWorkerConfig {
+    readers: Arc<Vec<RwLock<ReadEngine>>>,
+    changes: broadcast::Sender<ChangeEvent>,
+    metrics: Arc<Metrics>,
+    /// The engine, consulted only when a reader refresh fails, to decide
+    /// whether a concurrent checkpoint retired the batch's generation (a lost
+    /// race, not a fault) or storage is actually broken. Never locked on the
+    /// happy path: routing every batch through the engine lock would put the
+    /// flush stage back in contention with the apply stage, which is exactly
+    /// what this split exists to avoid.
+    engine: Arc<RwLock<Engine>>,
+    /// Batches applied but not yet durable, and a signal for when that count
+    /// drops. The write worker uses these to size the next batch against the
+    /// barrier actually in flight rather than against a fixed timer.
+    in_flight: Arc<AtomicU64>,
+    flush_completed: watch::Sender<u64>,
+}
+
+/// An applied batch waiting for its WAL flush before it can be acknowledged.
+///
+/// The mutations are already in the tree and their WAL record is already written,
+/// but neither is durable until `lsn` has been flushed. Handing this to the
+/// completion stage lets the write worker start the next batch immediately, so
+/// one batch's `fdatasync` overlaps the next batch's tree work.
+struct PendingFlush {
+    /// `None` when no flush is owed, as in async durability, where records are
+    /// buffered for the background sync instead of being written on commit.
+    lsn: Option<u64>,
+    requests: Vec<WriteRequest>,
+    results: Vec<BatchResult>,
+    published: Vec<change_log::ChangeRecord>,
+    generation: u64,
+    root: u64,
+    len: u64,
 }
 
 enum DocumentWrite {
