@@ -1834,6 +1834,98 @@ fn start_mvcc_gc(
     });
 }
 
+/// Rotates the active WAL segment on a timer and copies sealed segments into
+/// the archive directory, publishing the watermark checkpoints consult before
+/// deleting a segment.
+///
+/// A rotation failure is a storage error and poisons the server like the GC
+/// task's failure path. A copy failure only counts and logs: archiving must
+/// never block or kill writes, and the retention barrier already guarantees
+/// the uncopied segment survives until a later tick succeeds.
+fn start_wal_archiver(
+    engine: Arc<RwLock<Engine>>,
+    wal_directory: PathBuf,
+    archive_directory: PathBuf,
+    watermark: Arc<AtomicU64>,
+    interval: Duration,
+    metrics: Arc<Metrics>,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+            // Seal the active segment so the loss window is bounded by time,
+            // not just by the segment size trigger.
+            let rotate_engine = Arc::clone(&engine);
+            let rotated = task::spawn_blocking(move || {
+                rotate_engine
+                    .write()
+                    .map_err(|_| StorageError::Poisoned)?
+                    .rotate_for_archive()
+            })
+            .await;
+            if !matches!(rotated, Ok(Ok(()))) {
+                metrics.storage_failed.store(true, Ordering::Release);
+                metrics.ready.store(false, Ordering::Release);
+                return;
+            }
+            // Copied without the engine lock: sealed segments are immutable,
+            // and a segment deleted mid-copy is only ever an already-archived
+            // one, which archive_pending tolerates.
+            let wal = wal_directory.clone();
+            let archive = archive_directory.clone();
+            let result = task::spawn_blocking(move || {
+                let through = vyrn_core::wal_archive::archive_pending(&wal, &archive)?;
+                Ok::<_, StorageError>((through, wal_archive_lag(&wal, through)))
+            })
+            .await;
+            match result {
+                Ok(Ok((through, lag))) => {
+                    // AcqRel: the Release half publishes the watermark to the
+                    // checkpoint's Acquire load only after the copies are
+                    // durable; the returned previous value turns the dense
+                    // segment ids into a newly-archived count. After a restart
+                    // the first tick also counts segments archived by earlier
+                    // runs, which only front-loads a monotonic counter.
+                    let previous = watermark.swap(through, Ordering::AcqRel);
+                    metrics
+                        .wal_archived_total
+                        .fetch_add(through.saturating_sub(previous), Ordering::Relaxed);
+                    metrics
+                        .wal_archive_lag_segments
+                        .store(lag, Ordering::Relaxed);
+                }
+                other => {
+                    metrics
+                        .wal_archive_failures_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Ok(Err(error)) = other {
+                        eprintln!("wal archive tick failed: {error}");
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Sealed-but-unarchived segment count: WAL files with an id above the
+/// watermark, minus the one active segment. Approximate by design — the write
+/// path may rotate concurrently — but a growing value still means the
+/// archiver is falling behind.
+fn wal_archive_lag(wal_directory: &Path, archived_through: u64) -> u64 {
+    let Ok(entries) = std::fs::read_dir(wal_directory) else {
+        return 0;
+    };
+    let pending = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let id = name.to_str()?.strip_suffix(".vwal")?.parse::<u64>().ok()?;
+            (id > archived_through).then_some(id)
+        })
+        .count() as u64;
+    pending.saturating_sub(1)
+}
+
 fn start_async_sync(engine: Arc<RwLock<Engine>>, interval: Duration, metrics: Arc<Metrics>) {
     tokio::spawn(async move {
         loop {
