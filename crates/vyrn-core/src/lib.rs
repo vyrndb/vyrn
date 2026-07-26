@@ -1860,15 +1860,21 @@ fn redo_from_checkpoint(
     Ok(tree)
 }
 
+/// Replays one segment's committed records into `state`.
+///
+/// `next_first_lsn` is the successor segment's header first LSN, which states
+/// exactly where this segment's records end. `None` means there is no
+/// successor, so this is the last segment — the only one allowed a torn tail.
 fn replay_segment(
     path: &Path,
     segment_id: u64,
-    is_last: bool,
+    next_first_lsn: Option<u64>,
     state: &mut TreeState,
     mvcc: &mut mvcc::State,
     mvcc_values: &mut value_log::ValueLog,
     redo: &mut Vec<RedoRecord>,
 ) -> Result<()> {
+    let is_last = next_first_lsn.is_none();
     let mut file = OpenOptions::new().read(true).write(is_last).open(path)?;
     let file_len = file.metadata()?.len();
     if file_len < SEGMENT_HEADER_LEN as u64 {
@@ -1883,7 +1889,19 @@ fn replay_segment(
     {
         return Err(corrupt(segment_id, 0, "invalid segment header"));
     }
+    // A stalled archiver retains dead segments indefinitely, so scanning their
+    // bodies would make open O(retained bytes) — and one flipped bit in a
+    // semantically dead segment would make the database unopenable. When every
+    // LSN a sealed segment can contain is already at or below the replayed
+    // state, nothing in its body can change recovery's outcome; skip it.
+    if let Some(next) = next_first_lsn {
+        if next.saturating_sub(1) <= state.lsn {
+            return Ok(());
+        }
+    }
 
+    let header_first_lsn = read_u64(&header, 16);
+    let mut saw_record = false;
     let mut offset = SEGMENT_HEADER_LEN as u64;
     while offset < file_len {
         if file_len - offset < RECORD_HEADER_LEN as u64 {
