@@ -247,3 +247,67 @@ pub fn verify_archive(archive_directory: &Path) -> Result<ArchiveSummary> {
 /// range — refuses anything the published checkpoint does not cover, and
 /// never deletes the highest segment, which the next open adopts as its
 /// active file.
+pub fn prune_wal(data_directory: &Path, archive_directory: &Path, through: u64) -> Result<usize> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(data_directory.join("LOCK"))?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            Error::AlreadyOpen
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    let entries = read_index(archive_directory)?;
+    let wal_directory = data_directory.join("wal");
+    let segments = crate::list_segments(&wal_directory)?;
+    let Some(&highest) = segments.last() else {
+        return Ok(0);
+    };
+    for &segment in &segments {
+        if segment <= through && !entries.iter().any(|entry| entry.segment_id == segment) {
+            return Err(Error::CorruptBackup(format!(
+                "segment {segment} is not archived; pruning it would destroy the only copy of its LSN range"
+            )));
+        }
+    }
+    // Being archived proves a durable copy exists somewhere, but replay still
+    // needs every record above the published checkpoint locally: the manifest
+    // seeds replay's starting LSN and replay refuses a discontinuous sequence,
+    // so deleting an archived segment whose records exceed the manifest LSN
+    // leaves a database that never opens again — its acknowledged commits
+    // exist only in the archive. Segments seal between checkpoints as a matter
+    // of routine (size trigger, archive rotation timer), so `through` alone
+    // must never authorize deletion. A segment's records end exactly where its
+    // successor's header starts (the rule replay's dead-segment skip already
+    // trusts), which decides coverage without scanning bodies.
+    let manifest_lsn = crate::read_manifest(data_directory)?.map_or(0, |state| state.lsn);
+    let mut covered = 0;
+    for pair in segments.windows(2) {
+        let successor_first_lsn =
+            crate::read_segment_first_lsn(&wal_directory.join(crate::segment_name(pair[1])))?;
+        if successor_first_lsn.saturating_sub(1) > manifest_lsn {
+            break;
+        }
+        covered = pair[0];
+    }
+    let cutoff = through.min(highest.saturating_sub(1)).min(covered);
+    let mut deleted = 0;
+    for &segment in segments.iter().take_while(|&&segment| segment <= cutoff) {
+        fs::remove_file(wal_directory.join(crate::segment_name(segment)))?;
+        deleted += 1;
+    }
+    crate::sync_directory(&wal_directory)?;
+    Ok(deleted)
+}
+
+/// Segment ids present in wal/, sorted, without `list_segments`' gap check.
+///
+/// The archiver enumerates a live wal/ holding no lock while checkpoints
+/// delete archived segments concurrently, and `read_dir` is not an atomic
+/// snapshot: an enumeration that yields segment 1 before a checkpoint deletes
+/// segments 1 and 2, then resumes at 3, observes a gap no on-disk instant
+/// ever had — failing the whole tick for it would fire alerts on a healthy
+/// database. A genuinely lost segment is still caught, by the unindexed
+/// missing-candidate check rather than by the listing.
