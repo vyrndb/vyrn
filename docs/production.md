@@ -13,7 +13,14 @@ Use it only when:
 - `durable` mode is used for authoritative records; `async` is limited to reconstructable realtime state and its bounded loss window is accepted;
 - monitoring alerts on readiness, failed requests, disk space, backup age, and write-batch efficiency.
 
-Current observed WSL2/Linux baseline with 16 persistent clients and 128-byte values is approximately 105k snapshot reads/s (p99 0.33 ms), 1.2k durable writes/s (p99 64 ms), and 2.9k ops/s in a 70/30 durable mix (p99 46 ms). Async mode reached roughly 100k reads/s and 5k mixed ops/s. Persistent async commit-to-subscription latency measured p50 1.56 ms, p95 4.36 ms, and p99 5.93 ms. These are development-machine measurements, not deployment guarantees; benchmark the actual host and disk.
+Current observed WSL2/Linux baseline in `durable` mode with 16 persistent clients and 128-byte values, measured 2026-07-27: approximately 83k snapshot reads/s (p50 0.19 ms, p99 0.33 ms), 5.7k durable writes/s (p50 2.8 ms, p99 4.7 ms), 13.8k ops/s in a 70/30 durable mix (p50 0.30 ms, p99 5.3 ms), 50k index lookups/s, and 2.6k four-key transactions/s. See `docs/benchmarks.md` for the full matrix. The async-mode and commit-to-subscription figures previously quoted here were not re-measured and have been removed rather than carried forward stale.
+
+Two properties matter more than the averages when sizing a deployment:
+
+- **Write throughput does not scale with client count.** It saturates near 8.6k/s at 64 clients and is *lower* at 256 than at 64, because commits serialise through a single engine write lock. Offering more concurrent writers past that point buys latency, not throughput.
+- **The write tail is unresolved.** At 256 concurrent writers, p99 is roughly 200 ms and the maximum is several seconds, reproducibly. It is not yet established whether that originates in Vyrn or in this host's storage — a bare `fdatasync` on the same filesystem has itself been caught stalling 5.6 seconds. Do not put a latency SLO in front of concurrent durable writes until this is measured on the intended hardware.
+
+These are development-machine measurements, not deployment guarantees; benchmark the actual host and disk.
 
 ## Deployment
 
@@ -107,3 +114,16 @@ Before calling the exact build generally available:
 - Backup restoration is tested in the intended deployment environment.
 - A restore-plus-PITR drill (restore a base backup, roll forward through a real archive to a chosen LSN, verify the data) passes in the intended deployment environment.
 - Security and operational review is complete.
+
+### Status as of 2026-07-27
+
+Exercised on the WSL2 development host, which is **not** the intended deployment environment, so none of these close a gate on their own:
+
+- Full test suite passes (30 binaries, no failures) and `scripts/smoke-linux.sh` passes, covering crash, corruption, backup, verification, and restore.
+- A restore-plus-PITR drill ran against a live server over 146 archived segments spanning LSN 1..=15995. Rolling forward to the archive end restored every marker; bounding recovery to the phase-A LSN restored all of phase A and correctly excluded all of phase B.
+
+Still open, and these are the gates that matter:
+
+- **The multi-hour larger-than-memory soak has never validly completed.** One attempt was run with `VYRN_CHECKPOINT_WRITES` raised high enough to disable compaction, so the data directory grew to 41 GB and the server stopped answering; that result says nothing about the database and must be re-run with checkpointing at its default. The one usable signal from it: write p50 degraded from 2.6 ms to 4.2 ms as the tree grew to roughly 3 GB, which matches the tree-depth sensitivity documented in `docs/benchmarks.md`.
+- Security and operational review has not been done.
+- Backup restoration and the PITR drill have not been run on the intended deployment hardware.

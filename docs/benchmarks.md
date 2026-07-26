@@ -58,6 +58,116 @@ other. Both directions of a spurious result have been produced on this host by
 consecutive runs of identical code; the "won N of M paired rounds" line is what
 distinguishes a real change from the host's mood.
 
+## Measured 2026-07-27 (WSL2, 32 cores, 15 GB RAM, ext4)
+
+16 clients, 128-byte values, 1,000 operations per client, both databases durable.
+Single runs, not medians — this host varies by roughly 2× on write-heavy work, so
+read the write and transaction rows as a snapshot rather than a precise figure.
+
+| Workload | Vyrn | PostgreSQL 17 | Ratio |
+| --- | ---: | ---: | ---: |
+| Point reads | 83,049/s (p50 189 µs) | 10,129/s (p50 926 µs) | 8.2× faster |
+| Index equality lookup | 50,456/s (p50 302 µs) | 10,676/s (p50 902 µs) | 4.7× faster |
+| 70/30 mixed | 13,759/s (p50 299 µs) | 7,722/s (p50 1.03 ms) | 1.78× faster |
+| Four-key transactions | 2,618/s (p50 5.4 ms) | 1,223/s (p50 6.5 ms) | 2.14× faster |
+| Durable writes | 5,666/s (p50 2.78 ms) | 7,260/s (p50 2.12 ms) | 1.28× slower |
+
+### Write throughput against client count
+
+Every table above this one was taken at 16 clients. That is the point where Vyrn
+looks best on writes, and it hides the shape of the curve. Measured across the
+matrix the harness already supports:
+
+| Clients | Vyrn | Vyrn p50 | Vyrn p99 | PostgreSQL | PostgreSQL p50 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 940/s | 1.04 ms | 1.44 ms | 816/s | 1.20 ms |
+| 16 | 5,666/s | 2.78 ms | 4.72 ms | 7,260/s | 2.12 ms |
+| 64 | 8,624/s | 6.20 ms | 48.3 ms | 9,361/s | 3.31 ms |
+| 256 | 7,732/s | 14.6 ms | 217 ms | — | — |
+
+PostgreSQL's default `max_connections` is 100, so the 256-client cell cannot be
+run against it without raising that first.
+
+Three things this says that the 16-client table cannot:
+
+- **Vyrn wins at one client** and loses as concurrency rises. A durable commit
+  costs one `fdatasync` in both systems, so the deficit is not the barrier — it is
+  what happens when many writers meet a single write lock.
+- **Throughput saturates.** 256 clients is *slower* than 64. Serialised `apply`
+  caps the write path regardless of how many clients offer work; measured at
+  ~55 µs of lock-held time per request before the `node_ref` fix below.
+- **Group commit is not engaging.** `vyrn_flushed_batches_total` divided by
+  `vyrn_wal_flushes_total` measures **1.007** under a 256-client load: essentially
+  one barrier per batch, no amortisation at all. `apply` outlasts `sync`, so each
+  flush finishes before the next batch is ready and the flush queue never has two
+  batches to coalesce.
+
+### The tail is not yet attributed
+
+At 256 clients the tail is p99 217 ms, p999 586 ms, and a maximum between 8 and
+12 seconds, reproducibly, across every run taken. That is the number that would
+break an application, and **it is not yet known whether it is Vyrn or the host.**
+
+Ruled out by measurement: kernel dirty-page throttling (peak `Dirty` 1,378 MB
+against a 3,119 MB threshold, with `Writeback` near zero during the collapses),
+WAL segment rotation (forcing eight rotations instead of one *improved* the tail,
+24.7 ms against 58.5 ms maximum; a rotation costs about 8 ms), checkpointing and
+MVCC GC (`vyrn_checkpoints_total` and `vyrn_mvcc_versions_collected_total` both
+zero across the run), and the storage engine itself (3,000 batches driven straight
+through `Engine::write_batch` produced no commit over one second).
+
+Not ruled out: the host. A bare `fdatasync` loop on the same filesystem, run
+beside the load, was caught stalling **5.6 seconds** in one round — and in another
+round of the same experiment never exceeded 243 ms. One round of that probe is
+worth nothing; an early reading of it wrongly concluded the tail was Vyrn's alone.
+Settling this needs the probe run against the load perhaps ten times, comparing
+the distribution of second-scale stalls on each side. Until that exists, no
+production claim should rest on the tail either way.
+
+### Fixed: `node_ref` decoded a whole page to read one field
+
+`PageTree::node_ref` reached `children[0].page_id` by calling `decode_internal`,
+which materialises every child of the page as an owned `NodeRef` — a `Vec<u8>`
+key for each of roughly a hundred children. That value is a fixed header field at
+offset 24, which `decode_internal` itself reads directly. Worse, `decode_internal`
+calls `node_ref` for its own first child, so the two recursed into each other:
+decoding one root page walked and re-decoded the entire leftmost spine, allocating
+fanout-many keys at every level. Both hot descents paid it — `collect_many` for a
+commit's pre-state read, `apply_node` for the copy-on-write rewrite.
+
+Per request against a 200,000-key tree:
+
+    decode_internal   85.77 us -> 15.31 us
+    prestate          27.36 us -> 11.16 us
+    tree              76.20 us -> 59.36 us
+    apply            104.40 us -> 71.40 us
+    page reads            23.4 -> 16.2
+
+The page-read count is the load-bearing number: it is exact, where a timing on
+this host is not. End to end, the one-line change alternated against its parent
+within a single session at 64 clients won **5 of 5** paired rounds, p50 7,604 µs
+against 6,364 µs (1.19×) and 7,405/s against 9,453/s (1.28×).
+
+Three earlier attempts at this bottleneck were wrong and each was killed by
+measurement rather than by review: removing value materialisation from the commit
+path (0.98×, 3 of 5 rounds — the load generator writes a unique key per operation,
+so the value read never fires), removing an entry clone in `write_leaf_level`
+(91 µs to 94 µs), and growing the page cache from 16 MiB to 256 MiB (88 µs to
+84 µs — the hit rate was already 100%). `apply-profile` and `rotation-probe` split
+a commit into phases and report deterministic page counts; they are what found the
+real one.
+
+### Remaining: write amplification
+
+`apply`'s largest component is now `page_append` — **3.5 pages, 14 KiB written per
+128-byte durable write**, about 112× amplification, measured deterministically.
+Copy-on-write cannot amortise this the way an in-place engine does: PostgreSQL
+dirties one shared buffer and lets the checkpointer write it once for many
+commits, whereas every Vyrn commit must allocate and write a new leaf plus every
+internal page up to the root. It is also why a soak accumulates on-disk volume
+quickly. Reducing it is a change of persistence strategy, not a tuning exercise,
+and it is the reason concurrent durable writes still trail PostgreSQL.
+
 ## Measured 2026-07-26 (WSL2, 32 cores, 15 GB RAM, ext4)
 
 16 clients, 128-byte values, 600 operations per client, both databases durable
