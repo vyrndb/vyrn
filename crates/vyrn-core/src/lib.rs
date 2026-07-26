@@ -1114,75 +1114,101 @@ impl Engine {
                     BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
                 };
                 if is_versioned_key(key) {
-                    previous
-                        .entry(key.clone())
-                        .or_insert((self.tree.revision(key)?, self.tree.get(key)?));
+                    let entry = existing.get(key).and_then(Option::as_ref);
+                    previous.entry(key.clone()).or_insert((
+                        entry.map(|(_, revision)| *revision),
+                        entry.map(|(value, _)| value.clone()),
+                    ));
                 }
             }
         }
         let mut pending = Vec::with_capacity(operations.len());
         let mut results = Vec::with_capacity(operations.len());
+        // Resolve each key's presence first, without writing pages. Whether a
+        // delete reports a hit, and whether a put must clear a tombstone, both
+        // depend on the state left by earlier operations in the same batch, so this
+        // starts from the pre-batch state read above and tracks what the batch has
+        // changed so far. The page rewrites then happen once for the whole batch
+        // rather than once per key.
+        let mut overlay: BTreeMap<Vec<u8>, bool> = existing
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.is_some()))
+            .collect();
+        let mut mutations: Vec<(Vec<u8>, page_tree::Mutation)> =
+            Vec::with_capacity(operations.len());
+        let mut user_delta: i64 = 0;
+        let revision = self
+            .last_lsn
+            .checked_add(1)
+            .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
         for operation in operations {
             match operation {
                 BatchOperation::Put(key, value) => {
                     validate_key(&key)?;
                     validate_value(&value)?;
-                    let revision = self.last_lsn.checked_add(1).ok_or_else(|| {
-                        Error::Io(io::Error::other("WAL sequence number exhausted"))
-                    })?;
-                    if !key.starts_with(INTERNAL_PREFIX) {
+                    let internal = key.starts_with(INTERNAL_PREFIX);
+                    if !internal {
                         let tombstone = tombstone_key(&key);
-                        if let Some((root, len)) = self.tree.prepare_delete(&tombstone)? {
-                            self.tree.publish(root, len);
+                        if present(&overlay, &tombstone) {
+                            mutations.push((tombstone.clone(), page_tree::Mutation::Delete));
+                            overlay.insert(tombstone, false);
                         }
                     }
-                    let existed = self.tree.get(&key)?.is_some();
-                    let (root, len) = self.tree.prepare_put(&key, &value, revision)?;
-                    if !key.starts_with(INTERNAL_PREFIX) && !existed {
-                        self.user_len += 1;
+                    let existed = present(&overlay, &key);
+                    mutations.push((
+                        key.clone(),
+                        page_tree::Mutation::Put {
+                            value: value.clone(),
+                            revision,
+                        },
+                    ));
+                    overlay.insert(key.clone(), true);
+                    if !internal && !existed {
+                        user_delta += 1;
                     }
                     pending.push(PendingCommit {
                         op: OP_PUT,
                         key,
                         value,
                     });
-                    self.tree.publish(root, len);
                     results.push(BatchResult::Put);
                 }
                 BatchOperation::Delete(key) => {
                     validate_key(&key)?;
-                    if let Some((root, len)) = self.tree.prepare_delete(&key)? {
-                        self.tree.publish(root, len);
-                        if !key.starts_with(INTERNAL_PREFIX) {
-                            self.user_len -= 1;
-                        }
-                        if !key.starts_with(INTERNAL_PREFIX) {
-                            let revision = self.last_lsn.checked_add(1).ok_or_else(|| {
-                                Error::Io(io::Error::other("WAL sequence number exhausted"))
-                            })?;
-                            let tombstone = tombstone_key(&key);
-                            let (root, len) = self.tree.prepare_put(&tombstone, &[], revision)?;
-                            self.tree.publish(root, len);
-                        }
-                        pending.push(PendingCommit {
-                            op: OP_DELETE,
-                            key,
-                            value: Vec::new(),
-                        });
-                        results.push(BatchResult::Delete { existed: true });
-                    } else {
+                    if !present(&overlay, &key) {
                         results.push(BatchResult::Delete { existed: false });
+                        continue;
                     }
+                    let internal = key.starts_with(INTERNAL_PREFIX);
+                    mutations.push((key.clone(), page_tree::Mutation::Delete));
+                    overlay.insert(key.clone(), false);
+                    if !internal {
+                        user_delta -= 1;
+                        let tombstone = tombstone_key(&key);
+                        mutations.push((
+                            tombstone.clone(),
+                            page_tree::Mutation::Put {
+                                value: Vec::new(),
+                                revision,
+                            },
+                        ));
+                        overlay.insert(tombstone, true);
+                    }
+                    pending.push(PendingCommit {
+                        op: OP_DELETE,
+                        key,
+                        value: Vec::new(),
+                    });
+                    results.push(BatchResult::Delete { existed: true });
                 }
             }
         }
         if pending.is_empty() {
-            return Ok(results);
+            return Ok((results, None));
         }
-        let revision = self
-            .last_lsn
-            .checked_add(1)
-            .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
+        let outcome = self.tree.prepare_batch(&mutations)?;
+        self.tree.publish(outcome.root, outcome.len);
+        self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
         let mut prepared = Vec::with_capacity(pending.len());
         if oldest_snapshot.is_some() {
             for operation in pending.iter().filter(|op| is_versioned_key(&op.key)) {
