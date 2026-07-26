@@ -442,6 +442,7 @@ impl Engine {
         // is the newest root recovery can rely on if the page tail was lost.
         let checkpoint = state;
         let mut redo = Vec::new();
+        let mut record_end = SEGMENT_HEADER_LEN as u64;
         for (index, segment_id) in segments.iter().copied().enumerate() {
             // The successor's header states where this segment's records end,
             // which lets replay skip the bodies of segments retained only for
@@ -450,7 +451,10 @@ impl Engine {
                 .get(index + 1)
                 .map(|next| read_segment_first_lsn(&wal_directory.join(segment_name(*next))))
                 .transpose()?;
-            replay_segment(
+            // Only the active segment's value is used: it is where the next
+            // record goes, which is the end of the records rather than the end
+            // of the file now that a runway runs ahead of them.
+            record_end = replay_segment(
                 &wal_directory.join(segment_name(segment_id)),
                 segment_id,
                 next_first_lsn,
@@ -475,12 +479,17 @@ impl Engine {
         mvcc::collect(&mut mvcc, None, state.lsn);
         let segment_id = segments.last().copied().unwrap_or(1);
         let wal_path = wal_directory.join(segment_name(segment_id));
-        let mut wal_file = if wal_path.exists() {
-            OpenOptions::new().read(true).write(true).open(&wal_path)?
+        let (mut wal_file, mut wal_len) = if wal_path.exists() {
+            (
+                OpenOptions::new().read(true).write(true).open(&wal_path)?,
+                record_end,
+            )
         } else {
-            create_segment(&wal_directory, segment_id, state.lsn + 1)?
+            (
+                create_segment(&wal_directory, segment_id, state.lsn + 1)?,
+                SEGMENT_HEADER_LEN as u64,
+            )
         };
-        let mut wal_len = wal_file.seek(SeekFrom::End(0))?;
         // An empty active segment carries the only claim about where its
         // records' LSNs start, and replay has no record to contradict it. A
         // failed rotation in an earlier run (crash or I/O error after the
@@ -496,9 +505,10 @@ impl Engine {
             drop(wal_file);
             fs::remove_file(&wal_path)?;
             wal_file = create_segment(&wal_directory, segment_id, state.lsn + 1)?;
-            wal_len = wal_file.seek(SeekFrom::End(0))?;
+            wal_len = SEGMENT_HEADER_LEN as u64;
         }
-        let wal = Arc::new(Wal::new(wal_file)?);
+        let segment_size = options.segment_size.max((SEGMENT_HEADER_LEN + 1) as u64);
+        let wal = Arc::new(Wal::new(wal_file, wal_len, segment_size)?);
         // Everything already in the segment survived recovery, so it is durable.
         wal.adopt(state.lsn);
 
@@ -511,7 +521,7 @@ impl Engine {
             checkpoint_generation: state.generation,
             lock,
             poisoned: false,
-            segment_size: options.segment_size.max((SEGMENT_HEADER_LEN + 1) as u64),
+            segment_size,
             durability: options.durability,
             mvcc,
             mvcc_values,
@@ -1764,7 +1774,7 @@ impl Engine {
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL segment number exhausted")))?;
         let wal_directory = self.path.join("wal");
-        let mut file = create_segment(&wal_directory, next, self.last_lsn + 1)?;
+        let file = create_segment(&wal_directory, next, self.last_lsn + 1)?;
         // Nothing about this engine changes until the writer has actually
         // switched. The header just created is a durable promise that LSNs
         // from `last_lsn + 1` live in segment `next`; if the switch fails the
@@ -1777,18 +1787,14 @@ impl Engine {
         // in particular must not restart at the new header's length early, or
         // a failed rotation would also disarm the size trigger for the old,
         // still-active segment.
-        let switched = file
-            .seek(SeekFrom::End(0))
-            .map_err(Error::from)
-            // Flushes the outgoing segment before adopting the new one, so a
-            // durable record never sits behind an unflushed one in an earlier
-            // segment.
-            .and_then(|length| self.wal.rotate(file).map(|()| length));
-        match switched {
-            Ok(length) => {
+        // Flushes the outgoing segment before adopting the new one, so a durable
+        // record never sits behind an unflushed one in an earlier segment. The
+        // new segment's records start directly after its header.
+        match self.wal.rotate(file, SEGMENT_HEADER_LEN as u64) {
+            Ok(()) => {
                 // The new segment starts at its header, so the tracked length
                 // restarts too.
-                self.wal_len = length;
+                self.wal_len = SEGMENT_HEADER_LEN as u64;
                 self.segment_id = next;
                 Ok(())
             }
@@ -1928,7 +1934,12 @@ fn redo_from_checkpoint(
     Ok(tree)
 }
 
-/// Replays one segment's committed records into `state`.
+/// Replays one segment's committed records into `state`, returning the offset at
+/// which its records end.
+///
+/// That offset is where the next record belongs, which is not the end of the
+/// file: the writer keeps a zero-filled runway ahead of the records so its
+/// barrier never has to journal an extent update.
 ///
 /// `next_first_lsn` is the successor segment's header first LSN, which states
 /// exactly where this segment's records end. `None` means there is no
@@ -1941,7 +1952,7 @@ fn replay_segment(
     mvcc: &mut mvcc::State,
     mvcc_values: &mut value_log::ValueLog,
     redo: &mut Vec<RedoRecord>,
-) -> Result<()> {
+) -> Result<u64> {
     let is_last = next_first_lsn.is_none();
     let mut file = OpenOptions::new().read(true).write(is_last).open(path)?;
     let file_len = file.metadata()?.len();
@@ -1964,16 +1975,38 @@ fn replay_segment(
     // state, nothing in its body can change recovery's outcome; skip it.
     if let Some(next) = next_first_lsn {
         if next.saturating_sub(1) <= state.lsn {
-            return Ok(());
+            return Ok(file_len);
         }
     }
 
+    // The last byte a writer actually touched. Everything past it is untouched
+    // runway, which is what separates a record torn by a crash from one that was
+    // written whole and has since rotted: a torn record's declared body runs
+    // past this point, a rotten one does not.
+    let written_through = last_written_byte(&mut file, file_len)?;
     let header_first_lsn = read_u64(&header, 16);
     let mut saw_record = false;
     let mut offset = SEGMENT_HEADER_LEN as u64;
     while offset < file_len {
-        if file_len - offset < RECORD_HEADER_LEN as u64 {
-            return truncate_or_corrupt(&mut file, is_last, segment_id, offset);
+        // Nothing from here on was ever written, so the records end here and the
+        // rest is untouched runway. A sealed segment reaches this on its unused
+        // tail, the active one on every open. Records are not lost silently: a
+        // segment whose tail was zeroed by damage rather than never written
+        // leaves the next segment's first LSN discontinuous, which is rejected
+        // below.
+        if offset >= written_through {
+            break;
+        }
+        // Part of this frame was written and part was not, so the crash landed
+        // inside it. This is exact rather than heuristic: every record ends with
+        // the four non-zero bytes of `RECORD_END`, so a complete record can
+        // never reach past the last byte a writer touched, and a frame that does
+        // is necessarily torn. A record that is wholly present falls through to
+        // full validation, so damage to one is still reported as corruption.
+        if file_len - offset < RECORD_HEADER_LEN as u64
+            || offset + RECORD_HEADER_LEN as u64 > written_through
+        {
+            return truncate_or_corrupt(&mut file, is_last, segment_id, offset).map(|()| offset);
         }
         let mut record_header = [0; RECORD_HEADER_LEN];
         file.read_exact(&mut record_header)?;
@@ -1993,8 +2026,14 @@ fn replay_segment(
             .checked_add(payload_len)
             .and_then(|size| size.checked_add(RECORD_FOOTER_LEN))
             .ok_or_else(|| corrupt(segment_id, offset, "transaction length overflow"))?;
-        if total_len as u64 > file_len - offset {
-            return truncate_or_corrupt(&mut file, is_last, segment_id, offset);
+        // Torn rather than rotten, by the same rule as the header above, and
+        // checked before the payload is validated: a half-written record's tail
+        // reads as zeros and would otherwise fail its checksum and be reported
+        // as corruption, which would make an ordinary crash unrecoverable.
+        if total_len as u64 > file_len - offset
+            || offset.saturating_add(total_len as u64) > written_through
+        {
+            return truncate_or_corrupt(&mut file, is_last, segment_id, offset).map(|()| offset);
         }
         let mut payload = vec![0; payload_len];
         let mut footer = [0; RECORD_FOOTER_LEN];
@@ -2043,7 +2082,36 @@ fn replay_segment(
         }
         offset += total_len as u64;
     }
-    Ok(())
+    Ok(offset)
+}
+
+/// One past the last non-zero byte in `file`, or the header length when the
+/// segment holds no records at all.
+///
+/// Scans backwards from the end, so it reads only the unused runway rather than
+/// the whole segment. The result bounds where a writer can have reached: a
+/// record whose body extends past it cannot have been written in full.
+///
+/// Leaves the read cursor at the first record, where the caller resumes.
+fn last_written_byte(file: &mut File, file_len: u64) -> Result<u64> {
+    const CHUNK: usize = 64 * 1024;
+    let floor = SEGMENT_HEADER_LEN as u64;
+    let mut end = file_len;
+    let mut buffer = vec![0; CHUNK];
+    let mut written = floor;
+    while end > floor {
+        let start = end.saturating_sub(CHUNK as u64).max(floor);
+        let span = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..span])?;
+        if let Some(index) = buffer[..span].iter().rposition(|byte| *byte != 0) {
+            written = start + index as u64 + 1;
+            break;
+        }
+        end = start;
+    }
+    file.seek(SeekFrom::Start(floor))?;
+    Ok(written)
 }
 
 /// Byte offset of the first record in a segment whose LSN exceeds `bound`, or

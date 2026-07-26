@@ -434,7 +434,20 @@ fn scan_segment(segment_id: u64, bytes: &[u8]) -> Result<(u64, u64)> {
     let mut saw_record = false;
     let mut offset = crate::SEGMENT_HEADER_LEN;
     while offset < bytes.len() {
-        if bytes.len() - offset < crate::RECORD_HEADER_LEN {
+        // A sealed segment ends in the unused tail of its zero-filled runway,
+        // so records stopping before the end of the file is expected. Every
+        // remaining byte must be zero, though: this scan is what decides
+        // whether a segment is the one it claims to be, and anything else past
+        // the records is either a splice or damage.
+        let remainder = &bytes[offset..];
+        if remainder.len() < crate::RECORD_HEADER_LEN
+            || remainder[..crate::RECORD_HEADER_LEN]
+                .iter()
+                .all(|byte| *byte == 0)
+        {
+            if remainder.iter().all(|byte| *byte == 0) {
+                break;
+            }
             return Err(crate::corrupt(
                 segment_id,
                 offset as u64,

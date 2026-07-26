@@ -13,6 +13,7 @@ Vyrn is a correctness-first database built in Rust from its storage format upwar
 - Compact binary protocol v5 with bounded decoding, batched multi-get, and predictable support for 16 MiB values
 - Opaque binary keys up to 64 KiB and values up to 16 MiB
 - Segmented transaction WAL with sequence numbers, committed root generations, CRC32 checksums, record footers, and `sync_data` before acknowledgement
+- Records written into a preallocated zero-filled runway, so a commit's barrier has no file extension to journal
 - Recovery that publishes only complete committed roots and truncates only the incomplete tail of the active segment
 - Checksummed 4 KiB fixed pages and a bounded 4,096-page (~16 MiB) clock cache
 - Vyrn-owned online copy-on-write B+ tree with inline small keys/values, leaf/internal splitting, deletion/root collapse, and a checksummed versioned value log for large values
@@ -315,7 +316,7 @@ cargo bench -p vyrn-core --bench storage
 
 1. Parser/protocol fuzzing and Linux ext4/XFS power-loss matrix
 2. Online index construction, covering indexes, and index statistics
-3. Adaptive group-commit timing and direct-I/O experiments
+3. Single-writer commit latency below one flush, adaptive group-commit timing, and direct-I/O experiments
 4. Free-page accounting between compactions
 5. Online base backup (point-in-time recovery is implemented) and richer operational metrics
 6. Document collections, SQL planner/executor, and PostgreSQL compatibility

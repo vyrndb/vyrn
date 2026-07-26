@@ -33,11 +33,21 @@ pub fn recover_to(
     until_lsn: Option<u64>,
     allow_partial: bool,
 ) -> Result<u64> {
-    let base_lsn = crate::manifest_lsn(target).map_err(|error| {
-        failed(format!(
-            "recovery target has no readable checkpoint manifest ({error})"
-        ))
-    })?;
+    // A base taken from a database that had never checkpointed carries no
+    // manifest, which is a valid backup rather than a broken one. Its floor is
+    // LSN 0: nothing is baked into a checkpoint root, so every logged commit is
+    // still replayable and any bound the archive can reach is legal. A manifest
+    // that exists but cannot be read is still fatal — that is damage, not
+    // absence.
+    let base_lsn = if target.join("CURRENT").exists() {
+        crate::manifest_lsn(target).map_err(|error| {
+            failed(format!(
+                "recovery target has an unreadable checkpoint manifest ({error})"
+            ))
+        })?
+    } else {
+        0
+    };
     let wal_directory = target.join("wal");
     if !wal_directory.is_dir() {
         return Err(failed("recovery target has no wal directory".into()));
@@ -166,12 +176,15 @@ fn merge_archive(wal_directory: &Path, archive_directory: &Path) -> Result<()> {
         if present.contains(&entry.segment_id) {
             let base = fs::read(&destination)?;
             let archived = fs::read(&source)?;
-            let shorter: &[u8] = if base.len() <= archived.len() {
-                &base
-            } else {
-                &archived
-            };
-            let boundary = last_record_boundary(shorter);
+            // Compared by records rather than by file length. Both copies carry
+            // a zero-filled runway past their records, and the archived copy
+            // wrote further records into the very bytes the base backup copied
+            // as runway, so the two files can be the same size while holding
+            // different amounts of history. Whichever stops first is as far as
+            // they can be expected to agree.
+            let base_end = last_record_boundary(&base);
+            let archived_end = last_record_boundary(&archived);
+            let boundary = base_end.min(archived_end);
             if base[..boundary] != archived[..boundary] {
                 return Err(failed(format!(
                     "segment {} in {} does not share a history with the archived copy in {}; the archive belongs to a different timeline",
@@ -180,7 +193,7 @@ fn merge_archive(wal_directory: &Path, archive_directory: &Path) -> Result<()> {
                     source.display()
                 )));
             }
-            if archived.len() > base.len() {
+            if archived_end > base_end {
                 write_segment(wal_directory, &name, &archived)?;
             }
         } else {
@@ -230,23 +243,33 @@ fn wal_ids(directory: &Path) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
-/// Byte offset just past the last complete record frame, walking only the
-/// declared lengths. Bodies are left unverified because replay re-validates
-/// every byte it applies; the framing alone is enough to find where a torn or
-/// partial copy stops being comparable.
+/// The length of the record frame at `offset`, or `None` where the records end.
+///
+/// A segment is longer than its records: the writer keeps a zero-filled runway
+/// ahead of them so its barrier has no extent update to journal. Walking the
+/// declared lengths alone would step through that runway frame by frame, since
+/// zeros decode as a zero-length payload, so the frame's magic is what says
+/// whether a record is there at all. Bodies are still left unverified — replay
+/// re-validates every byte it applies, and the framing alone is enough to find
+/// where a torn or partial copy stops being comparable.
+fn record_frame_len(bytes: &[u8], offset: usize) -> Option<usize> {
+    if bytes.len() - offset < crate::RECORD_HEADER_LEN
+        || &bytes[offset..offset + 4] != crate::RECORD_MAGIC
+        || bytes[offset + 4] != crate::VERSION
+    {
+        return None;
+    }
+    let payload_len = crate::read_u32(bytes, offset + 17) as usize;
+    crate::RECORD_HEADER_LEN
+        .checked_add(payload_len)
+        .and_then(|size| size.checked_add(crate::RECORD_FOOTER_LEN))
+        .filter(|total| *total <= bytes.len() - offset)
+}
+
+/// Byte offset just past the last complete record frame.
 fn last_record_boundary(bytes: &[u8]) -> usize {
     let mut offset = crate::SEGMENT_HEADER_LEN.min(bytes.len());
-    while bytes.len() - offset >= crate::RECORD_HEADER_LEN {
-        let payload_len = crate::read_u32(bytes, offset + 17) as usize;
-        let Some(total_len) = crate::RECORD_HEADER_LEN
-            .checked_add(payload_len)
-            .and_then(|size| size.checked_add(crate::RECORD_FOOTER_LEN))
-        else {
-            break;
-        };
-        if total_len > bytes.len() - offset {
-            break;
-        }
+    while let Some(total_len) = record_frame_len(bytes, offset) {
         offset += total_len;
     }
     offset
@@ -259,17 +282,7 @@ fn last_record_lsn(path: &Path, first_lsn: u64) -> Result<u64> {
     let bytes = fs::read(path)?;
     let mut last = first_lsn.saturating_sub(1);
     let mut offset = crate::SEGMENT_HEADER_LEN.min(bytes.len());
-    while bytes.len() - offset >= crate::RECORD_HEADER_LEN {
-        let payload_len = crate::read_u32(&bytes, offset + 17) as usize;
-        let Some(total_len) = crate::RECORD_HEADER_LEN
-            .checked_add(payload_len)
-            .and_then(|size| size.checked_add(crate::RECORD_FOOTER_LEN))
-        else {
-            break;
-        };
-        if total_len > bytes.len() - offset {
-            break;
-        }
+    while let Some(total_len) = record_frame_len(&bytes, offset) {
         last = crate::read_u64(&bytes, offset + 5);
         offset += total_len;
     }
