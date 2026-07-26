@@ -509,6 +509,62 @@ impl Engine {
             .or(self.tree.revision(&tombstone_key(key))?))
     }
 
+    /// Whether any of `keys` changed after `revision`.
+    ///
+    /// Batches the tree lookups into two ordered sweeps (live keys, then
+    /// tombstones) rather than descending from the root twice per key, which is
+    /// what made transaction validation scale with the number of keys read.
+    pub fn any_changed_since(&self, keys: &[Vec<u8>], revision: u64) -> Result<bool> {
+        self.ensure_healthy()?;
+        let mut pending: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for key in keys {
+            validate_user_key(key)?;
+            // An in-memory history is authoritative and cheap, so a key with a
+            // recorded version never needs a tree lookup.
+            match self
+                .mvcc
+                .histories
+                .get(key)
+                .and_then(|versions| versions.last())
+            {
+                Some(version) => {
+                    if version.revision > revision {
+                        return Ok(true);
+                    }
+                }
+                None => {
+                    pending.insert(key.clone());
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let live: Vec<Vec<u8>> = pending.into_iter().collect();
+        let mut unresolved = Vec::new();
+        for (key, entry) in live.iter().zip(self.tree.get_many_with_revision(&live)?) {
+            match entry {
+                Some((_, current)) => {
+                    if current > revision {
+                        return Ok(true);
+                    }
+                }
+                None => unresolved.push(tombstone_key(key)),
+            }
+        }
+        if unresolved.is_empty() {
+            return Ok(false);
+        }
+        // A deleted key's revision lives on its tombstone.
+        unresolved.sort();
+        Ok(self
+            .tree
+            .get_many_with_revision(&unresolved)?
+            .into_iter()
+            .flatten()
+            .any(|(_, current)| current > revision))
+    }
+
     pub fn revisions(&self) -> Result<Vec<(Vec<u8>, u64)>> {
         self.ensure_healthy()?;
         let mut revisions: BTreeMap<_, _> = self
