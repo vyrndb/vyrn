@@ -13,6 +13,7 @@ use std::{
         Arc, RwLock,
     },
     thread,
+    time::Instant,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -115,6 +116,8 @@ struct Metrics {
     flushed_batches: AtomicU64,
     mvcc_versions_collected: AtomicU64,
     mvcc_gc_runs: AtomicU64,
+    /// Where a durable commit spends its time, stage by stage.
+    write_profile: WriteProfile,
     /// Sealed segments the archiver has not copied out yet (gauge). Growth
     /// means the archiver is falling behind the write rate.
     wal_archive_lag_segments: AtomicU64,
@@ -140,12 +143,166 @@ impl Default for Metrics {
             flushed_batches: AtomicU64::new(0),
             mvcc_versions_collected: AtomicU64::new(0),
             mvcc_gc_runs: AtomicU64::new(0),
+            write_profile: WriteProfile::default(),
             wal_archive_lag_segments: AtomicU64::new(0),
             wal_archived_total: AtomicU64::new(0),
             wal_archive_failures_total: AtomicU64::new(0),
             storage_failed: AtomicBool::new(false),
             drained: Notify::new(),
         }
+    }
+}
+
+/// A log-spaced latency histogram with four buckets per octave.
+///
+/// Totals are not enough to read this path: on a host whose p95 is thirty times
+/// its median, one stalled batch moves a mean further than a real regression
+/// does. Four buckets per octave holds the quantile error near 9%, which is far
+/// inside the differences worth acting on, for 160 atomics and one increment per
+/// observation.
+struct Histogram {
+    buckets: [AtomicU64; Self::BUCKETS],
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl Histogram {
+    /// 40 octaves reaches about 18 minutes, so nothing observable saturates.
+    const BUCKETS: usize = 160;
+
+    /// The first octave whose values are wide enough to subdivide. Below it each
+    /// nanosecond value is its own bucket, which costs nothing and keeps the
+    /// index arithmetic total.
+    const FLAT: u32 = 2;
+
+    fn index(nanoseconds: u64) -> usize {
+        let octave = 63 - nanoseconds.max(1).leading_zeros();
+        if octave < Self::FLAT {
+            return nanoseconds as usize;
+        }
+        let sub = (nanoseconds >> (octave - Self::FLAT)) & 3;
+        ((octave * 4 + sub as u32) as usize).min(Self::BUCKETS - 1)
+    }
+
+    /// The inclusive lower bound of `index`, used to place a quantile.
+    fn lower_bound(index: usize) -> u64 {
+        let octave = index as u32 / 4;
+        if octave < Self::FLAT {
+            return index as u64;
+        }
+        let sub = index as u64 % 4;
+        (4 + sub) << (octave - Self::FLAT)
+    }
+
+    fn record(&self, elapsed: Duration) {
+        self.buckets[Self::index(elapsed.as_nanos() as u64)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The value at `permille`, taken as the midpoint of the bucket it lands in.
+    fn quantile(&self, permille: u64) -> u64 {
+        let counts: Vec<u64> = self
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let wanted = total.saturating_mul(permille).div_ceil(1_000).max(1);
+        let mut seen = 0;
+        for (index, count) in counts.iter().enumerate() {
+            seen += count;
+            if seen >= wanted {
+                let lower = Self::lower_bound(index);
+                let upper = Self::lower_bound(index + 1).max(lower + 1);
+                return lower + (upper - lower) / 2;
+            }
+        }
+        Self::lower_bound(Self::BUCKETS - 1)
+    }
+}
+
+/// Nanoseconds spent in each stage of the durable commit path.
+///
+/// A commit crosses four hand-offs — request queue, engine lock, flush queue,
+/// acknowledgement — and the barrier is only one of them. Summed totals beside
+/// the batch and request counts turn a p50 into a budget, which is the only way
+/// to tell a slow `fdatasync` apart from scaffolding around it.
+///
+/// `front` is per request, since each one waits its own time before the batch it
+/// joins is closed; every other stage is per batch and shared by everything in
+/// it. Adding `front / requests` to the remaining stages divided by `batches`
+/// reconstructs the mean server-side latency of one write.
+#[derive(Default)]
+struct WriteProfile {
+    batches: AtomicU64,
+    requests: AtomicU64,
+    /// Client enqueue until the batch it joined stopped accumulating.
+    front: Stage,
+    /// Batch closed until the engine write lock is held: the `spawn_blocking`
+    /// hop plus contention with readers, checkpoints, and the previous batch.
+    lock: Stage,
+    /// Inside `write_batch_deferred`: change log, pre-state read, tree apply,
+    /// MVCC prepare, WAL encode and append.
+    apply: Stage,
+    /// Handed to the flush stage until that stage begins this batch's barrier.
+    flush_queue: Stage,
+    /// The `fdatasync` itself, including its `spawn_blocking` hop.
+    sync: Stage,
+    /// Durable until answered: reader refresh, change broadcast, response send.
+    publish: Stage,
+}
+
+impl WriteProfile {
+    fn stages(&self) -> [(&'static str, &Stage); 6] {
+        [
+            ("front", &self.front),
+            ("lock", &self.lock),
+            ("apply", &self.apply),
+            ("flush_queue", &self.flush_queue),
+            ("sync", &self.sync),
+            ("publish", &self.publish),
+        ]
+    }
+
+    /// A summed total plus p50 and p99 for each stage.
+    ///
+    /// Quantiles are over the process lifetime rather than a window, so a caller
+    /// comparing two configurations starts a server per configuration. The
+    /// totals are monotonic counters and can be differenced as usual.
+    fn render(&self) -> String {
+        let mut body = String::new();
+        for (name, stage) in self.stages() {
+            body.push_str(&format!(
+                "vyrn_commit_{name}_nanoseconds_total {}\nvyrn_commit_{name}_p50_nanoseconds {}\nvyrn_commit_{name}_p99_nanoseconds {}\n",
+                stage.total.load(Ordering::Relaxed),
+                stage.latency.quantile(500),
+                stage.latency.quantile(990),
+            ));
+        }
+        body
+    }
+}
+
+/// One stage's summed cost and its distribution.
+#[derive(Default)]
+struct Stage {
+    total: AtomicU64,
+    latency: Histogram,
+}
+
+impl Stage {
+    fn record(&self, elapsed: Duration) {
+        self.total
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        self.latency.record(elapsed);
     }
 }
 
@@ -216,6 +373,9 @@ enum WriteRequest {
     Operation {
         operation: BatchOperation,
         response: oneshot::Sender<std::result::Result<BatchResult, String>>,
+        /// When the connection handed this off, so the write worker can charge
+        /// the queue wait to the right stage.
+        queued: Instant,
     },
     Document {
         request: DocumentWrite,
@@ -238,7 +398,23 @@ enum WriteRequest {
         operations: Vec<BatchOperation>,
         index_updates: Vec<IndexUpdate>,
         response: oneshot::Sender<std::result::Result<Vec<BatchResult>, String>>,
+        queued: Instant,
     },
+}
+
+impl WriteRequest {
+    /// When this request entered the write queue, for the data requests that
+    /// group-commit. The others take the engine lock alone and are not profiled.
+    fn queued(&self) -> Option<Instant> {
+        match self {
+            WriteRequest::Operation { queued, .. } | WriteRequest::Transaction { queued, .. } => {
+                Some(*queued)
+            }
+            WriteRequest::Document { .. }
+            | WriteRequest::CreateIndex { .. }
+            | WriteRequest::DropIndex { .. } => None,
+        }
+    }
 }
 
 /// One batched transaction's validation inputs, pulled out of the queue so the
@@ -304,6 +480,9 @@ struct PendingFlush {
     generation: u64,
     root: u64,
     len: u64,
+    /// When this batch was handed to the flush stage, so the wait for a barrier
+    /// already in flight is charged separately from the barrier itself.
+    queued: Instant,
 }
 
 enum DocumentWrite {
@@ -433,6 +612,7 @@ async fn main() -> Result<()> {
             .map(|_| ReadEngine::open(&args.data).map(RwLock::new))
             .collect::<vyrn_core::Result<Vec<_>>>()?,
     );
+    // READER_FIX_PLACEHOLDER
     let read_queues = start_read_workers(&readers, args.write_queue_capacity);
     let engine = Arc::new(RwLock::new(engine));
     let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
@@ -1545,6 +1725,7 @@ async fn submit_write(state: &Arc<ServerState>, operation: BatchOperation) -> Me
         .send(WriteRequest::Operation {
             operation,
             response: sender,
+            queued: Instant::now(),
         })
         .await
         .is_err()
@@ -1745,6 +1926,7 @@ async fn commit_transaction(
             operations,
             index_updates: transaction.index_updates,
             response: sender,
+            queued: Instant::now(),
         })
         .await
         .is_err()
@@ -2217,6 +2399,19 @@ fn start_write_worker(
                     }
                 }
             }
+            // Everything up to here — queue wait, accumulation, and any conflict
+            // validation — is time a client spent before its batch could start
+            // work, so it is charged per request rather than per batch.
+            let batch_closed = Instant::now();
+            {
+                let profile = &config.metrics.write_profile;
+                for queued in requests.iter().filter_map(WriteRequest::queued) {
+                    profile
+                        .front
+                        .record(batch_closed.saturating_duration_since(queued));
+                    profile.requests.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             let operations: Vec<_> = requests
                 .iter()
                 .flat_map(|request| match request {
@@ -2263,6 +2458,7 @@ fn start_write_worker(
             // until this one is durable.
             let result = task::spawn_blocking(move || {
                 let mut engine = apply_engine.write().map_err(|_| StorageError::Poisoned)?;
+                let locked = Instant::now();
                 let (results, lsn) = if commit_index_updates.is_empty() {
                     engine.write_batch_deferred(commit_operations)?
                 } else {
@@ -2272,19 +2468,33 @@ fn start_write_worker(
                 // needed on the commit path.
                 let published = engine.last_published().to_vec();
                 let (generation, root, len) = engine.committed_root();
-                Ok::<_, StorageError>(PendingFlush {
-                    lsn,
-                    requests: Vec::new(),
-                    results,
-                    published,
-                    generation,
-                    root,
-                    len,
-                })
+                Ok::<_, StorageError>((
+                    PendingFlush {
+                        lsn,
+                        requests: Vec::new(),
+                        results,
+                        published,
+                        generation,
+                        root,
+                        len,
+                        queued: locked,
+                    },
+                    locked,
+                ))
             })
             .await;
             match result {
-                Ok(Ok(mut flush)) => {
+                Ok(Ok((mut flush, locked))) => {
+                    let applied = Instant::now();
+                    let profile = &config.metrics.write_profile;
+                    profile.batches.fetch_add(1, Ordering::Relaxed);
+                    profile
+                        .lock
+                        .record(locked.saturating_duration_since(batch_closed));
+                    profile
+                        .apply
+                        .record(applied.saturating_duration_since(locked));
+                    flush.queued = applied;
                     flush.requests = requests;
                     writes_since_checkpoint = if should_checkpoint {
                         config.metrics.checkpoints.fetch_add(1, Ordering::Relaxed);
@@ -2364,6 +2574,16 @@ fn start_flush_worker(
             while let Ok(next) = flushes.try_recv() {
                 batch.push(next);
             }
+            // Every batch here waited from its own hand-off until this point, and
+            // from here they all wait on the same barrier.
+            let barrier_started = Instant::now();
+            for flush in batch.iter() {
+                config
+                    .metrics
+                    .write_profile
+                    .flush_queue
+                    .record(barrier_started.saturating_duration_since(flush.queued));
+            }
             config.metrics.wal_flushes.fetch_add(1, Ordering::Relaxed);
             config
                 .metrics
@@ -2400,6 +2620,15 @@ fn start_flush_worker(
                     continue;
                 }
             }
+            // Charged to every batch in the group, not once: each of them waited
+            // the whole barrier before it could be answered.
+            let durable = Instant::now();
+            {
+                let sync = durable.saturating_duration_since(barrier_started);
+                for _ in 0..batch.len() {
+                    config.metrics.write_profile.sync.record(sync);
+                }
+            }
             let covered = batch.len() as u64;
             let mut stop = false;
             for flush in batch {
@@ -2416,6 +2645,14 @@ fn start_flush_worker(
                     stop = true;
                     break;
                 }
+                // Measured from the barrier rather than from the previous batch,
+                // so a batch waiting its turn behind earlier ones in the same
+                // group carries that wait.
+                config
+                    .metrics
+                    .write_profile
+                    .publish
+                    .record(Instant::now().saturating_duration_since(durable));
             }
             // Release the writer before returning, so a failure here cannot leave
             // it accumulating behind a barrier that will never land.
@@ -2690,7 +2927,7 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
                     "200 OK",
                     "text/plain; version=0.0.4",
                     format!(
-                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\n",
+                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\nvyrn_commit_batches_total {}\nvyrn_commit_requests_total {}\n{}",
                         u8::from(ready),
                         u8::from(metrics.storage_failed.load(Ordering::Relaxed)),
                         metrics.active_connections.load(Ordering::Relaxed),
@@ -2708,6 +2945,9 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
                         metrics.wal_archive_lag_segments.load(Ordering::Relaxed),
                         metrics.wal_archived_total.load(Ordering::Relaxed),
                         metrics.wal_archive_failures_total.load(Ordering::Relaxed),
+                        metrics.write_profile.batches.load(Ordering::Relaxed),
+                        metrics.write_profile.requests.load(Ordering::Relaxed),
+                        metrics.write_profile.render(),
                     ),
                 ),
                 _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
@@ -2789,6 +3029,47 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use tempfile::tempdir;
+
+    /// The quantile is only worth reading if the bucket it names actually holds
+    /// the value, so index and lower bound have to agree in both directions.
+    #[test]
+    fn histogram_buckets_contain_the_values_indexed_into_them() {
+        for nanoseconds in (0..64).chain((6..40).map(|shift| (1_u64 << shift) + 12_345)) {
+            let index = Histogram::index(nanoseconds);
+            assert!(
+                Histogram::lower_bound(index) <= nanoseconds,
+                "{nanoseconds} below the bound of bucket {index}"
+            );
+            assert!(
+                index + 1 == Histogram::BUCKETS || nanoseconds < Histogram::lower_bound(index + 1),
+                "{nanoseconds} above the bound of bucket {index}"
+            );
+        }
+    }
+
+    /// Four buckets per octave is the accuracy the stage budget is read at.
+    #[test]
+    fn histogram_quantiles_land_within_a_quarter_octave() {
+        let histogram = Histogram::default();
+        for micros in 1..=1_000_u64 {
+            histogram.record(Duration::from_micros(micros));
+        }
+        for (permille, expected) in [(500_u64, 500_000_u64), (990, 990_000)] {
+            let measured = histogram.quantile(permille);
+            let error = measured.abs_diff(expected) as f64 / expected as f64;
+            assert!(
+                error < 0.10,
+                "p{permille} measured {measured} against {expected}"
+            );
+        }
+    }
+
+    /// An empty stage must report zero rather than the bottom bucket, or an
+    /// unused path reads as a fast one.
+    #[test]
+    fn histogram_without_observations_reports_zero() {
+        assert_eq!(Histogram::default().quantile(500), 0);
+    }
 
     #[tokio::test]
     async fn transaction_reads_persisted_snapshot_and_its_writes() {
