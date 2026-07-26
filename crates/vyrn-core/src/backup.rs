@@ -189,9 +189,23 @@ fn database_files(directory: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     files.sort();
-    if !files.iter().any(|path| path == Path::new("CURRENT")) {
+    // A database that has never checkpointed has no manifest, and that is a
+    // legitimate state rather than a corrupt one: `Engine::open` falls back to
+    // generation 0 at an empty root and replays the WAL onto it, which is exactly
+    // what it does for a restored copy. Absent `CURRENT` also proves no
+    // checkpoint ran, so no segment was ever deleted and segment 1 onwards is
+    // the complete log. Refusing here made backup unavailable for the whole
+    // early life of a database — including immediately after a clean shutdown,
+    // which is when an operator is most likely to take the first one.
+    //
+    // What must be present is a page file to replay onto. Its absence means the
+    // directory is not a database at all.
+    if !files
+        .iter()
+        .any(|path| path.to_string_lossy().starts_with("pages-"))
+    {
         return Err(Error::CorruptBackup(
-            "database has no CURRENT manifest; checkpoint it first".into(),
+            "database has no page file; the directory is not a Vyrn database".into(),
         ));
     }
     Ok(files)
@@ -261,6 +275,50 @@ mod tests {
         restore_backup(&archive, &target).unwrap();
         let engine = Engine::open(target).unwrap();
         assert_eq!(engine.get(b"key").unwrap(), Some(b"value".to_vec()));
+        let _ = fs::remove_file(archive);
+    }
+
+    /// A database only gets a manifest once it checkpoints, so refusing to back
+    /// one up without it made backup unavailable for the whole early life of a
+    /// database — including right after a clean shutdown. The restored copy has
+    /// to come back complete, which it does because replay rebuilds the tree from
+    /// segment 1 onto the empty generation-0 root.
+    #[test]
+    fn a_database_that_never_checkpointed_can_be_backed_up_and_restored() {
+        let source = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(source.path()).unwrap();
+            engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+            engine.put(b"second".to_vec(), b"durable".to_vec()).unwrap();
+            engine.delete(b"key").unwrap();
+            engine.put(b"key".to_vec(), b"rewritten".to_vec()).unwrap();
+        }
+        assert!(
+            !source.path().join("CURRENT").exists(),
+            "this case is only meaningful without a manifest"
+        );
+
+        let archive = source.path().join("../no-manifest.vyrn");
+        create_backup(source.path(), &archive).unwrap();
+        verify_backup(&archive).unwrap();
+        let restored = tempdir().unwrap();
+        let target = restored.path().join("db");
+        restore_backup(&archive, &target).unwrap();
+
+        let engine = Engine::open(target).unwrap();
+        assert_eq!(engine.get(b"key").unwrap(), Some(b"rewritten".to_vec()));
+        assert_eq!(engine.get(b"second").unwrap(), Some(b"durable".to_vec()));
+        let _ = fs::remove_file(archive);
+    }
+
+    /// The replacement guard: a directory with no page file is not a database,
+    /// and backing it up would produce an archive that restores to nothing.
+    #[test]
+    fn a_directory_without_a_page_file_is_refused() {
+        let empty = tempdir().unwrap();
+        fs::write(empty.path().join("LOCK"), b"").unwrap();
+        let archive = empty.path().join("../not-a-database.vyrn");
+        assert!(create_backup(empty.path(), &archive).is_err());
         let _ = fs::remove_file(archive);
     }
 
