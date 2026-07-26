@@ -41,6 +41,31 @@ vyrn restore backup.vyrn --target /var/lib/vyrn-restored
 
 Restore refuses non-empty targets and verifies every file checksum before completing.
 
+### Continuous WAL archiving
+
+Offline backups bound loss to the backup interval. Add continuous archiving to shrink the loss window to the rotation interval plus archive latency:
+
+- Set `VYRN_WAL_ARCHIVE_DIR` to a local directory outside the data directory (the server refuses a nested one) and keep `VYRN_WAL_ARCHIVE_INTERVAL_MS` at its 5000 ms default unless the loss window demands less; the minimum is 100.
+- Archiving never blocks writes: it copies only sealed, immutable segments, and checkpoints keep any sealed segment the archiver has not durably copied.
+- The archive directory is local by design. Ship it off-host yourself (rsync, object-storage sync) on a schedule at least as frequent as your loss-window target.
+- Run `vyrn verify-archive <dir>` periodically; it re-reads and re-checksums every archived byte, catching disk rot the index alone cannot see.
+- Reclaim local WAL disk only with `vyrn wal-prune --data <data> --archive <dir> --through <id>` against a stopped server; it refuses to delete anything the archive does not provably hold, and it keeps any segment holding records above the published checkpoint regardless of `--through` — replay still needs those records locally, so pruning fewer segments than requested is normal on a database stopped between checkpoints.
+
+**Alert rule:** `vyrn_wal_archive_lag_segments` growing over time means the archiver is falling behind the write rate and the local WAL directory is growing without bound, because checkpoints cannot delete unarchived segments. Alert on sustained growth, and on any increase of `vyrn_wal_archive_failures_total`.
+
+### Point-in-time recovery procedure
+
+1. Stop routing traffic; do not start a replacement writer against the old archive.
+2. Copy the archive directory from off-host storage to the recovery host.
+3. `vyrn verify-archive /path/to/archive` — confirm the reported LSN range covers the target point.
+4. `vyrn verify-backup base.vyrn` for the newest base backup taken at or before the target LSN.
+5. `vyrn recover --base base.vyrn --archive /path/to/archive --target /var/lib/vyrn-recovered --until-lsn N` (omit `--until-lsn` to roll forward to the archive's end). The bound cannot be below the base checkpoint's LSN; `--allow-partial` is required to accept an earlier LSN than requested.
+6. If recovery fails, delete the target directory and start over from step 5; a failed target is unusable by design.
+7. Start `vyrnd` against the recovered directory with a **new, empty** `VYRN_WAL_ARCHIVE_DIR`. The recovered database is a new timeline, and archiving it into the old directory would poison the only copy of the old history.
+8. Smoke-test reads of known keys before restoring traffic.
+
+**Windows caveat:** `sync_directory` is a no-op on non-Unix platforms, so archive-directory durability (the rename publishing a copied segment or the index) is not certified on Windows. Windows remains a development-only platform; run archiving in production on Linux ext4/XFS only.
+
 ## Failure handling
 
 If readiness becomes false or a storage error is logged:
@@ -69,4 +94,5 @@ Before calling the exact build generally available:
 - The Linux crash, corruption, backup, and restore jobs pass repeatedly.
 - A multi-hour soak with a larger-than-memory dataset has stable memory and latency.
 - Backup restoration is tested in the intended deployment environment.
+- A restore-plus-PITR drill (restore a base backup, roll forward through a real archive to a chosen LSN, verify the data) passes in the intended deployment environment.
 - Security and operational review is complete.
