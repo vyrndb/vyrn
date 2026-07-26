@@ -159,10 +159,26 @@ pub enum DurabilityMode {
     Async,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// When a durable batch's WAL flush happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Barrier {
+    /// Flush before returning, so the batch is durable once the call completes.
+    Immediate,
+    /// Append only, leaving the flush to the caller once it has dropped the
+    /// write lock. The batch must not be acknowledged until then.
+    Deferred,
+}
+
+#[derive(Debug, Clone)]
 pub struct EngineOptions {
     pub segment_size: u64,
     pub durability: DurabilityMode,
+    /// Highest WAL segment id the archiver has durably copied out, shared so
+    /// the checkpoint's segment deletion can observe it without taking a lock.
+    ///
+    /// `None` disables the retention barrier entirely: checkpoints delete
+    /// sealed segments exactly as they did before archiving existed.
+    pub archived_through: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl Default for EngineOptions {
@@ -170,6 +186,7 @@ impl Default for EngineOptions {
         Self {
             segment_size: DEFAULT_SEGMENT_SIZE,
             durability: DurabilityMode::Durable,
+            archived_through: None,
         }
     }
 }
