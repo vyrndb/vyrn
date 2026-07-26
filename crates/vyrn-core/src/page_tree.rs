@@ -1358,6 +1358,51 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
     })
 }
 
+/// Merges sorted mutations into a leaf's sorted entries.
+///
+/// Records in `existed` whether each key was already present before the batch, so
+/// the caller can maintain its entry count and report delete results. Repeated
+/// mutations of one key collapse to the last one, and only the first of them sees
+/// the pre-batch state.
+fn merge_entries(
+    entries: Vec<Entry>,
+    mutations: &[PreparedMutation],
+    existed: &mut [bool],
+) -> Vec<Entry> {
+    let mut merged: Vec<Entry> = Vec::with_capacity(entries.len() + mutations.len());
+    let mut entries = entries.into_iter().peekable();
+    let mut index = 0;
+    while index < mutations.len() {
+        let key = &mutations[index].key;
+        // Carry over every entry that sorts before this key.
+        while entries.peek().is_some_and(|entry| &entry.key < key) {
+            merged.push(entries.next().unwrap());
+        }
+        let present = entries.peek().is_some_and(|entry| &entry.key == key);
+        if present {
+            entries.next();
+        }
+        // Collapse a run of mutations on the same key; the last one wins.
+        let mut last = index;
+        while last + 1 < mutations.len() && &mutations[last + 1].key == key {
+            last += 1;
+        }
+        for mutation in &mutations[index..=last] {
+            existed[mutation.index] = present;
+        }
+        if let Some((value, revision)) = &mutations[last].value {
+            merged.push(Entry {
+                key: key.clone(),
+                value: value.clone(),
+                revision: *revision,
+            });
+        }
+        index = last + 1;
+    }
+    merged.extend(entries);
+    merged
+}
+
 fn find_entry(entries: &[Entry], key: &[u8]) -> (usize, bool) {
     match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
         Ok(index) => (index, true),
