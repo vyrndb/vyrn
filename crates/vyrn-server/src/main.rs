@@ -2134,6 +2134,194 @@ fn start_write_worker(
     });
 }
 
+/// Moves every already-queued data write into `requests` without waiting.
+///
+/// A non-data request ends the batch and is parked in `pending` for the next loop
+/// iteration, since index and document writes take the engine lock on their own.
+fn drain_writes(
+    receiver: &mut mpsc::Receiver<WriteRequest>,
+    requests: &mut Vec<WriteRequest>,
+    pending: &mut Option<WriteRequest>,
+    maximum: usize,
+) {
+    while requests.len() < maximum {
+        match receiver.try_recv() {
+            Ok(request @ (WriteRequest::Operation { .. } | WriteRequest::Transaction { .. })) => {
+                requests.push(request)
+            }
+            Ok(request) => {
+                *pending = Some(request);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Flushes applied batches and acknowledges them, in order.
+///
+/// Runs as its own stage so the write worker never waits on `fdatasync`. Batches
+/// are handled strictly in arrival order, and a flush covers every record written
+/// before it began, so a batch queued while an earlier flush was running is often
+/// already durable by the time it is examined — several commits then share one
+/// barrier. Nothing is acknowledged, and no reader is refreshed, before the
+/// record behind it is durable.
+fn start_flush_worker(
+    wal: Arc<vyrn_core::Wal>,
+    mut flushes: mpsc::Receiver<PendingFlush>,
+    config: FlushWorkerConfig,
+) {
+    tokio::spawn(async move {
+        while let Some(first) = flushes.recv().await {
+            // Take every batch already waiting, so one barrier covers all of them.
+            // This is where group commit actually happens now: the write worker no
+            // longer blocks on the flush, so without coalescing here each batch
+            // would pay its own `fdatasync` and the barrier count would rise.
+            let mut batch = vec![first];
+            while let Ok(next) = flushes.try_recv() {
+                batch.push(next);
+            }
+            config.metrics.wal_flushes.fetch_add(1, Ordering::Relaxed);
+            config
+                .metrics
+                .flushed_batches
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            // One flush through the highest LSN makes every batch here durable,
+            // because all of their records were appended before this call.
+            if let Some(lsn) = batch.iter().filter_map(|flush| flush.lsn).max() {
+                let wal_handle = Arc::clone(&wal);
+                let synced = task::spawn_blocking(move || wal_handle.sync_through(lsn)).await;
+                let error = match synced {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => {
+                        record_storage_error(&config.metrics, &error);
+                        Some(error.to_string())
+                    }
+                    Err(_) => {
+                        config.metrics.storage_failed.store(true, Ordering::Release);
+                        config.metrics.ready.store(false, Ordering::Release);
+                        Some("WAL flush task failed".into())
+                    }
+                };
+                if let Some(message) = error {
+                    let covered = batch.len() as u64;
+                    for flush in batch {
+                        respond_writes(flush.requests, Err(message.clone()));
+                    }
+                    // Release these before looping, or the write worker would keep
+                    // accumulating behind a barrier that has already failed.
+                    config.in_flight.fetch_sub(covered, Ordering::AcqRel);
+                    config
+                        .flush_completed
+                        .send_modify(|generation| *generation += 1);
+                    continue;
+                }
+            }
+            let covered = batch.len() as u64;
+            let mut stop = false;
+            for flush in batch {
+                let PendingFlush {
+                    requests,
+                    results,
+                    published,
+                    generation,
+                    root,
+                    len,
+                    ..
+                } = flush;
+                if !publish_commit(&config, requests, results, published, generation, root, len) {
+                    stop = true;
+                    break;
+                }
+            }
+            // Release the writer before returning, so a failure here cannot leave
+            // it accumulating behind a barrier that will never land.
+            config.in_flight.fetch_sub(covered, Ordering::AcqRel);
+            config
+                .flush_completed
+                .send_modify(|generation| *generation += 1);
+            if stop {
+                return;
+            }
+        }
+    });
+}
+
+/// Refreshes the read handles, broadcasts the commit, and answers its clients.
+///
+/// Returns false when storage has failed and the flush stage must stop.
+fn publish_commit(
+    config: &FlushWorkerConfig,
+    requests: Vec<WriteRequest>,
+    results: Vec<BatchResult>,
+    published: Vec<change_log::ChangeRecord>,
+    generation: u64,
+    root: u64,
+    len: u64,
+) -> bool {
+    // Only now is the batch durable, so only now may readers publish it.
+    //
+    // A checkpoint may have compacted the tree while this batch was being
+    // flushed, retiring the generation the batch recorded and deleting its
+    // page files. `ReadEngine::refresh` ignores a generation older than the
+    // one a reader already serves, checked under that reader's own write lock
+    // — a single load of a shared atomic before this loop left a window in
+    // which the checkpoint task moved a reader forward mid-loop and the stale
+    // refresh here reopened the deleted files, failing every write from then
+    // on. The checkpoint task republishes the compacted generation itself.
+    let mut refresh_error = None;
+    for reader in config.readers.iter() {
+        match reader.write() {
+            Ok(mut reader) => {
+                if let Err(error) = reader.refresh(generation, root, len) {
+                    refresh_error = Some(error);
+                    break;
+                }
+            }
+            Err(_) => {
+                config.metrics.storage_failed.store(true, Ordering::Release);
+                config.metrics.ready.store(false, Ordering::Release);
+                respond_writes(requests, Err("storage reader lock poisoned".into()));
+                return false;
+            }
+        }
+    }
+    if let Some(error) = refresh_error {
+        // A refresh can still lose the race in the other direction: the
+        // batch's generation was ahead of the reader's, but a second
+        // checkpoint retired it before the refresh reopened its files. The
+        // engine lock arbitrates — files are only deleted inside `checkpoint`
+        // under the engine write lock, so once this read lock is acquired the
+        // committed generation provably differs from a raced batch's. Only a
+        // failure for the live generation means storage is actually broken;
+        // a retired one is skipped like any stale refresh, and the checkpoint
+        // task republishes the readers. No reader lock is held here, so this
+        // cannot invert the checkpoint task's engine-then-reader lock order,
+        // and the engine lock is only ever taken on this cold path.
+        let retired = config
+            .engine
+            .read()
+            .is_ok_and(|engine| engine.committed_root().0 != generation);
+        if !retired {
+            record_storage_error(&config.metrics, &error);
+            respond_writes(requests, Err(error.to_string()));
+            return false;
+        }
+    }
+    // Broadcast the records the commit actually published, so a live cursor
+    // always matches a durable one.
+    for record in published {
+        let _ = config.changes.send(ChangeEvent {
+            sequence: record.sequence,
+            key: record.key,
+            value: record.value,
+            cursor: Some(change_log::Cursor::new(record.sequence, record.index)),
+        });
+    }
+    respond_writes(requests, Ok(results));
+    true
+}
+
 type DocumentChangeEvent = (Vec<u8>, Option<Vec<u8>>);
 
 fn apply_document_write(
