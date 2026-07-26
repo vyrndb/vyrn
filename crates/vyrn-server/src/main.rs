@@ -2447,19 +2447,20 @@ fn has_conflict(
     operations: &[BatchOperation],
     index_updates: &[IndexUpdate],
 ) -> vyrn_core::Result<bool> {
-    for key in operations
+    // One batched sweep for every key this transaction wrote or read, rather than
+    // a root-to-leaf descent per key.
+    let keys: Vec<Vec<u8>> = operations
         .iter()
-        .map(operation_key)
+        .map(|operation| operation_key(operation).to_vec())
         .chain(
             index_updates
                 .iter()
-                .map(|update| update.primary_key.as_slice()),
+                .map(|update| update.primary_key.clone()),
         )
-        .chain(read_keys.iter().map(Vec::as_slice))
-    {
-        if engine.changed_since(key, snapshot_sequence)? {
-            return Ok(true);
-        }
+        .chain(read_keys.iter().cloned())
+        .collect();
+    if engine.any_changed_since(&keys, snapshot_sequence)? {
+        return Ok(true);
     }
     for (start, end) in read_ranges {
         if engine.range_changed_since(start.as_deref(), end.as_deref(), snapshot_sequence)? {
