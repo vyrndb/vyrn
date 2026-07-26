@@ -2626,6 +2626,43 @@ mod tests {
         assert_eq!(engine.stats().unwrap().checkpoint_generation, 1);
     }
 
+    /// A rotation that fails between creating the successor's header and
+    /// switching the writer leaves an empty segment whose header claims a
+    /// first LSN below records that stayed in its predecessor. An empty
+    /// segment has no record to contradict its header, so an open that adopts
+    /// it as-is places the next commit under the lie — and the open after
+    /// that rejects the segment, leaving a database that never opens again
+    /// with every acknowledged record intact on disk.
+    #[test]
+    fn open_repairs_an_empty_active_segment_with_a_stale_header() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+            engine.put(b"k3".to_vec(), b"v3".to_vec()).unwrap();
+        }
+        // The orphan successor of a failed rotation: created as though the
+        // switch happened after LSN 1, while records 2 and 3 actually stayed
+        // in segment 1.
+        drop(create_segment(&directory.path().join("wal"), 2, 2).unwrap());
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            assert_eq!(engine.sequence(), 3);
+            engine.put(b"k4".to_vec(), b"v4".to_vec()).unwrap();
+        }
+        let engine = Engine::open(directory.path()).unwrap();
+        for (key, value) in [
+            (b"k1", b"v1"),
+            (b"k2", b"v2"),
+            (b"k3", b"v3"),
+            (b"k4", b"v4"),
+        ] {
+            assert_eq!(engine.get(key).unwrap(), Some(value.to_vec()));
+        }
+        assert_eq!(engine.sequence(), 4);
+    }
+
     #[test]
     fn transactional_indexes_enforce_uniqueness_and_survive_reopen() {
         let directory = tempdir().unwrap();
