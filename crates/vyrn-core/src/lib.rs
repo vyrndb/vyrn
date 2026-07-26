@@ -460,12 +460,32 @@ impl Engine {
         mvcc::collect(&mut mvcc, None, state.lsn);
         let segment_id = segments.last().copied().unwrap_or(1);
         let wal_path = wal_directory.join(segment_name(segment_id));
-        let mut wal = if wal_path.exists() {
-            OpenOptions::new().read(true).write(true).open(wal_path)?
+        let mut wal_file = if wal_path.exists() {
+            OpenOptions::new().read(true).write(true).open(&wal_path)?
         } else {
             create_segment(&wal_directory, segment_id, state.lsn + 1)?
         };
-        let wal_len = wal.seek(SeekFrom::End(0))?;
+        let mut wal_len = wal_file.seek(SeekFrom::End(0))?;
+        // An empty active segment carries the only claim about where its
+        // records' LSNs start, and replay has no record to contradict it. A
+        // failed rotation in an earlier run (crash or I/O error after the
+        // successor's header became durable but before the writer switched)
+        // can leave such a segment claiming a first LSN below records that
+        // later landed in its predecessor; adopting the lie would place the
+        // next commit's LSN in a segment whose header disagrees, which replay
+        // rejects on the open after this one. The segment provably holds no
+        // records, so recreate it with the header the log actually requires.
+        if wal_len == SEGMENT_HEADER_LEN as u64
+            && read_segment_first_lsn(&wal_path)? != state.lsn + 1
+        {
+            drop(wal_file);
+            fs::remove_file(&wal_path)?;
+            wal_file = create_segment(&wal_directory, segment_id, state.lsn + 1)?;
+            wal_len = wal_file.seek(SeekFrom::End(0))?;
+        }
+        let wal = Arc::new(Wal::new(wal_file)?);
+        // Everything already in the segment survived recovery, so it is durable.
+        wal.adopt(state.lsn);
 
         Ok(Self {
             path: path.to_owned(),
