@@ -1638,54 +1638,100 @@ impl Engine {
     }
 
     fn commit_batch(&mut self, operations: &[PendingCommit], root: u64, len: u64) -> Result<()> {
+        let lsn = self.append_batch(operations, root, len)?;
+        if self.durability == DurabilityMode::Durable {
+            self.wal.sync_through(lsn)?;
+        }
+        Ok(())
+    }
+
+    /// Appends this batch's WAL record without flushing it.
+    ///
+    /// Returns the LSN that must be passed to [`Wal::sync_through`] before the
+    /// batch may be acknowledged.
+    fn append_batch(&mut self, operations: &[PendingCommit], root: u64, len: u64) -> Result<u64> {
         let lsn = self
             .last_lsn
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
         let record = encode_record(lsn, operations, root, len)?;
-        let pending_len: u64 = self
-            .pending_wal
-            .iter()
-            .map(|record| record.len() as u64)
-            .sum();
-        // Tracked in memory rather than stat'ing the WAL on every commit.
-        let current_len = self.wal_len + pending_len;
+        // Tracked in memory rather than stat'ing the WAL on every commit. A
+        // buffered async record is already counted here when it is pushed onto
+        // `pending_wal`, so adding those lengths again would double-count them
+        // and rotate early. `rotate_segment` drains the buffer itself.
+        let current_len = self.wal_len;
         if current_len > SEGMENT_HEADER_LEN as u64
             && current_len + record.len() as u64 > self.segment_size
         {
-            self.sync()?;
             self.rotate_segment()?;
         }
         if self.durability == DurabilityMode::Durable {
-            // Only the WAL is synced here. Pages and historical values are left
+            // Only the WAL is written here. Pages and historical values are left
             // for the background flush: redo recovery reapplies logged mutations
             // when the committed root's pages did not survive, so a commit no
             // longer needs a page barrier before naming its root.
             self.inject(FailurePoint::BeforePageSync)?;
             self.inject(FailurePoint::AfterPageSync)?;
             self.wal_len += record.len() as u64;
-            self.wal.write_all(&record)?;
+            self.wal.append(&record, lsn)?;
             self.inject(FailurePoint::AfterWalWrite)?;
             self.inject(FailurePoint::BeforeWalSync)?;
-            self.wal.sync_data()?;
         } else {
             self.wal_len += record.len() as u64;
             self.pending_wal.push(record);
         }
         self.last_lsn = lsn;
-        Ok(())
+        Ok(lsn)
     }
 
     fn rotate_segment(&mut self) -> Result<()> {
+        // The new segment's header claims `first_lsn = last_lsn + 1`, so every
+        // record at or below `last_lsn` must be in the outgoing segment before
+        // the switch. In async mode `last_lsn` runs ahead of the buffered
+        // records, and draining them after rotation would put them in the new
+        // segment, above LSNs its header says it starts at.
+        self.sync()?;
+        debug_assert!(self.pending_wal.is_empty());
         let next = self
             .segment_id
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL segment number exhausted")))?;
-        self.wal = create_segment(&self.path.join("wal"), next, self.last_lsn + 1)?;
-        self.segment_id = next;
-        // The new segment starts at its header, so the tracked length restarts too.
-        self.wal_len = self.wal.seek(SeekFrom::End(0))?;
-        Ok(())
+        let wal_directory = self.path.join("wal");
+        let mut file = create_segment(&wal_directory, next, self.last_lsn + 1)?;
+        // Nothing about this engine changes until the writer has actually
+        // switched. The header just created is a durable promise that LSNs
+        // from `last_lsn + 1` live in segment `next`; if the switch fails the
+        // writer keeps appending to the outgoing segment, so any further
+        // commit would falsify that promise — and after two restarts replay
+        // rejects the segment whose first record contradicts its header. On
+        // failure the orphan successor is therefore removed again and the
+        // engine poisoned so no commit can land behind the stale state;
+        // reopening rebuilds `segment_id` and `wal_len` from disk. `wal_len`
+        // in particular must not restart at the new header's length early, or
+        // a failed rotation would also disarm the size trigger for the old,
+        // still-active segment.
+        let switched = file
+            .seek(SeekFrom::End(0))
+            .map_err(Error::from)
+            // Flushes the outgoing segment before adopting the new one, so a
+            // durable record never sits behind an unflushed one in an earlier
+            // segment.
+            .and_then(|length| self.wal.rotate(file).map(|()| length));
+        match switched {
+            Ok(length) => {
+                // The new segment starts at its header, so the tracked length
+                // restarts too.
+                self.wal_len = length;
+                self.segment_id = next;
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                let _ = fs::remove_file(wal_directory.join(segment_name(next)));
+                let _ = sync_directory(&wal_directory);
+                Err(error)
+            }
+        }
     }
 
     fn ensure_healthy(&self) -> Result<()> {
