@@ -258,3 +258,70 @@ fn rotate_for_archive_is_a_noop_on_an_idle_segment() {
 /// would brick the database. But the same leniency must never extend to
 /// segments recovery actually replays: rot there is real data corruption and
 /// open must fail closed.
+#[test]
+fn bitrot_in_dead_retained_segment_still_opens() {
+    let database = tempdir().unwrap();
+    let wal_directory = database.path().join("wal");
+    let watermark = Arc::new(AtomicU64::new(0));
+    {
+        let mut engine = Engine::open_with_options(
+            database.path(),
+            EngineOptions {
+                segment_size: 128,
+                archived_through: Some(Arc::clone(&watermark)),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        for index in 0..8u8 {
+            engine
+                .put(format!("key-{index}").into_bytes(), vec![index; 40])
+                .unwrap();
+        }
+        // The checkpoint publishes a manifest at the current LSN, so every
+        // segment sealed before it is now semantically dead — retained only
+        // because the watermark says the archiver has not copied it yet.
+        engine.checkpoint().unwrap();
+        // Live records after the checkpoint: only the WAL guarantees these,
+        // so the segments holding them must still be scanned byte-for-byte.
+        for index in 0..3u8 {
+            engine
+                .put(format!("live-{index}").into_bytes(), vec![index; 40])
+                .unwrap();
+        }
+    }
+    let segments = segment_ids(&wal_directory);
+    assert!(segments.len() >= 3);
+    let oldest = segments[0];
+    let last = *segments.last().unwrap();
+
+    // Flip a byte in the dead segment's body, past the 32-byte header. The
+    // header must stay intact: recovery still reads it to walk the LSN chain.
+    let dead = segment_path(&wal_directory, oldest);
+    let mut bytes = std::fs::read(&dead).unwrap();
+    assert!(bytes.len() > 40);
+    bytes[40] ^= 0xff;
+    std::fs::write(&dead, &bytes).unwrap();
+    {
+        let engine = Engine::open(database.path())
+            .expect("bitrot below the checkpoint must not brick the database");
+        assert_eq!(engine.get(b"live-0").unwrap(), Some(vec![0; 40]));
+    }
+
+    // The same flip in a segment recovery replays must fail closed: these
+    // bytes are the only copy of acknowledged post-checkpoint commits.
+    let live = segment_path(&wal_directory, last);
+    let mut bytes = std::fs::read(&live).unwrap();
+    assert!(
+        bytes.len() > 32 + 45,
+        "the last segment should hold at least one live record"
+    );
+    // Inside the first record's payload: the framing stays intact, so this is
+    // unambiguous corruption rather than a torn tail recovery may truncate.
+    bytes[32 + 45 + 2] ^= 0xff;
+    std::fs::write(&live, &bytes).unwrap();
+    assert!(
+        Engine::open(database.path()).is_err(),
+        "corruption in a replayed segment must fail closed"
+    );
+}
