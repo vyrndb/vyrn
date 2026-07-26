@@ -428,10 +428,17 @@ impl Engine {
         let checkpoint = state;
         let mut redo = Vec::new();
         for (index, segment_id) in segments.iter().copied().enumerate() {
+            // The successor's header states where this segment's records end,
+            // which lets replay skip the bodies of segments retained only for
+            // the archiver.
+            let next_first_lsn = segments
+                .get(index + 1)
+                .map(|next| read_segment_first_lsn(&wal_directory.join(segment_name(*next))))
+                .transpose()?;
             replay_segment(
                 &wal_directory.join(segment_name(segment_id)),
                 segment_id,
-                index + 1 == segments.len(),
+                next_first_lsn,
                 &mut state,
                 &mut mvcc,
                 &mut mvcc_values,
