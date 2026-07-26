@@ -26,10 +26,28 @@ const EXTERNAL_KEY: u8 = 1;
 const EXTERNAL_VALUE: u8 = 2;
 const DEFAULT_CACHE_PAGES: usize = 4_096;
 
+/// How many 4 KiB pages the tree may hold in memory.
+///
+/// The default is 16 MiB, which a tree of any real size outgrows immediately;
+/// past that point every commit's descent and every copy-on-write rewrite starts
+/// missing the cache, and the two of them are most of a commit's time under the
+/// engine write lock.
+fn cache_pages() -> usize {
+    std::env::var("VYRN_PAGE_CACHE_PAGES")
+        .ok()
+        .and_then(|pages| pages.parse().ok())
+        .filter(|pages| *pages > 0)
+        .unwrap_or(DEFAULT_CACHE_PAGES)
+}
+
 type Page = [u8; PAGE_SIZE];
 type VersionedRow = (Vec<u8>, Vec<u8>, u64);
 /// A key's stored value and the revision that wrote it, absent when the key is gone.
 type RevisionedValue = Option<(Vec<u8>, u64)>;
+/// A found key's revision and its value, where the value is present only when
+/// the caller asked for one. Lets one descent serve both the callers that need
+/// the bytes and the callers that only need presence and revision.
+type MaybeValued = Option<(Option<Vec<u8>>, u64)>;
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -197,8 +215,10 @@ impl PageManager {
             // Mark the page as recently used so a burst of writes cannot evict
             // pages that readers are actively hitting.
             cached.referenced = true;
+            crate::profile::PAGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Arc::clone(&cached.page));
         }
+        crate::profile::PAGE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if page_id >= self.page_count {
             return Err(Error::CorruptPage {
                 page_id,
@@ -214,6 +234,7 @@ impl PageManager {
     }
 
     fn append(&mut self, mut page: Page) -> Result<u64> {
+        crate::profile::PAGE_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let page_id = self.page_count;
         write_u64(&mut page, 8, page_id);
         finalize_page(&mut page);
@@ -281,7 +302,7 @@ pub(crate) struct PageTree {
 
 impl PageTree {
     pub(crate) fn open(path: &Path, value_path: &Path, root: u64, len: u64) -> Result<Self> {
-        let pages = PageManager::open(path, DEFAULT_CACHE_PAGES)?;
+        let pages = PageManager::open(path, cache_pages())?;
         let values = ValueLog::open(value_path)?;
         if root != 0 {
             let page = pages.read(root)?;
@@ -388,16 +409,41 @@ impl PageTree {
     pub(crate) fn get_many_with_revision(&self, keys: &[Vec<u8>]) -> Result<Vec<RevisionedValue>> {
         let mut results = vec![None; keys.len()];
         if self.root != 0 && !keys.is_empty() {
-            self.collect_many(self.root, keys, &mut results)?;
+            self.collect_many(self.root, keys, &mut results, true)?;
         }
-        Ok(results)
+        Ok(results
+            .into_iter()
+            .map(|found| found.map(|(value, revision)| (value.unwrap_or_default(), revision)))
+            .collect())
+    }
+
+    /// Reads many keys' revisions in a single ordered sweep, without reading
+    /// their values.
+    ///
+    /// The commit path and transaction validation both need to know whether a
+    /// key is present and at what revision, but not what it holds. Materialising
+    /// the value costs an allocation and copy for an inline value and a value-log
+    /// file read for an external one — on the commit path that read happens under
+    /// the engine write lock, where it blocks every other writer. Only an MVCC
+    /// pre-image genuinely needs the bytes, so the value read is now asked for
+    /// explicitly rather than paid for by every caller.
+    pub(crate) fn get_many_revisions(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<u64>>> {
+        let mut results = vec![None; keys.len()];
+        if self.root != 0 && !keys.is_empty() {
+            self.collect_many(self.root, keys, &mut results, false)?;
+        }
+        Ok(results
+            .into_iter()
+            .map(|found| found.map(|(_, revision)| revision))
+            .collect())
     }
 
     fn collect_many(
         &self,
         page_id: u64,
         keys: &[Vec<u8>],
-        results: &mut [RevisionedValue],
+        results: &mut [MaybeValued],
+        want_values: bool,
     ) -> Result<()> {
         let page = self.pages.read(page_id)?;
         match page[5] {
@@ -411,7 +457,11 @@ impl PageTree {
                     }
                     match entries.get(cursor) {
                         Some(entry) if &entry.key == key => {
-                            results[index] = Some((self.read_value(&entry.value)?, entry.revision));
+                            let value = match want_values {
+                                true => Some(self.read_value(&entry.value)?),
+                                false => None,
+                            };
+                            results[index] = Some((value, entry.revision));
                         }
                         _ => {}
                     }
@@ -433,6 +483,7 @@ impl PageTree {
                             child.page_id,
                             &keys[cursor..end],
                             &mut results[cursor..end],
+                            want_values,
                         )?;
                     }
                     cursor = end;
@@ -1023,16 +1074,30 @@ impl PageTree {
                         min_key: first.key.clone(),
                     });
                 }
-                INTERNAL => current = self.decode_internal(&page, current)?[0].page_id,
+                // The first child's page id is a fixed header field, which is
+                // exactly what `decode_internal` reads to build `children[0]`.
+                // Going through the full decode to reach it allocated a key for
+                // every child of every page on the way down, and because
+                // `decode_internal` calls back into `node_ref` for its own first
+                // child, the two recursed into each other once per level — so a
+                // single decode of a root page walked and re-decoded the whole
+                // leftmost spine.
+                INTERNAL => current = read_u64(page.as_slice(), 24),
                 page_type => return Err(unexpected_type(current, page_type)),
             }
         }
     }
 
     fn write_leaf_level(&mut self, entries: &[Entry]) -> Result<Vec<NodeRef>> {
-        let mut chunks: Vec<Vec<Entry>> = vec![Vec::new()];
+        // Page boundaries are recorded as index ranges into `entries` rather than
+        // by moving the entries into owned per-page vectors. Cloning them there
+        // duplicated every key and value in the page — which `decode_leaf` had
+        // just allocated and `write_leaf` is about to copy into the page anyway —
+        // on a path that runs once per leaf touched by a batch.
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0;
         let mut used = HEADER_SIZE;
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             let size = leaf_cell_size(entry);
             if size > PAGE_SIZE - HEADER_SIZE {
                 return Err(Error::CorruptPage {
@@ -1040,16 +1105,19 @@ impl PageTree {
                     reason: "leaf cell exceeds page size".into(),
                 });
             }
-            if used + size > PAGE_SIZE && !chunks.last().unwrap().is_empty() {
-                chunks.push(Vec::new());
+            // `index > start` is the old "current chunk is not empty" guard: an
+            // entry never starts a new page when the current one holds nothing.
+            if used + size > PAGE_SIZE && index > start {
+                bounds.push((start, index));
+                start = index;
                 used = HEADER_SIZE;
             }
-            chunks.last_mut().unwrap().push(entry.clone());
             used += size;
         }
-        chunks
+        bounds.push((start, entries.len()));
+        bounds
             .into_iter()
-            .map(|chunk| self.write_leaf(&chunk))
+            .map(|(from, to)| self.write_leaf(&entries[from..to]))
             .collect()
     }
 

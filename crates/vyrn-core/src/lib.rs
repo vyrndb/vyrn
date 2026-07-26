@@ -10,6 +10,53 @@ pub mod wal_archive;
 
 pub use wal::Wal;
 
+/// Diagnostic breakdown of the work `apply_batch` does under the engine write
+/// lock.
+///
+/// The server's `vyrn_commit_*` counters report `apply` as one number; this
+/// splits that number into its phases so the dominant one is visible rather than
+/// inferred. Counters are process-wide and free-running: read them either side
+/// of a workload and divide by the request delta.
+pub mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static CHANGE_LOG_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PRESTATE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static PLAN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TREE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MVCC_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REQUESTS: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    /// Deterministic page counts. Unlike a timing on a host that stalls, these
+    /// are exact, so they are the reliable signal for whether a change actually
+    /// reduced the work a commit does.
+    pub static PAGE_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static PAGE_MISSES: AtomicU64 = AtomicU64::new(0);
+    pub static PAGE_APPENDS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn add(counter: &AtomicU64, started: std::time::Instant) {
+        counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Phase totals in nanoseconds, plus the request and batch counts they cover.
+    pub fn snapshot() -> Vec<(&'static str, u64)> {
+        vec![
+            ("change_log", CHANGE_LOG_NS.load(Ordering::Relaxed)),
+            ("prestate", PRESTATE_NS.load(Ordering::Relaxed)),
+            ("plan", PLAN_NS.load(Ordering::Relaxed)),
+            ("tree", TREE_NS.load(Ordering::Relaxed)),
+            ("mvcc", MVCC_NS.load(Ordering::Relaxed)),
+            ("wal", WAL_NS.load(Ordering::Relaxed)),
+            ("__requests", REQUESTS.load(Ordering::Relaxed)),
+            ("__batches", BATCHES.load(Ordering::Relaxed)),
+            ("__page_hits", PAGE_HITS.load(Ordering::Relaxed)),
+            ("__page_misses", PAGE_MISSES.load(Ordering::Relaxed)),
+            ("__page_appends", PAGE_APPENDS.load(Ordering::Relaxed)),
+        ]
+    }
+}
+
 use crc32fast::Hasher;
 use fs2::FileExt;
 use page_tree::PageTree;
@@ -594,9 +641,9 @@ impl Engine {
         }
         let live: Vec<Vec<u8>> = pending.into_iter().collect();
         let mut unresolved = Vec::new();
-        for (key, entry) in live.iter().zip(self.tree.get_many_with_revision(&live)?) {
+        for (key, entry) in live.iter().zip(self.tree.get_many_revisions(&live)?) {
             match entry {
-                Some((_, current)) => {
+                Some(current) => {
                     if current > revision {
                         return Ok(true);
                     }
@@ -611,10 +658,10 @@ impl Engine {
         unresolved.sort();
         Ok(self
             .tree
-            .get_many_with_revision(&unresolved)?
+            .get_many_revisions(&unresolved)?
             .into_iter()
             .flatten()
-            .any(|(_, current)| current > revision))
+            .any(|current| current > revision))
     }
 
     pub fn revisions(&self) -> Result<Vec<(Vec<u8>, u64)>> {
@@ -1130,7 +1177,11 @@ impl Engine {
             }
         }
         let requested = operations.len();
+        profile::REQUESTS.fetch_add(requested as u64, std::sync::atomic::Ordering::Relaxed);
+        profile::BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let phase = std::time::Instant::now();
         let operations = self.with_change_log(operations)?;
+        profile::add(&profile::CHANGE_LOG_NS, phase);
         let original_root = self.tree.root_id();
         let original_len = self.tree.len();
         let original_user_len = self.user_len;
@@ -1154,26 +1205,47 @@ impl Engine {
             }
         }
         let wanted: Vec<Vec<u8>> = wanted.into_iter().collect();
-        let existing: BTreeMap<Vec<u8>, Option<(Vec<u8>, u64)>> = wanted
+        let phase = std::time::Instant::now();
+        // Presence and revision only. The batch needs to know which keys and
+        // tombstones exist, not what they hold, and reading the values here cost
+        // a value-log read per external value while holding the write lock.
+        let existing: BTreeMap<Vec<u8>, Option<u64>> = wanted
             .iter()
             .cloned()
-            .zip(self.tree.get_many_with_revision(&wanted)?)
+            .zip(self.tree.get_many_revisions(&wanted)?)
             .collect();
         let mut previous = BTreeMap::new();
         if oldest_snapshot.is_some() {
+            // Only an active snapshot forces a pre-image, and only the versioned
+            // keys the batch actually writes need one — not their tombstones. So
+            // the value read is a second, narrower sweep rather than a cost every
+            // commit pays for every key it touches.
+            let mut pre_image: BTreeSet<Vec<u8>> = BTreeSet::new();
             for operation in &operations {
                 let key = match operation {
                     BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
                 };
                 if is_versioned_key(key) {
-                    let entry = existing.get(key).and_then(Option::as_ref);
-                    previous.entry(key.clone()).or_insert((
-                        entry.map(|(_, revision)| *revision),
-                        entry.map(|(value, _)| value.clone()),
-                    ));
+                    pre_image.insert(key.clone());
                 }
             }
+            let pre_image: Vec<Vec<u8>> = pre_image.into_iter().collect();
+            for (key, entry) in pre_image
+                .iter()
+                .cloned()
+                .zip(self.tree.get_many_with_revision(&pre_image)?)
+            {
+                previous.insert(
+                    key,
+                    (
+                        entry.as_ref().map(|(_, revision)| *revision),
+                        entry.map(|(value, _)| value),
+                    ),
+                );
+            }
         }
+        profile::add(&profile::PRESTATE_NS, phase);
+        let phase = std::time::Instant::now();
         let mut pending = Vec::with_capacity(operations.len());
         let mut results = Vec::with_capacity(operations.len());
         // Resolve each key's presence first, without writing pages. Whether a
@@ -1258,9 +1330,13 @@ impl Engine {
         if pending.is_empty() {
             return Ok((results, None));
         }
+        profile::add(&profile::PLAN_NS, phase);
+        let phase = std::time::Instant::now();
         let outcome = self.tree.prepare_batch(&mutations)?;
+        profile::add(&profile::TREE_NS, phase);
         self.tree.publish(outcome.root, outcome.len);
         self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
+        let phase = std::time::Instant::now();
         let mut prepared = Vec::with_capacity(pending.len());
         if oldest_snapshot.is_some() {
             for operation in pending.iter().filter(|op| is_versioned_key(&op.key)) {
@@ -1274,6 +1350,8 @@ impl Engine {
                 ));
             }
         }
+        profile::add(&profile::MVCC_NS, phase);
+        let phase = std::time::Instant::now();
         // A deferred barrier only appends here; the caller flushes once it has
         // released the write lock, and must not acknowledge before it returns.
         let deferred = barrier == Barrier::Deferred && self.durability == DurabilityMode::Durable;
@@ -1287,6 +1365,7 @@ impl Engine {
                 // there is no barrier for the caller to wait on.
                 .map(|lsn| deferred.then_some(lsn)),
         };
+        profile::add(&profile::WAL_NS, phase);
         let lsn = match committed {
             Ok(lsn) => lsn,
             Err(error) => {
