@@ -2133,6 +2133,14 @@ fn change_log_sequence(key: &[u8]) -> Result<u64> {
     Ok(u64::from_be_bytes(suffix.try_into().unwrap()))
 }
 
+/// Whether a key is present given the batch's view of the tree.
+///
+/// Every key a batch touches is read before any pages are written, so a missing
+/// entry here means the key was never looked up and cannot be present.
+fn present(overlay: &BTreeMap<Vec<u8>, bool>, key: &[u8]) -> bool {
+    overlay.get(key).copied().unwrap_or(false)
+}
+
 fn tombstone_key(key: &[u8]) -> Vec<u8> {
     let mut tombstone = TOMBSTONE_PREFIX.to_vec();
     tombstone.extend_from_slice(key);
