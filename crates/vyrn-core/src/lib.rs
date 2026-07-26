@@ -1576,8 +1576,18 @@ impl Engine {
         self.mvcc = compacted_mvcc;
         self.rotate_segment()?;
         let wal_directory = self.path.join("wal");
+        // Once pages are checkpointed, an unarchived sealed segment is the only
+        // copy of its LSN range anywhere, so deletion additionally waits for
+        // the archiver's watermark. With no archiver configured the barrier is
+        // absent and behavior is byte-identical to the pre-archiving rule.
+        let archived_through = self
+            .archived_through
+            .as_ref()
+            .map(|watermark| watermark.load(std::sync::atomic::Ordering::Acquire));
         for segment in list_segments(&wal_directory)? {
-            if segment < self.segment_id {
+            if segment < self.segment_id
+                && archived_through.is_none_or(|watermark| segment <= watermark)
+            {
                 fs::remove_file(wal_directory.join(segment_name(segment)))?;
             }
         }
