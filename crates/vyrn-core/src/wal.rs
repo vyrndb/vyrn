@@ -118,3 +118,58 @@ impl Wal {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn wal(path: &std::path::Path) -> Wal {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        Wal::new(file).unwrap()
+    }
+
+    /// One barrier must cover every record appended before it began. This is what
+    /// lets several applied batches share a single `fdatasync`.
+    #[test]
+    fn one_flush_covers_every_earlier_append() {
+        let directory = tempdir().unwrap();
+        let wal = wal(&directory.path().join("segment"));
+        wal.append(b"first", 1).unwrap();
+        wal.append(b"second", 2).unwrap();
+        wal.append(b"third", 3).unwrap();
+        assert_eq!(wal.synced(), 0, "appending must not flush");
+
+        wal.sync_through(3).unwrap();
+        assert_eq!(wal.synced(), 3);
+
+        // Earlier waiters are already satisfied, so they must not flush again.
+        wal.sync_through(1).unwrap();
+        wal.sync_through(2).unwrap();
+        assert_eq!(wal.synced(), 3);
+    }
+
+    /// A flush must never report an LSN durable whose record it did not cover.
+    #[test]
+    fn a_later_append_is_not_covered_by_an_earlier_flush() {
+        let directory = tempdir().unwrap();
+        let wal = wal(&directory.path().join("segment"));
+        wal.append(b"first", 1).unwrap();
+        wal.sync_through(1).unwrap();
+        assert_eq!(wal.synced(), 1);
+
+        wal.append(b"second", 2).unwrap();
+        assert_eq!(
+            wal.synced(),
+            1,
+            "the new record is not durable until it is flushed"
+        );
+        wal.sync_through(2).unwrap();
+        assert_eq!(wal.synced(), 2);
+    }
+}
