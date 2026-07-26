@@ -276,3 +276,160 @@ fn last_record_lsn(path: &Path, first_lsn: u64) -> Result<u64> {
     Ok(last)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{backup, Engine};
+    use tempfile::tempdir;
+
+    /// Base at LSN 1 (k1 checkpointed), backup taken with k2 in the active
+    /// segment, then k3/k4 committed and the segment sealed and archived. The
+    /// backup's copy of that segment is a strict byte prefix of the archived
+    /// one.
+    fn seed(database: &Path, backup_file: &Path, archive: &Path) {
+        {
+            let mut engine = Engine::open(database).unwrap();
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.checkpoint().unwrap();
+            engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        }
+        backup::create_backup(database, backup_file).unwrap();
+        {
+            let mut engine = Engine::open(database).unwrap();
+            engine.put(b"k3".to_vec(), b"v3".to_vec()).unwrap();
+            engine.put(b"k4".to_vec(), b"v4".to_vec()).unwrap();
+            engine.rotate_for_archive().unwrap();
+        }
+        wal_archive::archive_pending(&database.join("wal"), archive).unwrap();
+    }
+
+    /// A base backup copies the then-active segment mid-write, so the same id
+    /// exists in both the base and the archive with different lengths; a raw
+    /// full-file compare (or blindly keeping the base copy) would either
+    /// reject every recovery or silently drop the sealed tail.
+    #[test]
+    fn recovers_past_the_backup_through_a_partially_backed_up_segment() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let backup_file = auxiliary.path().join("base.bkp");
+        let archive = auxiliary.path().join("archive");
+        seed(database.path(), &backup_file, &archive);
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+        let shared = crate::segment_name(2);
+        assert!(
+            fs::metadata(target.join("wal").join(&shared))
+                .unwrap()
+                .len()
+                < fs::metadata(archive.join(&shared)).unwrap().len()
+        );
+        let achieved = recover_to(&target, Some(&archive), None, false).unwrap();
+        assert_eq!(achieved, 4);
+        let engine = Engine::open(&target).unwrap();
+        for (key, value) in [
+            (b"k1", b"v1"),
+            (b"k2", b"v2"),
+            (b"k3", b"v3"),
+            (b"k4", b"v4"),
+        ] {
+            assert_eq!(engine.get(key).unwrap(), Some(value.to_vec()));
+        }
+    }
+
+    /// The checkpoint root in the base already contains every commit at or
+    /// below its manifest LSN and redo only rolls forward, so accepting an
+    /// earlier bound would return a database containing commits past the
+    /// requested point while claiming it stopped there.
+    #[test]
+    fn rejects_a_bound_below_the_base_checkpoint() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let backup_file = auxiliary.path().join("base.bkp");
+        let archive = auxiliary.path().join("archive");
+        seed(database.path(), &backup_file, &archive);
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+        let error = recover_to(&target, Some(&archive), Some(0), false).unwrap_err();
+        assert!(matches!(error, Error::CorruptBackup(_)));
+    }
+
+    /// A bound past the archive's end cannot be reached; stopping short
+    /// silently would hand back a database missing commits the caller asked
+    /// for, so falling back to the reachable LSN must be an explicit opt-in.
+    #[test]
+    fn rejects_a_bound_beyond_the_archive_unless_partial_is_allowed() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let backup_file = auxiliary.path().join("base.bkp");
+        let archive = auxiliary.path().join("archive");
+        seed(database.path(), &backup_file, &archive);
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+        let error = recover_to(&target, Some(&archive), Some(999), false).unwrap_err();
+        assert!(matches!(error, Error::CorruptBackup(_)));
+        assert_eq!(
+            recover_to(&target, Some(&archive), Some(999), true).unwrap(),
+            4
+        );
+    }
+
+    /// A crash mid-append leaves a torn frame at the active segment's tail —
+    /// a state a plain `Engine::open` repairs by truncation — and
+    /// `create_backup` copies the crashed, never-reopened directory verbatim,
+    /// so the tear survives into the restored base. The trim scan used to be
+    /// strict about framing, which made `recover_to` fail on exactly those
+    /// bytes on every retry, leaving a fully intact backup permanently
+    /// unrecoverable through the recovery path.
+    #[test]
+    fn recovers_a_base_backup_whose_active_segment_has_a_torn_tail() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let backup_file = auxiliary.path().join("base.bkp");
+        {
+            let mut engine = Engine::open(database.path()).unwrap();
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.checkpoint().unwrap();
+            engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+        }
+        // Simulate the crash: 20 bytes of a record header, torn inside the
+        // 45-byte header, appended to the active segment (id 2 after the
+        // checkpoint's rotation).
+        let segment = database.path().join("wal").join(crate::segment_name(2));
+        let mut torn = vec![0u8; 20];
+        torn[0..4].copy_from_slice(b"VTXN");
+        torn[4] = crate::VERSION;
+        let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
+        file.write_all(&torn).unwrap();
+        drop(file);
+        backup::create_backup(database.path(), &backup_file).unwrap();
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+        assert_eq!(recover_to(&target, None, None, false).unwrap(), 2);
+        let engine = Engine::open(&target).unwrap();
+        assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(engine.sequence(), 2);
+    }
+
+    /// Records left on disk past the bound would be replayed by the next
+    /// ordinary open, silently resurrecting the discarded timeline; the trim
+    /// must survive a plain reopen, not just the recovery process's memory.
+    #[test]
+    fn trims_records_past_the_bound_physically() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let backup_file = auxiliary.path().join("base.bkp");
+        let archive = auxiliary.path().join("archive");
+        seed(database.path(), &backup_file, &archive);
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+        assert_eq!(
+            recover_to(&target, Some(&archive), Some(3), false).unwrap(),
+            3
+        );
+        let engine = Engine::open(&target).unwrap();
+        assert_eq!(engine.get(b"k3").unwrap(), Some(b"v3".to_vec()));
+        assert_eq!(engine.get(b"k4").unwrap(), None);
+        assert_eq!(engine.sequence(), 3);
+    }
+}
