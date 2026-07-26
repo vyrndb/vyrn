@@ -186,3 +186,64 @@ pub fn archive_pending(wal_directory: &Path, archive_directory: &Path) -> Result
 
 /// Re-proves every archived byte: index checksum, id contiguity, LSN chain,
 /// and a full re-scan of each segment against its index entry.
+pub fn verify_archive(archive_directory: &Path) -> Result<ArchiveSummary> {
+    let entries = read_index(archive_directory)?;
+    for pair in entries.windows(2) {
+        if pair[1].segment_id != pair[0].segment_id + 1 {
+            return Err(Error::CorruptBackup(format!(
+                "archive is missing segment {} between {} and {}",
+                pair[0].segment_id + 1,
+                pair[0].segment_id,
+                pair[1].segment_id
+            )));
+        }
+        if pair[1].first_lsn != pair[0].last_lsn + 1 {
+            return Err(Error::CorruptBackup(format!(
+                "archive LSN chain breaks between segment {} (ends at {}) and segment {} (starts at {})",
+                pair[0].segment_id, pair[0].last_lsn, pair[1].segment_id, pair[1].first_lsn
+            )));
+        }
+    }
+    for entry in &entries {
+        let bytes = fs::read(archive_directory.join(crate::segment_name(entry.segment_id)))
+            .map_err(|error| {
+                Error::CorruptBackup(format!(
+                    "cannot read archived segment {}: {error}",
+                    entry.segment_id
+                ))
+            })?;
+        let (first_lsn, last_lsn) = scan_segment(entry.segment_id, &bytes).map_err(|error| {
+            Error::CorruptBackup(format!(
+                "archived segment {} failed verification: {error}",
+                entry.segment_id
+            ))
+        })?;
+        if first_lsn != entry.first_lsn
+            || last_lsn != entry.last_lsn
+            || bytes.len() as u64 != entry.byte_len
+            || crate::checksum(&bytes) != entry.crc
+        {
+            return Err(Error::CorruptBackup(format!(
+                "archived segment {} does not match its index entry",
+                entry.segment_id
+            )));
+        }
+    }
+    Ok(ArchiveSummary {
+        segments: entries.len(),
+        first_lsn: entries.first().map_or(0, |entry| entry.first_lsn),
+        last_lsn: entries.last().map_or(0, |entry| entry.last_lsn),
+    })
+}
+
+/// Deletes archived WAL segments with id at most `through` from an offline
+/// database, returning how many were removed.
+///
+/// Takes the database's exclusive LOCK exactly like `backup::create_backup`:
+/// pruning under a live server would race checkpoint's own segment deletions
+/// and the archiver's watermark, so it only runs when nothing else can touch
+/// wal/. Refuses to delete anything the archive has not indexed — once pages
+/// are checkpointed those bytes are the only point-in-time copy of their LSN
+/// range — refuses anything the published checkpoint does not cover, and
+/// never deletes the highest segment, which the next open adopts as its
+/// active file.
