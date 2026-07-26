@@ -93,6 +93,10 @@ struct Args {
         default_value_t = 10_000
     )]
     mvcc_gc_checkpoint_versions: usize,
+    #[arg(long, env = "VYRN_WAL_ARCHIVE_DIR")]
+    wal_archive_dir: Option<PathBuf>,
+    #[arg(long, env = "VYRN_WAL_ARCHIVE_INTERVAL_MS", default_value_t = 5_000)]
+    wal_archive_interval_ms: u64,
 }
 
 struct Metrics {
@@ -378,10 +382,41 @@ async fn main() -> Result<()> {
     if durability == DurabilityMode::Async && args.async_sync_ms == 0 {
         bail!("VYRN_ASYNC_SYNC_MS must be greater than zero in async mode");
     }
+    if let Some(archive_dir) = &args.wal_archive_dir {
+        if args.wal_archive_interval_ms < 100 {
+            bail!("VYRN_WAL_ARCHIVE_INTERVAL_MS must be at least 100");
+        }
+        // The archive must live outside the data directory: backup's file
+        // enumeration is non-recursive, so a nested archive would be silently
+        // excluded from backups yet destroyed by a restore. Both directories
+        // are created up front because canonicalize requires them to exist.
+        std::fs::create_dir_all(&args.data)
+            .with_context(|| format!("failed to create data directory {}", args.data.display()))?;
+        std::fs::create_dir_all(archive_dir).with_context(|| {
+            format!(
+                "failed to create WAL archive directory {}",
+                archive_dir.display()
+            )
+        })?;
+        let data = args.data.canonicalize().context("data directory")?;
+        let archive = archive_dir
+            .canonicalize()
+            .context("WAL archive directory")?;
+        if archive.starts_with(&data) {
+            bail!("VYRN_WAL_ARCHIVE_DIR must not be inside the data directory");
+        }
+    }
+    // The watermark exists before the engine so checkpoints observe the
+    // archiver's progress from the very first deletion decision.
+    let archived_through = args
+        .wal_archive_dir
+        .as_ref()
+        .map(|_| Arc::new(AtomicU64::new(0)));
     let engine = Engine::open_with_options(
         &args.data,
         EngineOptions {
             durability,
+            archived_through: archived_through.clone(),
             ..EngineOptions::default()
         },
     )
