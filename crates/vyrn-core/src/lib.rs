@@ -1609,6 +1609,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Seals the active WAL segment so the archiver can copy it out.
+    ///
+    /// The size trigger alone bounds archive lag by bytes, which on a low-write
+    /// database can mean days of committed data sitting in one open segment;
+    /// calling this on a timer bounds the loss window by time instead. A no-op
+    /// when the active segment holds no records, so an idle database does not
+    /// accumulate empty segments.
+    pub fn rotate_for_archive(&mut self) -> Result<()> {
+        self.ensure_healthy()?;
+        if self.wal_len <= SEGMENT_HEADER_LEN as u64 {
+            return Ok(());
+        }
+        self.rotate_segment()
+    }
+
     pub fn stats(&self) -> Result<EngineStats> {
         self.ensure_healthy()?;
         Ok(EngineStats {
