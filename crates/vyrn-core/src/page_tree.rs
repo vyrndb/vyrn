@@ -379,7 +379,72 @@ impl PageTree {
             .map(|entry| entry.map(|(_, revision)| revision))
     }
 
-    fn get_with_revision(&self, key: &[u8]) -> Result<Option<(Vec<u8>, u64)>> {
+    /// Reads many keys' values and revisions in a single ordered sweep.
+    ///
+    /// `keys` must be sorted and deduplicated. Results are returned positionally.
+    /// One descent shared across the batch reads each internal page once instead
+    /// of once per key, which matters on the commit path where a batch has to know
+    /// the prior state of every key it touches.
+    pub(crate) fn get_many_with_revision(&self, keys: &[Vec<u8>]) -> Result<Vec<RevisionedValue>> {
+        let mut results = vec![None; keys.len()];
+        if self.root != 0 && !keys.is_empty() {
+            self.collect_many(self.root, keys, &mut results)?;
+        }
+        Ok(results)
+    }
+
+    fn collect_many(
+        &self,
+        page_id: u64,
+        keys: &[Vec<u8>],
+        results: &mut [RevisionedValue],
+    ) -> Result<()> {
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => {
+                let entries = self.decode_leaf(&page, page_id)?;
+                // Both sides are sorted, so a merge walk finds every hit in one pass.
+                let mut cursor = 0;
+                for (index, key) in keys.iter().enumerate() {
+                    while cursor < entries.len() && &entries[cursor].key < key {
+                        cursor += 1;
+                    }
+                    match entries.get(cursor) {
+                        Some(entry) if &entry.key == key => {
+                            results[index] = Some((self.read_value(&entry.value)?, entry.revision));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                let mut cursor = 0;
+                for (index, child) in children.iter().enumerate() {
+                    let end = match children.get(index + 1) {
+                        Some(next) => {
+                            cursor + keys[cursor..].partition_point(|key| key < &next.min_key)
+                        }
+                        None => keys.len(),
+                    };
+                    if end > cursor {
+                        self.collect_many(
+                            child.page_id,
+                            &keys[cursor..end],
+                            &mut results[cursor..end],
+                        )?;
+                    }
+                    cursor = end;
+                }
+                Ok(())
+            }
+            page_type => Err(unexpected_type(page_id, page_type)),
+        }
+    }
+
+    /// Reads a key's value and revision in one descent.
+    pub(crate) fn get_with_revision(&self, key: &[u8]) -> Result<RevisionedValue> {
         if self.root == 0 {
             return Ok(None);
         }
