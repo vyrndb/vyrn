@@ -2046,6 +2046,83 @@ fn replay_segment(
     Ok(())
 }
 
+/// Byte offset of the first record in a segment whose LSN exceeds `bound`, or
+/// `None` when every record is at or below it.
+///
+/// Point-in-time restore truncates a copied segment at this offset so replay
+/// stops exactly at the requested LSN; record bodies are left unverified here
+/// because replay re-validates every byte it applies.
+///
+/// A frame that cannot be complete — a partial header, damaged header magic,
+/// or a declared length past end of file — is returned as the truncation
+/// point rather than an error. The trimmed segment is (or becomes) the last
+/// segment of the log, the only one allowed a torn tail, and replay would
+/// truncate exactly the same bytes; a base backup of a database that crashed
+/// mid-append carries such a tail verbatim, so failing on it would make
+/// recovery from that backup deterministically impossible while a plain open
+/// of the same tree succeeds. Truncating a genuinely rotten mid-segment frame
+/// is caught instead by `recover_to`'s replay-reached-the-bound check.
+pub(crate) fn scan_to_lsn(path: &Path, segment_id: u64, bound: u64) -> Result<Option<u64>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < SEGMENT_HEADER_LEN as u64 {
+        return Err(corrupt(segment_id, 0, "incomplete segment header"));
+    }
+    let mut header = [0; SEGMENT_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if &header[0..4] != SEGMENT_MAGIC
+        || header[4] != VERSION
+        || read_u64(&header, 8) != segment_id
+        || checksum(&header[0..24]) != read_u32(&header, 24)
+    {
+        return Err(corrupt(segment_id, 0, "invalid segment header"));
+    }
+    let mut offset = SEGMENT_HEADER_LEN as u64;
+    while offset < file_len {
+        if file_len - offset < RECORD_HEADER_LEN as u64 {
+            return Ok(Some(offset));
+        }
+        let mut record_header = [0; RECORD_HEADER_LEN];
+        file.read_exact(&mut record_header)?;
+        if &record_header[0..4] != RECORD_MAGIC || record_header[4] != VERSION {
+            return Ok(Some(offset));
+        }
+        if read_u64(&record_header, 5) > bound {
+            return Ok(Some(offset));
+        }
+        let payload_len = read_u32(&record_header, 17) as usize;
+        let Some(total_len) = RECORD_HEADER_LEN
+            .checked_add(payload_len)
+            .and_then(|size| size.checked_add(RECORD_FOOTER_LEN))
+        else {
+            return Ok(Some(offset));
+        };
+        if total_len as u64 > file_len - offset {
+            return Ok(Some(offset));
+        }
+        file.seek(SeekFrom::Current((payload_len + RECORD_FOOTER_LEN) as i64))?;
+        offset += total_len as u64;
+    }
+    Ok(None)
+}
+
+/// Reads and validates a segment's 32-byte header, returning its first LSN.
+///
+/// Recovery consults a successor's header to decide whether the segment before
+/// it is semantically dead without paying to scan the dead segment's body.
+fn read_segment_first_lsn(path: &Path) -> Result<u64> {
+    let mut file = File::open(path)?;
+    let mut header = [0; SEGMENT_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    if &header[0..4] != SEGMENT_MAGIC
+        || header[4] != VERSION
+        || checksum(&header[0..24]) != read_u32(&header, 24)
+    {
+        return Err(corrupt(read_u64(&header, 8), 0, "invalid segment header"));
+    }
+    Ok(read_u64(&header, 16))
+}
+
 fn truncate_or_corrupt(file: &mut File, is_last: bool, segment: u64, offset: u64) -> Result<()> {
     if !is_last {
         return Err(corrupt(
@@ -2198,6 +2275,20 @@ fn read_manifest(path: &Path) -> Result<Option<TreeState>> {
         root: read_u64(&bytes, 24),
         len: read_u64(&bytes, 32),
     }))
+}
+
+/// The LSN recorded in a database's published checkpoint manifest.
+///
+/// Point-in-time tooling needs the replay floor of a data directory it does
+/// not own, so this reads CURRENT directly instead of opening an engine and
+/// taking the process lock.
+pub fn manifest_lsn(path: impl AsRef<Path>) -> Result<u64> {
+    match read_manifest(path.as_ref())? {
+        Some(state) => Ok(state.lsn),
+        None => Err(Error::CorruptManifest(
+            "database has no CURRENT manifest".into(),
+        )),
+    }
 }
 
 fn write_manifest(path: &Path, state: TreeState) -> Result<()> {
