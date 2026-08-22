@@ -16,7 +16,10 @@
 use bytes::{BufMut, BytesMut};
 use proptest::prelude::*;
 use tokio_util::codec::{Decoder, Encoder};
-use vyrn_protocol::{DocumentIndex, Envelope, ErrorCode, Message, VyrnCodec, MAX_SCAN_LIMIT};
+use vyrn_protocol::{
+    CodecError, DocumentIndex, Envelope, ErrorCode, Message, VyrnCodec, MAX_SCAN_LIMIT,
+    PROTOCOL_VERSION,
+};
 
 /// Wraps `body` in the length-delimited framing the codec expects.
 fn frame(body: &[u8]) -> BytesMut {
@@ -113,6 +116,24 @@ fn seed_messages() -> Vec<Message> {
             id: "user_1".into(),
             document: br#"{"email":"a@example.com"}"#.to_vec(),
         },
+        // The remaining document kinds also read names, ids or counts from the
+        // wire; without seeds here the mutation and truncation tests below
+        // would never reach those branches.
+        Message::GetDocument {
+            collection: "users".into(),
+            id: "user_1".into(),
+        },
+        Message::DeleteDocument {
+            collection: "users".into(),
+            id: "user_1".into(),
+        },
+        Message::ListDocuments {
+            collection: "users".into(),
+            limit: 25,
+        },
+        Message::SubscribeCollection {
+            collection: "users".into(),
+        },
         Message::QueryDocuments {
             collection: "users".into(),
             field: "email".into(),
@@ -130,6 +151,11 @@ fn seed_messages() -> Vec<Message> {
         },
         Message::Documents {
             documents: vec![("user_1".into(), b"{}".to_vec())],
+        },
+        Message::DocumentChange {
+            sequence: 9,
+            id: "user_1".into(),
+            document: Some(b"{}".to_vec()),
         },
         Message::CursorChange {
             cursor: "000000000000000000000007".into(),
@@ -194,7 +220,7 @@ proptest! {
         body in prop::collection::vec(any::<u8>(), 0..512),
     ) {
         let mut input = BytesMut::new();
-        input.put_u16(6);
+        input.put_u16(PROTOCOL_VERSION);
         input.put_u64(1);
         input.put_u8(kind);
         input.extend_from_slice(&body);
@@ -215,26 +241,43 @@ proptest! {
         let encoded = encode(seed);
         // Skip the 4-byte length prefix: the framing layer is not under test
         // here, and corrupting it only ever yields a short or oversized frame.
-        let body = &encoded[4..];
+        // Skip the 2 version bytes too: the decoder refuses a foreign version
+        // outright before looking at the body (the dedicated tests cover that),
+        // so mutating them proves nothing about the parsers underneath.
+        let body = &encoded[4 + 2..];
         let position = index.index(body.len());
         let mut mutated = body.to_vec();
         mutated[position] = replacement;
         decode_without_panic(&mutated);
     }
 
-    /// Every truncation of a valid frame.
+    /// Every truncation of a valid frame must be reported as truncated.
     ///
-    /// A short read must be reported as truncated, never treated as a complete
-    /// message with a garbage tail.
+    /// A short read must never be treated as a complete message with a garbage
+    /// tail. The slice is reframed with a matching length prefix, so the framing
+    /// layer sees a whole frame and the rejection must come from the body
+    /// parser catching the mid-field cut. All seeds are ASCII, which keeps the
+    /// assertion exact: a cut can never land inside a multi-byte character and
+    /// masquerade as invalid UTF-8 instead of truncation.
     #[test]
     fn every_truncation_of_a_valid_frame_is_rejected(
         seed in prop::sample::select(seed_messages()),
         index in any::<prop::sample::Index>(),
     ) {
-        let encoded = encode(seed);
+        let encoded = encode(seed.clone());
         let body = &encoded[4..];
         let length = index.index(body.len());
-        decode_without_panic(&body[..length]);
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&body[..length]);
+        let result = codec.decode(&mut bytes);
+        prop_assert!(
+            matches!(
+                result,
+                Err(CodecError::Malformed("truncated message"))
+            ),
+            "a {length}-byte prefix of a {}-byte {seed:?} decoded as {result:?}",
+            body.len()
+        );
     }
 
     /// A wire-supplied count must not drive an allocation on its own.
@@ -246,14 +289,22 @@ proptest! {
     #[test]
     fn an_oversized_count_is_rejected_before_allocating(
         kind in prop::sample::select(vec![10_u8, 28, 29, 30, 31, 42]),
-        count in (MAX_SCAN_LIMIT + 1)..=u32::MAX,
+        // The first branch pins the smallest rejected value: a range alone would
+        // generate it with probability zero, yet that exact boundary is the one
+        // an off-by-one in the decoder's check would let through.
+        count in prop_oneof![
+            Just(MAX_SCAN_LIMIT + 1),
+            (MAX_SCAN_LIMIT + 1)..=u32::MAX,
+        ],
     ) {
         let mut input = BytesMut::new();
-        input.put_u16(6);
+        input.put_u16(PROTOCOL_VERSION);
         input.put_u64(1);
         input.put_u8(kind);
-        // Kinds 31 and 42 read a collection name before their count.
-        if matches!(kind, 31 | 42) {
+        // Only CreateCollection (31) reads a collection name before its count;
+        // Documents (42) goes straight to the count despite carrying names per
+        // element.
+        if kind == 31 {
             input.put_u32(5);
             input.extend_from_slice(b"users");
         }
@@ -436,4 +487,454 @@ fn a_frame_delivered_byte_by_byte_yields_once_when_complete() {
     }
 
     assert!(buffer.is_empty(), "the frame's bytes should be consumed");
+}
+
+/// A frame carrying bytes beyond the message it declares must be refused.
+///
+/// After a message parses, the decoder must have consumed the frame exactly.
+/// Leftovers mean the sender's framing disagrees with ours about where the
+/// message ends; ignoring them would let one connection desynchronize silently
+/// instead of failing visibly. The extra byte is placed inside the frame (the
+/// length prefix counts it), which is the only placement that exercises this.
+#[test]
+fn trailing_bytes_after_a_complete_message_are_rejected() {
+    let encoded = encode(Message::Get { key: vec![1] });
+    let body = &encoded[4..];
+    let mut padded = Vec::with_capacity(body.len() + 1);
+    padded.extend_from_slice(body);
+    padded.push(0);
+
+    let mut codec = VyrnCodec::default();
+    let mut bytes = frame(&padded);
+    assert!(matches!(
+        codec.decode(&mut bytes),
+        Err(CodecError::Malformed("trailing bytes"))
+    ));
+}
+
+/// Builds one envelope body for `kind` declaring `count` elements.
+///
+/// `element` is the shortest legal encoding of one element (`None` skips them
+/// entirely, which is enough for the rejected cases: the count is checked
+/// before any element is read). Only kind 31 reads a collection name ahead of
+/// its count; Documents (42) carries no name, and feeding it one would shift
+/// every later field rather than exercise the count check.
+fn counted_body(kind: u8, count: u32, element: Option<&[u8]>) -> BytesMut {
+    let mut input = BytesMut::new();
+    input.put_u16(PROTOCOL_VERSION);
+    input.put_u64(1);
+    input.put_u8(kind);
+    if kind == 31 {
+        input.put_u32(5);
+        input.extend_from_slice(b"users");
+    }
+    input.put_u32(count);
+    for _ in 0..count {
+        input.extend_from_slice(element.unwrap_or(&[]));
+    }
+    input
+}
+
+/// The shortest legal element for each count-bearing kind.
+fn smallest_element(kind: u8) -> &'static [u8] {
+    match kind {
+        // A row is a key and a value; a document is an id and a body.
+        10 | 42 => &[0, 0, 0, 0, 0, 0, 0, 0],
+        // An optional value carries only its presence byte when absent.
+        30 => &[0],
+        // Keys are single length-prefixed fields.
+        _ => &[0, 0, 0, 0],
+    }
+}
+
+/// Zero is a legal count for every collection kind.
+///
+/// An empty result answers itself and must not cost the sender its connection;
+/// multi-get (29) is included deliberately, because the decoder used to be the
+/// one branch that refused emptiness even though the encoder allowed it.
+#[test]
+fn counts_of_zero_are_accepted_for_every_collection_kind() {
+    for (kind, empty) in [
+        (10_u8, Message::Rows { rows: Vec::new() }),
+        (28, Message::Keys { keys: Vec::new() }),
+        (29, Message::MultiGet { keys: Vec::new() }),
+        (30, Message::Values { values: Vec::new() }),
+        (
+            42,
+            Message::Documents {
+                documents: Vec::new(),
+            },
+        ),
+    ] {
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&counted_body(kind, 0, None));
+        let decoded = codec
+            .decode(&mut bytes)
+            .unwrap_or_else(|error| panic!("kind {kind} rejected an empty collection: {error}"))
+            .expect("the frame was complete");
+        assert_eq!(decoded.message, empty, "kind {kind}");
+    }
+}
+
+/// Counts sit exactly on their ceiling in both directions.
+///
+/// `MAX_SCAN_LIMIT` itself is legal — this is where a scan limit of exactly
+/// [`MAX_SCAN_LIMIT`] must still work — and one more than it must be refused
+/// before any element is read. The boundary value deserves its own case: a
+/// range starting just above it never actually generates it.
+#[test]
+fn counts_exactly_at_the_scan_limit_are_accepted_and_one_more_is_not() {
+    let kinds = [10_u8, 28, 29, 30, 42];
+
+    for kind in kinds {
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&counted_body(
+            kind,
+            MAX_SCAN_LIMIT,
+            Some(smallest_element(kind)),
+        ));
+        let decoded = codec
+            .decode(&mut bytes)
+            .unwrap_or_else(|error| panic!("kind {kind} rejected the exact scan limit: {error}"))
+            .expect("the frame was complete");
+        let accepted = match decoded.message {
+            Message::Rows { rows } => rows.len(),
+            Message::Keys { keys } => keys.len(),
+            Message::MultiGet { keys } => keys.len(),
+            Message::Values { values } => values.len(),
+            Message::Documents { documents } => documents.len(),
+            other => panic!("kind {kind} decoded as {other:?}"),
+        };
+        assert_eq!(accepted, MAX_SCAN_LIMIT as usize, "kind {kind}");
+    }
+
+    for kind in kinds {
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&counted_body(kind, MAX_SCAN_LIMIT + 1, None));
+        assert!(
+            codec.decode(&mut bytes).is_err(),
+            "kind {kind} accepted a count one past the scan limit"
+        );
+    }
+}
+
+/// Cursors are bounded at exactly 64 bytes.
+///
+/// 64 bytes still round-trips through the encoder; 65 must be refused by the
+/// decoder, and is built by hand because the encoder now rejects it locally.
+#[test]
+fn cursors_are_bounded_at_sixty_four_bytes() {
+    let cursor = "c".repeat(64);
+    let message = Message::SubscribeFrom {
+        prefix: b"k".to_vec(),
+        cursor: Some(cursor.clone()),
+    };
+    let mut codec = VyrnCodec::default();
+    let mut bytes = encode(message.clone());
+    assert_eq!(codec.decode(&mut bytes).unwrap().unwrap().message, message);
+
+    let mut input = BytesMut::new();
+    input.put_u16(PROTOCOL_VERSION);
+    input.put_u64(1);
+    input.put_u8(45); // SubscribeFrom
+    input.put_u32(1);
+    input.extend_from_slice(b"k");
+    input.put_u8(1); // cursor present
+    input.put_u32(65);
+    input.extend_from_slice(&[b'c'; 65]);
+    let mut codec = VyrnCodec::default();
+    let mut bytes = frame(&input);
+    assert!(
+        matches!(
+            codec.decode(&mut bytes),
+            Err(CodecError::Malformed("byte field exceeds limit"))
+        ),
+        "a 65-byte cursor must be refused"
+    );
+}
+
+/// Authentication fields are bounded at exactly 4 KiB.
+#[test]
+fn authentication_fields_are_bounded_at_four_kib() {
+    let username = "u".repeat(4096);
+    let message = Message::Authenticate {
+        username: username.clone(),
+        password: String::new(),
+        database: String::new(),
+    };
+    let mut codec = VyrnCodec::default();
+    let mut bytes = encode(message.clone());
+    assert_eq!(codec.decode(&mut bytes).unwrap().unwrap().message, message);
+
+    let mut input = BytesMut::new();
+    input.put_u16(PROTOCOL_VERSION);
+    input.put_u64(1);
+    input.put_u8(1); // Authenticate, username first
+    input.put_u32(4097);
+    input.extend_from_slice(&[b'u'; 4097]);
+    let mut codec = VyrnCodec::default();
+    let mut bytes = frame(&input);
+    assert!(
+        matches!(
+            codec.decode(&mut bytes),
+            Err(CodecError::Malformed("byte field exceeds limit"))
+        ),
+        "a 4097-byte username must be refused"
+    );
+}
+
+/// Collection names are bounded at exactly 4 KiB.
+#[test]
+fn document_names_are_bounded_at_four_kib() {
+    let collection = "c".repeat(4096);
+    let message = Message::SubscribeCollection {
+        collection: collection.clone(),
+    };
+    let mut codec = VyrnCodec::default();
+    let mut bytes = encode(message.clone());
+    assert_eq!(codec.decode(&mut bytes).unwrap().unwrap().message, message);
+
+    let mut input = BytesMut::new();
+    input.put_u16(PROTOCOL_VERSION);
+    input.put_u64(1);
+    input.put_u8(32); // GetDocument, collection name first
+    input.put_u32(4097);
+    input.extend_from_slice(&[b'c'; 4097]);
+    let mut codec = VyrnCodec::default();
+    let mut bytes = frame(&input);
+    assert!(
+        matches!(
+            codec.decode(&mut bytes),
+            Err(CodecError::Malformed("byte field exceeds limit"))
+        ),
+        "a 4097-byte collection name must be refused"
+    );
+}
+
+/// Error messages are bounded at exactly 64 KiB.
+#[test]
+fn error_messages_are_bounded_at_sixtyfour_kib() {
+    let text = "m".repeat(64 * 1024);
+    let message = Message::Error {
+        code: ErrorCode::Internal,
+        message: text.clone(),
+    };
+    let mut codec = VyrnCodec::default();
+    let mut bytes = encode(message.clone());
+    assert_eq!(codec.decode(&mut bytes).unwrap().unwrap().message, message);
+
+    let mut input = BytesMut::new();
+    input.put_u16(PROTOCOL_VERSION);
+    input.put_u64(1);
+    input.put_u8(11); // Error
+    input.put_u8(5); // Internal
+    input.put_u32((64 * 1024 + 1) as u32);
+    input.extend_from_slice(&[b'm'; 64 * 1024 + 1]);
+    let mut codec = VyrnCodec::default();
+    let mut bytes = frame(&input);
+    assert!(
+        matches!(
+            codec.decode(&mut bytes),
+            Err(CodecError::Malformed("byte field exceeds limit"))
+        ),
+        "an error message one byte over 64 KiB must be refused"
+    );
+}
+
+/// Invalid UTF-8 in every string-bearing kind must be named as such.
+///
+/// Random mutation almost never produces a well-formed frame whose only defect
+/// is a broken character, so each string-bearing kind is targeted directly: one
+/// byte of a known string field is replaced with `0xff`, leaving every length
+/// prefix intact so the UTF-8 check is the only check that can fire.
+#[test]
+fn invalid_utf8_in_each_string_field_is_rejected() {
+    for (seed, sentinel) in [
+        (
+            Message::Authenticate {
+                username: "suser".into(),
+                password: "spass".into(),
+                database: "sdb".into(),
+            },
+            "suser",
+        ),
+        (
+            Message::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "smessage".into(),
+            },
+            "smessage",
+        ),
+        (
+            Message::CreateCollection {
+                collection: "scollection".into(),
+                indexes: vec![DocumentIndex {
+                    field: "sfield".into(),
+                    unique: false,
+                }],
+            },
+            "scollection",
+        ),
+        (
+            Message::GetDocument {
+                collection: "scollection".into(),
+                id: "sid7".into(),
+            },
+            "scollection",
+        ),
+        (
+            Message::PutDocument {
+                collection: "scollection".into(),
+                id: "sid7".into(),
+                document: b"k".to_vec(),
+            },
+            "scollection",
+        ),
+        (
+            Message::DeleteDocument {
+                collection: "scollection".into(),
+                id: "sid7".into(),
+            },
+            "scollection",
+        ),
+        (
+            Message::ListDocuments {
+                collection: "scollection".into(),
+                limit: 5,
+            },
+            "scollection",
+        ),
+        (
+            Message::QueryDocuments {
+                collection: "scollection".into(),
+                field: "sfield".into(),
+                value: b"k".to_vec(),
+                limit: 5,
+            },
+            "scollection",
+        ),
+        (
+            Message::SubscribeCollection {
+                collection: "scollection".into(),
+            },
+            "scollection",
+        ),
+        (
+            Message::Documents {
+                documents: vec![("sdocid".into(), b"k".to_vec())],
+            },
+            "sdocid",
+        ),
+        (
+            Message::DocumentChange {
+                sequence: 1,
+                id: "sid7".into(),
+                document: None,
+            },
+            "sid7",
+        ),
+        (
+            Message::SubscribeFrom {
+                prefix: b"k".to_vec(),
+                cursor: Some("scursor7".into()),
+            },
+            "scursor7",
+        ),
+        (
+            Message::SubscribeCollectionFrom {
+                collection: "scollection".into(),
+                cursor: Some("scursor7".into()),
+            },
+            "scollection",
+        ),
+        (
+            Message::CursorChange {
+                cursor: "scursor7".into(),
+                key: b"k".to_vec(),
+                value: None,
+            },
+            "scursor7",
+        ),
+        (
+            Message::CursorDocumentChange {
+                cursor: "scursor7".into(),
+                collection: "scollection".into(),
+                id: "sid7".into(),
+                document: None,
+            },
+            "scursor7",
+        ),
+        (
+            Message::Caught {
+                cursor: "scursor7".into(),
+            },
+            "scursor7",
+        ),
+        (
+            Message::ReplicaHello {
+                database: "sdatabase".into(),
+                last_lsn: 1,
+                replica_id: "sreplica7".into(),
+            },
+            "sdatabase",
+        ),
+        (
+            Message::ReplicaDiverged {
+                reason: "sreason".into(),
+            },
+            "sreason",
+        ),
+    ] {
+        let encoded = encode(seed);
+        let body = &encoded[4..];
+        let position = body
+            .windows(sentinel.len())
+            .position(|window| window == sentinel.as_bytes())
+            .unwrap_or_else(|| panic!("{sentinel:?} missing from its own encoding"));
+        let mut corrupted = body.to_vec();
+        corrupted[position] = 0xff;
+
+        let kind = corrupted[2 + 8];
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&corrupted);
+        match codec.decode(&mut bytes) {
+            Err(CodecError::Malformed("string is not UTF-8")) => {}
+            other => panic!("kind {kind}: expected a UTF-8 rejection, got {other:?}"),
+        }
+    }
+}
+
+/// The pre-auth frame ceiling is configurable without touching the default.
+///
+/// An unauthenticated peer can make a server buffer up to the frame ceiling per
+/// connection before presenting any credential, so a server wants a smaller
+/// ceiling for the handshake. Exactly at the reduced limit is accepted; one
+/// byte over is refused in both directions; the default codec is unaffected.
+#[test]
+fn a_reduced_frame_limit_is_enforced_in_both_directions() {
+    // 11 header + 4 length prefix + 49 key = a 64-byte frame body.
+    let exact = Envelope::new(1, Message::Get { key: vec![7; 49] });
+    let over = Envelope::new(2, Message::Get { key: vec![7; 50] });
+
+    let mut restricted = VyrnCodec::builder().max_frame_length(64).build();
+
+    let mut bytes = BytesMut::new();
+    restricted.encode(exact.clone(), &mut bytes).unwrap();
+    assert_eq!(restricted.decode(&mut bytes).unwrap(), Some(exact));
+
+    // One byte over is refused before anything is buffered, on send...
+    let mut bytes = BytesMut::new();
+    assert!(
+        restricted.encode(over.clone(), &mut bytes).is_err(),
+        "encoding past the reduced ceiling must fail locally"
+    );
+
+    // ...and on receive.
+    let mut incoming = encode(Message::Get { key: vec![7; 50] });
+    assert!(restricted.decode(&mut incoming).is_err());
+
+    // The default ceiling is untouched: the same frame decodes fine there.
+    let mut unrestricted = VyrnCodec::default();
+    let mut incoming = encode(Message::Get { key: vec![7; 50] });
+    assert!(unrestricted.decode(&mut incoming).unwrap().is_some());
 }

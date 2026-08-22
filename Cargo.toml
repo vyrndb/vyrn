@@ -15,6 +15,15 @@ edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.87"
 
+# Shipped binaries keep overflow checks on: the storage layer is u64-heavy
+# (LSNs, page ids, WAL offsets) and a silent wraparound there is corruption,
+# not a perf trade worth taking. LTO/codegen-units so release numbers match
+# what benchmarks measure.
+[profile.release]
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 anyhow = "1.0"
 async-stream = "0.3"

@@ -24,6 +24,14 @@ export type { ErrorCode } from "./protocol.js";
 
 export type VyrnBytes = string | Uint8Array;
 
+/**
+ * Envelopes buffered for a subscriber before the client declares it too slow.
+ * Exceeding this closes the subscription instead of growing without bound, so
+ * a stalled consumer cannot exhaust memory; reconnect and resume from your
+ * last cursor to recover.
+ */
+export const MAX_STREAM_BUFFER = 10_000;
+
 export type JsonValue =
   | null
   | boolean
@@ -237,12 +245,19 @@ export class Transaction extends Operations {
 
 /** A single native connection with document, KV, and transaction APIs. */
 export class Session extends Operations {
+  #transaction: Transaction | null = null;
+
   static async connect(options: ConnectionOptions): Promise<Session> {
     return new Session(await Connection.connect(options));
   }
 
   get closedConnection(): boolean {
     return this.connection.closed;
+  }
+
+  /** True when `begin` has not yet been followed by `commit` or `rollback`. */
+  get transactionActive(): boolean {
+    return this.#transaction !== null && !this.#transaction.finished;
   }
 
   close(): void {
@@ -325,9 +340,23 @@ export class Session extends Operations {
   }
 
   async begin(): Promise<Transaction> {
+    if (this.transactionActive) {
+      throw new VyrnConnectionError("a transaction is already active on this session");
+    }
     const response = await this.connection.call({ type: "begin" });
     if (response.type !== "begun") throw unexpected(response);
-    return new Transaction(this.connection, () => {});
+    this.#transaction = new Transaction(this.connection, () => {});
+    return this.#transaction;
+  }
+
+  /**
+   * Best-effort rollback of an abandoned transaction, used by the pool before
+   * handing the session to its next lessee. Errors propagate so the pool can
+   * retire a session it cannot prove clean.
+   */
+  async rollbackAbandoned(): Promise<void> {
+    const transaction = this.#transaction;
+    if (transaction && !transaction.finished) await transaction.rollback();
   }
 
   /**
@@ -356,19 +385,31 @@ export class Session extends Operations {
   }
 }
 
+/** A queued acquire, settled either by a session or by an error. */
+interface PendingAcquire {
+  resolve: (session: Session) => void;
+  reject: (error: Error) => void;
+}
+
 /**
  * Pooled client for backend servers.
  *
  * Each native connection handles one request at a time, so every call leases a
  * connection for its duration. Concurrent calls use separate connections, up to
- * `maxConnections`; further callers queue until one is returned.
+ * `maxConnections`; further callers queue until one is returned. Dead sessions
+ * are discarded with their capacity reclaimed, so a backend restart cannot
+ * erode the pool, and queued callers are settled instead of waiting forever.
  */
 export class VyrnClient {
   readonly #options: ConnectionOptions;
   readonly #maximum: number;
   readonly #idle: Session[] = [];
-  readonly #waiting: Array<(session: Session) => void> = [];
+  readonly #waiting: PendingAcquire[] = [];
+  /** Sessions that connected successfully and are not yet destroyed. */
   #open = 0;
+  /** Connections still being established; `#open + #connecting <= #maximum`. */
+  #connecting = 0;
+  #pumping = false;
   #closed = false;
 
   constructor(options: PoolOptions) {
@@ -383,55 +424,119 @@ export class VyrnClient {
   /** Verifies credentials and connectivity by opening one connection. */
   async connect(): Promise<void> {
     const session = await this.#acquire();
-    this.#release(session);
+    await this.#release(session);
   }
 
+  /**
+   * Closes every pooled connection. Queued callers are rejected instead of
+   * being left waiting for a session that will never come.
+   */
   async close(): Promise<void> {
     this.#closed = true;
+    for (const waiter of this.#waiting.splice(0)) {
+      waiter.reject(new VyrnConnectionError("client is closed"));
+    }
     while (this.#idle.length > 0) {
-      this.#idle.pop()?.close();
+      this.#destroy(this.#idle.pop() as Session);
     }
   }
 
   async #acquire(): Promise<Session> {
     if (this.#closed) throw new VyrnConnectionError("client is closed");
-    const idle = this.#idle.pop();
-    if (idle && !idle.closedConnection) return idle;
-    if (this.#open < this.#maximum) {
-      this.#open += 1;
-      try {
-        return await Session.connect(this.#options);
-      } catch (error) {
-        this.#open -= 1;
-        throw error;
-      }
+    let idle = this.#idle.pop();
+    while (idle !== undefined) {
+      if (!idle.closedConnection) return idle;
+      // Dead session (backend restart): drop it and reclaim its slot before
+      // opening anything new.
+      this.#destroy(idle);
+      idle = this.#idle.pop();
     }
-    return new Promise<Session>((resolve) => this.#waiting.push(resolve));
+    return new Promise<Session>((resolve, reject) => {
+      this.#waiting.push({ resolve, reject });
+      void this.#pump();
+    });
   }
 
-  #release(session: Session): void {
-    if (session.closedConnection || this.#closed) {
-      this.#open -= 1;
-      session.close();
-      void this.#refill();
+  #destroy(session: Session): void {
+    this.#open -= 1;
+    session.close();
+  }
+
+  async #release(session: Session): Promise<void> {
+    let reusable = !this.#closed && !session.closedConnection;
+    if (reusable && session.transactionActive) {
+      // The lessee abandoned an open transaction. Roll it back so the next
+      // lessee cannot run inside the stale snapshot; if the rollback fails,
+      // the session cannot be proven clean, so retire it instead.
+      try {
+        await session.rollbackAbandoned();
+      } catch {
+        reusable = false;
+      }
+    }
+    // Re-check #closed: close() may have run while the rollback was in flight.
+    if (!reusable || this.#closed || session.closedConnection) {
+      this.#destroy(session);
+      void this.#pump();
       return;
     }
     const next = this.#waiting.shift();
     if (next) {
-      next(session);
+      next.resolve(session);
       return;
     }
     this.#idle.push(session);
   }
 
-  async #refill(): Promise<void> {
-    const next = this.#waiting.shift();
-    if (!next) return;
+  /**
+   * Hands queued callers idle sessions, replaces dead ones, and opens new
+   * connections while capacity remains. Single-flighted so overlapping
+   * triggers cannot overshoot `maxConnections`.
+   */
+  async #pump(): Promise<void> {
+    if (this.#pumping) return;
+    this.#pumping = true;
     try {
-      this.#open += 1;
-      next(await Session.connect(this.#options));
-    } catch {
-      this.#open -= 1;
+      while (!this.#closed && this.#waiting.length > 0) {
+        const idle = this.#idle.pop();
+        if (idle !== undefined) {
+          if (!idle.closedConnection) {
+            (this.#waiting.shift() as PendingAcquire).resolve(idle);
+            continue;
+          }
+          this.#destroy(idle);
+          continue;
+        }
+        if (this.#open + this.#connecting >= this.#maximum) return;
+        this.#connecting += 1;
+        let session: Session;
+        try {
+          session = await Session.connect(this.#options);
+        } catch (error) {
+          this.#connecting -= 1;
+          // Settle the head waiter so nobody queues forever behind a backend
+          // that refuses connections; the rest stay queued until the next
+          // release or acquire retries.
+          (this.#waiting.shift() as PendingAcquire | undefined)?.reject(
+            error instanceof Error ? error : new VyrnConnectionError(String(error)),
+          );
+          return;
+        }
+        this.#connecting -= 1;
+        this.#open += 1;
+        if (this.#closed) {
+          this.#destroy(session);
+          return;
+        }
+        const waiter = this.#waiting.shift();
+        if (waiter === undefined) {
+          this.#idle.push(session);
+          continue;
+        }
+        waiter.resolve(session);
+      }
+    } finally {
+      this.#pumping = false;
     }
   }
 
@@ -441,7 +546,7 @@ export class VyrnClient {
     try {
       return await body(session);
     } finally {
-      this.#release(session);
+      await this.#release(session);
     }
   }
 
@@ -540,21 +645,49 @@ export class VyrnClient {
   }
 }
 
+/**
+ * Installs a buffering stream handler before the subscribe message is sent.
+ *
+ * The server writes the ack and the first replayed events back-to-back, so
+ * both frames routinely arrive in a single socket read. Without a handler
+ * already registered, the backlog frames land before `streamEnvelopes` starts
+ * and are treated as unsolicited traffic, tearing the connection down. The
+ * buffered envelopes are handed to `streamEnvelopes` once it begins, which
+ * preserves delivery order.
+ */
+function bufferStream(connection: Connection): Envelope[] {
+  const buffered: Envelope[] = [];
+  connection.stream((envelope) => buffered.push(envelope), () => {});
+  return buffered;
+}
+
 async function* streamEnvelopes(
   connection: Connection,
   signal?: AbortSignal,
+  buffered: Envelope[] = [],
 ): AsyncGenerator<Envelope> {
-  const queue: Envelope[] = [];
+  const queue = buffered;
   let notify: (() => void) | null = null;
   let failure: Error | null = null;
 
   connection.stream(
     (envelope) => {
+      if (failure !== null) return;
+      if (queue.length >= MAX_STREAM_BUFFER) {
+        // The consumer stopped keeping up. Failing beats buffering without
+        // bound: a large retained log would otherwise exhaust memory.
+        failure = new VyrnConnectionError(
+          `subscriber fell more than ${MAX_STREAM_BUFFER} events behind; the subscription is closing`,
+        );
+        connection.close();
+        notify?.();
+        return;
+      }
       queue.push(envelope);
       notify?.();
     },
     (error) => {
-      failure = error;
+      if (failure === null) failure = error;
       notify?.();
     },
   );
@@ -597,6 +730,7 @@ export async function* subscribeFrom(
   signal?: AbortSignal,
 ): AsyncGenerator<VyrnStreamEvent> {
   const connection = await Connection.connect(options);
+  const buffered = bufferStream(connection);
   const response = await connection.call({
     type: "subscribeFrom",
     prefix: bytes(prefix),
@@ -606,7 +740,7 @@ export async function* subscribeFrom(
     connection.close();
     throw unexpected(response);
   }
-  yield* cursorEvents(connection, signal);
+  yield* cursorEvents(connection, signal, buffered);
 }
 
 /** Subscribes to document changes in one collection with durable cursors. */
@@ -617,6 +751,7 @@ export async function* subscribeCollectionFrom<T = JsonValue>(
   signal?: AbortSignal,
 ): AsyncGenerator<VyrnStreamEvent<T>> {
   const connection = await Connection.connect(options);
+  const buffered = bufferStream(connection);
   const response = await connection.call({
     type: "subscribeCollectionFrom",
     collection,
@@ -626,14 +761,15 @@ export async function* subscribeCollectionFrom<T = JsonValue>(
     connection.close();
     throw unexpected(response);
   }
-  yield* cursorEvents<T>(connection, signal);
+  yield* cursorEvents<T>(connection, signal, buffered);
 }
 
 async function* cursorEvents<T = JsonValue>(
   connection: Connection,
   signal?: AbortSignal,
+  buffered: Envelope[] = [],
 ): AsyncGenerator<VyrnStreamEvent<T>> {
-  for await (const envelope of streamEnvelopes(connection, signal)) {
+  for await (const envelope of streamEnvelopes(connection, signal, buffered)) {
     const message = envelope.message;
     if (message.type === "error") throw new VyrnServerError(message.code, message.message);
     if (message.type === "cursorChange") {
@@ -670,12 +806,13 @@ export async function* subscribe(
   signal?: AbortSignal,
 ): AsyncGenerator<VyrnChange> {
   const connection = await Connection.connect(options);
+  const buffered = bufferStream(connection);
   const response = await connection.call({ type: "subscribe", prefix: bytes(prefix) });
   if (response.type !== "subscribed") {
     connection.close();
     throw unexpected(response);
   }
-  for await (const envelope of streamEnvelopes(connection, signal)) {
+  for await (const envelope of streamEnvelopes(connection, signal, buffered)) {
     const message = envelope.message;
     if (message.type === "error") throw new VyrnServerError(message.code, message.message);
     if (message.type !== "change") throw unexpected(message);
@@ -693,12 +830,13 @@ export async function* subscribeCollection<T = JsonValue>(
   signal?: AbortSignal,
 ): AsyncGenerator<VyrnDocumentChange<T>> {
   const connection = await Connection.connect(options);
+  const buffered = bufferStream(connection);
   const response = await connection.call({ type: "subscribeCollection", collection });
   if (response.type !== "collectionSubscribed") {
     connection.close();
     throw unexpected(response);
   }
-  for await (const envelope of streamEnvelopes(connection, signal)) {
+  for await (const envelope of streamEnvelopes(connection, signal, buffered)) {
     const message = envelope.message;
     if (message.type === "error") throw new VyrnServerError(message.code, message.message);
     if (message.type !== "documentChange") throw unexpected(message);

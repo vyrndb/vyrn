@@ -26,6 +26,34 @@ const EXTERNAL_KEY: u8 = 1;
 const EXTERNAL_VALUE: u8 = 2;
 const DEFAULT_CACHE_PAGES: usize = 4_096;
 
+/// The most entries a leaf page can physically hold.
+///
+/// Every entry needs at least its cell header inside the page, so a count above
+/// this is not a large tree but a forged field — and `decode_leaf` used to hand
+/// such a field straight to `Vec::with_capacity`, letting four on-disk bytes
+/// request a quarter-terabyte of memory. The page checksum does not help: it
+/// sits next to the count and is trivially recomputed by whoever rewrites it.
+const MAX_LEAF_ENTRIES: usize = (PAGE_SIZE - HEADER_SIZE) / LEAF_CELL_HEADER;
+
+/// The most children an internal page can physically hold.
+///
+/// The first child lives in the header; each further one needs its cell in the
+/// body. Same reasoning as [`MAX_LEAF_ENTRIES`]: a stored count past this bound
+/// describes a page that cannot exist.
+const MAX_INTERNAL_CHILDREN: usize = (PAGE_SIZE - HEADER_SIZE) / INTERNAL_CELL_HEADER + 1;
+
+/// The deepest root-to-leaf descent any traversal will follow.
+///
+/// A 4 KiB internal page addresses at most [`MAX_INTERNAL_CHILDREN`] children,
+/// so a real tree reaches single-digit height long before it reaches a trillion
+/// keys. The bound exists for pages this build did not write: an internal page
+/// whose first child is itself — or whose children form a ring — otherwise walks
+/// every read path forever, and a long chain of degenerate internal pages
+/// overflows the stack in the recursive walkers. 64 leaves orders of magnitude
+/// of headroom above anything a healthy tree produces while turning both
+/// failures into an ordinary corrupt-page report.
+const MAX_TREE_DEPTH: usize = 64;
+
 /// How many 4 KiB pages the tree may hold in memory.
 ///
 /// The default is 16 MiB, which a tree of any real size outgrows immediately;
@@ -180,12 +208,21 @@ impl PageManager {
             file.write_all(&super_page)?;
             file.sync_all()?;
         }
-        let file_len = file.metadata()?.len();
+        let mut file_len = file.metadata()?.len();
+        // Commits fsync only the WAL between checkpoints; page appends ride
+        // along without a barrier of their own, so a power loss routinely
+        // leaves part of one final page on disk. Refusing the file made an
+        // ordinary crash permanently fatal even though redo reconstructs every
+        // lost page from the log. A page is finished and checksummed before its
+        // append begins and is written with a single `write_all`, so any page a
+        // manifest or WAL record still names starts on a page boundary: the
+        // fragment can only be the head of a page whose loss redo already
+        // recovers from. Drop it, exactly as the WAL and the value logs repair
+        // their own tails.
         if file_len % PAGE_SIZE as u64 != 0 {
-            return Err(Error::CorruptPage {
-                page_id: 0,
-                reason: "page file length is not page-aligned".into(),
-            });
+            file_len -= file_len % PAGE_SIZE as u64;
+            file.set_len(file_len)?;
+            file.sync_all()?;
         }
         let page_count = file_len / PAGE_SIZE as u64;
         let manager = Self {
@@ -238,7 +275,16 @@ impl PageManager {
         let page_id = self.page_count;
         write_u64(&mut page, 8, page_id);
         finalize_page(&mut page);
-        self.file.seek(SeekFrom::End(0))?;
+        // Write at the page-aligned end of the file, never the raw end. An
+        // append cut off mid-write (ENOSPC) leaves a fragment shorter than a
+        // page at the tail while `page_count` still counts whole pages only;
+        // seeking to End(0) would land this page past the fragment and shift
+        // every later offset, silently misaligning each subsequent page. The
+        // fragment is overwritten rather than truncated away: it is the head of
+        // exactly the page this append rewrites in full.
+        let end = self.file.seek(SeekFrom::End(0))?;
+        self.file
+            .seek(SeekFrom::Start(end - end % PAGE_SIZE as u64))?;
         self.file.write_all(&page)?;
         self.dirty = true;
         self.page_count += 1;
@@ -302,6 +348,19 @@ pub(crate) struct PageTree {
 
 impl PageTree {
     pub(crate) fn open(path: &Path, value_path: &Path, root: u64, len: u64) -> Result<Self> {
+        // A manifest naming a generation whose page file is gone is damage, not
+        // an empty database. Opening used to materialise the missing file as a
+        // fresh page store and only then fail looking up the root — after
+        // writing an empty file over a name that a restored backup or an older
+        // copy may still hold the real bytes for. Creation stays legal for a
+        // genuinely fresh database, whose manifest is absent and whose root and
+        // length are both zero.
+        if !path.exists() && (root != 0 || len != 0) {
+            return Err(Error::CorruptManifest(format!(
+                "the checkpoint names page file {} and it does not exist",
+                path.display()
+            )));
+        }
         let pages = PageManager::open(path, cache_pages())?;
         let values = ValueLog::open(value_path)?;
         if root != 0 {
@@ -341,7 +400,7 @@ impl PageTree {
         if self.root == 0 {
             return Ok(0);
         }
-        self.count_node_excluding_prefix(self.root, prefix)
+        self.count_node_excluding_prefix(self.root, prefix, 0)
     }
 
     pub(crate) fn publish(&mut self, root: u64, len: u64) {
@@ -376,7 +435,7 @@ impl PageTree {
         let count = if self.root == 0 {
             0
         } else {
-            self.validate_node(self.root, None, None, &mut visited)?
+            self.validate_node(self.root, None, None, &mut visited, 0)?
         };
         if count != self.len {
             return Err(Error::CorruptPage {
@@ -409,7 +468,7 @@ impl PageTree {
     pub(crate) fn get_many_with_revision(&self, keys: &[Vec<u8>]) -> Result<Vec<RevisionedValue>> {
         let mut results = vec![None; keys.len()];
         if self.root != 0 && !keys.is_empty() {
-            self.collect_many(self.root, keys, &mut results, true)?;
+            self.collect_many(self.root, keys, &mut results, true, 0)?;
         }
         Ok(results
             .into_iter()
@@ -430,7 +489,7 @@ impl PageTree {
     pub(crate) fn get_many_revisions(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<u64>>> {
         let mut results = vec![None; keys.len()];
         if self.root != 0 && !keys.is_empty() {
-            self.collect_many(self.root, keys, &mut results, false)?;
+            self.collect_many(self.root, keys, &mut results, false, 0)?;
         }
         Ok(results
             .into_iter()
@@ -444,7 +503,11 @@ impl PageTree {
         keys: &[Vec<u8>],
         results: &mut [MaybeValued],
         want_values: bool,
+        depth: usize,
     ) -> Result<()> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => {
@@ -484,6 +547,7 @@ impl PageTree {
                             &keys[cursor..end],
                             &mut results[cursor..end],
                             want_values,
+                            depth + 1,
                         )?;
                     }
                     cursor = end;
@@ -608,7 +672,7 @@ impl PageTree {
                 self.write_leaf_level(&entries)?
             }
         } else {
-            self.apply_node(self.root, &prepared, true, &mut existed)?
+            self.apply_node(self.root, &prepared, true, &mut existed, 0)?
         };
         while replacements.len() > 1 {
             replacements = self.write_internal_level(&replacements)?;
@@ -650,7 +714,11 @@ impl PageTree {
         mutations: &[PreparedMutation],
         is_root: bool,
         existed: &mut [bool],
+        depth: usize,
     ) -> Result<Vec<NodeRef>> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => {
@@ -683,6 +751,7 @@ impl PageTree {
                             &mutations[cursor..end],
                             false,
                             existed,
+                            depth + 1,
                         )?;
                         new_children.extend(replacements);
                     } else {
@@ -776,7 +845,7 @@ impl PageTree {
         if self.root == 0 {
             return Ok(None);
         }
-        self.last_key_in_node(self.root, start, end)
+        self.last_key_in_node(self.root, start, end, 0)
     }
 
     fn last_key_in_node(
@@ -784,7 +853,11 @@ impl PageTree {
         page_id: u64,
         start: &[u8],
         end: Option<&[u8]>,
+        depth: usize,
     ) -> Result<Option<Vec<u8>>> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => Ok(self
@@ -808,7 +881,9 @@ impl PageTree {
                     if child_end.is_some_and(|child_end| child_end <= start) {
                         continue;
                     }
-                    if let Some(found) = self.last_key_in_node(child.page_id, start, end)? {
+                    if let Some(found) =
+                        self.last_key_in_node(child.page_id, start, end, depth + 1)?
+                    {
                         return Ok(Some(found));
                     }
                 }
@@ -828,7 +903,7 @@ impl PageTree {
         if self.root == 0 {
             return Ok(false);
         }
-        self.node_changed_since(self.root, start, end, revision, excluded_prefix)
+        self.node_changed_since(self.root, start, end, revision, excluded_prefix, 0)
     }
 
     fn scan_with_revisions_excluding_prefix(
@@ -840,7 +915,7 @@ impl PageTree {
     ) -> Result<Vec<VersionedRow>> {
         let mut rows = Vec::with_capacity(limit.min(1024));
         if self.root != 0 && limit != 0 {
-            self.scan_node(self.root, start, end, limit, excluded_prefix, &mut rows)?;
+            self.scan_node(self.root, start, end, limit, excluded_prefix, &mut rows, 0)?;
         }
         Ok(rows)
     }
@@ -851,7 +926,11 @@ impl PageTree {
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
         visited: &mut HashSet<u64>,
+        depth: usize,
     ) -> Result<u64> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         if !visited.insert(page_id) {
             return Err(Error::CorruptPage {
                 page_id,
@@ -900,8 +979,13 @@ impl PageTree {
                         Some(separators[index - 1].clone())
                     };
                     let child_upper = separators.get(index).cloned().or_else(|| upper.clone());
-                    total +=
-                        self.validate_node(child.page_id, child_lower, child_upper, visited)?;
+                    total += self.validate_node(
+                        child.page_id,
+                        child_lower,
+                        child_upper,
+                        visited,
+                        depth + 1,
+                    )?;
                 }
                 Ok(total)
             }
@@ -909,7 +993,15 @@ impl PageTree {
         }
     }
 
-    fn count_node_excluding_prefix(&self, page_id: u64, prefix: &[u8]) -> Result<usize> {
+    fn count_node_excluding_prefix(
+        &self,
+        page_id: u64,
+        prefix: &[u8],
+        depth: usize,
+    ) -> Result<usize> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => Ok(self
@@ -920,7 +1012,7 @@ impl PageTree {
             INTERNAL => {
                 let mut count = 0;
                 for child in self.decode_internal(&page, page_id)? {
-                    count += self.count_node_excluding_prefix(child.page_id, prefix)?;
+                    count += self.count_node_excluding_prefix(child.page_id, prefix, depth + 1)?;
                 }
                 Ok(count)
             }
@@ -935,7 +1027,11 @@ impl PageTree {
         end: Option<&[u8]>,
         revision: u64,
         excluded_prefix: Option<&[u8]>,
+        depth: usize,
     ) -> Result<bool> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => Ok(self.decode_leaf(&page, page_id)?.into_iter().any(|entry| {
@@ -959,6 +1055,7 @@ impl PageTree {
                         end,
                         revision,
                         excluded_prefix,
+                        depth + 1,
                     )? {
                         return Ok(true);
                     }
@@ -969,6 +1066,10 @@ impl PageTree {
         }
     }
 
+    /// One argument past clippy's comfort: the trailing `depth` is the descent
+    /// bound every walker carries, and folding the scan's four filters into a
+    /// struct to shave it would obscure a signature that mirrors its callers.
+    #[allow(clippy::too_many_arguments)]
     fn scan_node(
         &self,
         page_id: u64,
@@ -977,7 +1078,11 @@ impl PageTree {
         limit: usize,
         excluded_prefix: Option<&[u8]>,
         rows: &mut Vec<VersionedRow>,
+        depth: usize,
     ) -> Result<()> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
         if rows.len() >= limit {
             return Ok(());
         }
@@ -1010,7 +1115,15 @@ impl PageTree {
                     {
                         continue;
                     }
-                    self.scan_node(child.page_id, start, end, limit, excluded_prefix, rows)?;
+                    self.scan_node(
+                        child.page_id,
+                        start,
+                        end,
+                        limit,
+                        excluded_prefix,
+                        rows,
+                        depth + 1,
+                    )?;
                     if rows.len() == limit {
                         break;
                     }
@@ -1023,7 +1136,15 @@ impl PageTree {
 
     fn find_leaf(&self, key: &[u8], mut path: Option<&mut Vec<(u64, usize)>>) -> Result<u64> {
         let mut page_id = self.root;
+        // The descent is bounded like the recursive walkers: a crafted page that
+        // names itself (directly or through a ring of children) would otherwise
+        // keep this loop spinning forever.
+        let mut depth = 0;
         loop {
+            if depth >= MAX_TREE_DEPTH {
+                return Err(excessive_depth(page_id));
+            }
+            depth += 1;
             let page = self.pages.read(page_id)?;
             match page[5] {
                 LEAF => return Ok(page_id),
@@ -1060,7 +1181,15 @@ impl PageTree {
 
     fn node_ref(&self, page_id: u64) -> Result<NodeRef> {
         let mut current = page_id;
+        // Bounded like every other descent: the first-child field is read
+        // straight from each page without validating where it leads, so a page
+        // that is its own first descendant would spin here forever.
+        let mut depth = 0;
         loop {
+            if depth >= MAX_TREE_DEPTH {
+                return Err(excessive_depth(current));
+            }
+            depth += 1;
             let page = self.pages.read(current)?;
             match page[5] {
                 LEAF => {
@@ -1227,6 +1356,20 @@ impl PageTree {
 
     fn decode_leaf(&self, page: &Page, page_id: u64) -> Result<Vec<Entry>> {
         let count = read_u32(page, 20) as usize;
+        // The count is trusted only up to what the page can physically hold.
+        // Beyond that it is a forged field, and it used to reach
+        // `Vec::with_capacity` directly — a crafted page could ask the
+        // allocator for gigabytes and take the process down with it. Every
+        // legitimate entry needs its cell header inside this page, so anything
+        // over [`MAX_LEAF_ENTRIES`] is corruption by arithmetic alone.
+        if count > MAX_LEAF_ENTRIES {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: format!(
+                    "leaf claims {count} entries but a page holds at most {MAX_LEAF_ENTRIES}"
+                ),
+            });
+        }
         let mut offset = HEADER_SIZE;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1303,6 +1446,20 @@ impl PageTree {
 
     fn decode_internal(&self, page: &Page, page_id: u64) -> Result<Vec<NodeRef>> {
         let count = read_u32(page, 20) as usize;
+        // `count` is the children past the first, which lives in the header.
+        // The per-cell bounds below already stop the loop once the body runs
+        // out, so nothing here allocates from the count — but rejecting a
+        // page-impossible child count up front reports the forged field as what
+        // it is instead of letting the descent discover it one cell at a time.
+        if count >= MAX_INTERNAL_CHILDREN {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: format!(
+                    "internal page claims {} children but a page holds at most {MAX_INTERNAL_CHILDREN}",
+                    count + 1
+                ),
+            });
+        }
         let first_id = read_u64(page, 24);
         let first = self.node_ref(first_id)?;
         let mut children = vec![first];
@@ -1564,6 +1721,16 @@ fn unexpected_type(page_id: u64, page_type: u8) -> Error {
     }
 }
 
+/// The error every traversal raises once [`MAX_TREE_DEPTH`] is exceeded.
+fn excessive_depth(page_id: u64) -> Error {
+    Error::CorruptPage {
+        page_id,
+        reason: format!(
+            "tree descent deeper than {MAX_TREE_DEPTH} levels; the page graph is cyclic or forged"
+        ),
+    }
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -1581,6 +1748,118 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Rewrites one page of a page file with mutated contents behind a valid
+    /// checksum. This is exactly what a crafted database looks like: the
+    /// checksum protects against rot, not against whoever rewrites the bytes,
+    /// so every field the decoders trust has to stand on its own.
+    fn forge_page(path: &Path, page_id: u64, mutate: impl FnOnce(&mut Page)) {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut page = [0; PAGE_SIZE];
+        read_exact_at(&file, &mut page, page_id * PAGE_SIZE as u64).unwrap();
+        mutate(&mut page);
+        finalize_page(&mut page);
+        file.seek(SeekFrom::Start(page_id * PAGE_SIZE as u64))
+            .unwrap();
+        file.write_all(&page).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Builds a tree tall enough that its root is an internal page spanning
+    /// several leaves, which is what the descent guards below need to bite.
+    fn tree_with_internal_root(path: &Path, values: &Path) -> (u64, u64) {
+        let mut tree = PageTree::open(path, values, 0, 0).unwrap();
+        let mut state = (0, 0);
+        for index in 0..200_u64 {
+            let key = format!("key-{index:06}");
+            state = tree
+                .prepare_put(key.as_bytes(), &[7; 40], index + 1)
+                .unwrap();
+            tree.publish(state.0, state.1);
+        }
+        tree.sync().unwrap();
+        assert_eq!(
+            tree.pages.read(state.0).unwrap()[5],
+            INTERNAL,
+            "this test needs a tree whose root is an internal page"
+        );
+        state
+    }
+
+    /// A forged entry count used to flow straight into `Vec::with_capacity`,
+    /// turning four on-disk bytes into a quarter-terabyte allocation request
+    /// that took the whole process down. A count above what a page can
+    /// physically hold is corruption by arithmetic alone.
+    #[test]
+    fn a_forged_leaf_entry_count_is_reported_not_allocated() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let root = {
+            let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+            let state = tree.prepare_put(b"key", b"value", 1).unwrap();
+            tree.publish(state.0, state.1);
+            tree.sync().unwrap();
+            state.0
+        };
+        // A one-entry tree's root is its only leaf, so the very first decode
+        // meets the forged count on the way to the data.
+        forge_page(&path, root, |page| write_u32(page, 20, u32::MAX));
+        let tree = PageTree::open(&path, &values, root, 1).unwrap();
+        let error = tree.get(b"key").unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptPage { .. }),
+            "a forged entry count must be reported as corruption, got {error:?}"
+        );
+    }
+
+    /// The internal-page sibling: children past the first each need a cell in
+    /// the page body, so an impossible child count is corruption however the
+    /// bytes got that way.
+    #[test]
+    fn a_forged_internal_child_count_is_reported_not_walked() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, len) = tree_with_internal_root(&path, &values);
+        forge_page(&path, root, |page| write_u32(page, 20, u32::MAX));
+        let tree = PageTree::open(&path, &values, root, len).unwrap();
+        let error = tree.get(b"key-000100").unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptPage { .. }),
+            "a forged child count must be reported as corruption, got {error:?}"
+        );
+    }
+
+    /// An internal page naming itself as its own first descendant used to walk
+    /// every traversal forever — the first-child field was followed without
+    /// ever asking where the chain led.
+    #[test]
+    fn an_internal_page_that_is_its_own_descendant_is_reported() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, len) = tree_with_internal_root(&path, &values);
+        forge_page(&path, root, |page| write_u64(page, 24, root));
+        let tree = PageTree::open(&path, &values, root, len).unwrap();
+        // Point lookups descend through `find_leaf`; scans walk recursively.
+        // Both must come back as corruption instead of hanging.
+        for attempted in [
+            tree.get(b"key-000100").err(),
+            tree.scan(None, None, 10).err(),
+            tree.count_excluding_prefix(b"key").err(),
+        ] {
+            let error = attempted.expect("every traversal of a cyclic tree must fail");
+            assert!(
+                matches!(error, Error::CorruptPage { .. }),
+                "a cyclic page graph must be reported as corruption, got {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn inline_records_split_reopen_and_overflow() {

@@ -194,8 +194,12 @@ export class Connection {
 
     return new Promise<Message>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.#pending = null;
+        // #fail rejects the in-flight request and clears it; clearing #pending
+        // here first would leave the caller waiting forever. The server never
+        // answered, so tear the socket down instead of leaving a half-open
+        // connection behind.
         this.#fail(new VyrnConnectionError("request timed out"));
+        this.#socket.destroy();
       }, this.#timeoutMs);
       timer.unref?.();
       this.#pending = { requestId, resolve, reject, timer };

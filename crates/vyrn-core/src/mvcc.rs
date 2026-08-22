@@ -17,6 +17,9 @@ const HEADER_LEN: usize = 24;
 const KEY_HEADER_LEN: usize = 8;
 const VERSION_HEADER_LEN: usize = 25;
 const LEGACY_VERSION_HEADER_LEN: usize = 17;
+/// Smallest legal per-version record across both formats, used only to bound
+/// allocations that are sized from counts read off disk.
+const MIN_VERSION_LEN: usize = LEGACY_VERSION_HEADER_LEN;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Version {
@@ -63,7 +66,14 @@ pub(crate) fn read(path: &Path, maximum_revision: u64, values: &mut ValueLog) ->
         require(&bytes, offset, key_len)?;
         let key = bytes[offset..offset + key_len].to_vec();
         offset += key_len;
-        let mut versions = Vec::with_capacity(version_count);
+        // version_count comes off disk unvalidated, so the reservation is
+        // clamped to what the remaining buffer could hold at the smallest
+        // legal version record. A corrupt count near u32::MAX would otherwise
+        // attempt a huge allocation before the per-version checks reject it;
+        // a valid history always fits its buffer, so the clamp never binds
+        // for one.
+        let remaining = bytes.len() - offset;
+        let mut versions = Vec::with_capacity(version_count.min(remaining / MIN_VERSION_LEN));
         let mut previous = None;
         for _ in 0..version_count {
             let version = if format == LEGACY_VERSION {
@@ -449,5 +459,35 @@ mod tests {
             get_at(&restored, &restored_values, b"b", 4).unwrap(),
             Some(b"four".to_vec())
         );
+    }
+
+    #[test]
+    fn a_corrupt_version_count_does_not_drive_the_allocation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.vmvcc");
+        let value_path = directory.path().join("history.vlog");
+        let mut values = ValueLog::open(&value_path).unwrap();
+
+        // One well-formed header naming a single key that claims u32::MAX
+        // versions and carries none of them. Reserving capacity for the claim
+        // aborts the process before the first version's truncation check runs.
+        let mut bytes = vec![0; HEADER_LEN];
+        bytes[0..4].copy_from_slice(MAGIC);
+        bytes[4] = VERSION;
+        write_u32(&mut bytes, 8, 1);
+        write_u64(&mut bytes, 12, 0);
+        let header_checksum = checksum(&bytes[0..20]);
+        write_u32(&mut bytes, 20, header_checksum);
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        bytes.push(b'k');
+        fs::write(&path, &bytes).unwrap();
+
+        // `State` is not `Debug`, so the error is matched out by hand.
+        let error = match read(&path, 1, &mut values) {
+            Ok(_) => panic!("a corrupt history must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::CorruptManifest(_)));
     }
 }

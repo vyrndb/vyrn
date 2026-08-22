@@ -17,3 +17,7 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 vyrn-protocol = { path = "../vyrn-protocol" }
+
+# Pausing and advancing virtual time in the timeout tests.
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

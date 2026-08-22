@@ -1,7 +1,7 @@
 {
   "name": "@vyrn/client",
   "version": "0.1.0-dev",
-  "description": "TypeScript client for the Vyrn HTTP gateway",
+  "description": "TypeScript client for the Vyrn database: native protocol for Node.js backends, HTTP gateway for browsers and edge",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

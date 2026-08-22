@@ -12,8 +12,11 @@
 
 use proptest::prelude::*;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tempfile::tempdir;
-use vyrn_core::{backup, BatchOperation, Engine};
+use vyrn_core::{backup, BatchOperation, Engine, EngineOptions, Error};
 
 #[derive(Debug, Clone)]
 enum Operation {
@@ -242,4 +245,175 @@ fn a_corrupted_archive_body_is_refused() {
             "a flip at byte {index} restored into a database that will not open"
         );
     }
+}
+
+/// A published manifest promises every commit above its LSN is recoverable from
+/// the WAL alone. With wal/ wiped, replay finds no segments, skips, and
+/// "succeeds": restore silently rolls back to the last checkpoint while the
+/// acknowledged commits since exist nowhere. The backup has to refuse while the
+/// damage can still be repaired at the source.
+#[test]
+fn a_manifest_without_any_wal_segments_is_refused() {
+    let source_dir = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(source_dir.path()).unwrap();
+        engine.put(b"checkpointed".to_vec(), b"1".to_vec()).unwrap();
+        engine.checkpoint().unwrap();
+        engine
+            .put(b"only-in-the-wal".to_vec(), b"2".to_vec())
+            .unwrap();
+    }
+    assert!(source_dir.path().join("CURRENT").exists());
+    let wal_directory = source_dir.path().join("wal");
+    for entry in std::fs::read_dir(&wal_directory).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    let archive_dir = tempdir().unwrap();
+    let archive = archive_dir.path().join("backup.vyrnbkp");
+    let error = backup::create_backup(source_dir.path(), &archive).unwrap_err();
+    assert!(
+        matches!(error, Error::CorruptBackup(_)),
+        "a wiped wal was backed up anyway: {error:?}"
+    );
+    // Nothing partial was left behind either — not the archive, not its
+    // in-progress temporary.
+    assert!(!archive.exists());
+    assert!(!archive_dir.path().join("backup.tmp").exists());
+}
+
+/// The subtler loss: the earliest surviving segment still starts below the
+/// manifest's LSN, so nothing about the head looks wrong — but a deleted middle
+/// segment breaks replay's sequence requirement, which only surfaces hours
+/// later when the restored copy refuses to open. Segment ids are contiguous in
+/// any healthy wal/, so the hole is detectable at backup time.
+#[test]
+fn a_missing_middle_segment_is_refused_instead_of_backed_up() {
+    let source_dir = tempdir().unwrap();
+    // A watermark of zero keeps checkpoint from deleting sealed segments, so
+    // the directory holds several and one can be removed by hand.
+    let watermark = Arc::new(AtomicU64::new(0));
+    {
+        let mut engine = Engine::open_with_options(
+            source_dir.path(),
+            EngineOptions {
+                segment_size: 128,
+                archived_through: Some(Arc::clone(&watermark)),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        engine.put(b"base".to_vec(), b"1".to_vec()).unwrap();
+        engine.checkpoint().unwrap();
+        for index in 0..20_u8 {
+            engine
+                .put(format!("key-{index}").into_bytes(), vec![index; 40])
+                .unwrap();
+        }
+    }
+    let wal_directory = source_dir.path().join("wal");
+    let mut segments: Vec<PathBuf> = std::fs::read_dir(&wal_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "vwal"))
+        .collect();
+    segments.sort();
+    assert!(
+        segments.len() >= 3,
+        "expected several sealed segments, got {}",
+        segments.len()
+    );
+
+    std::fs::remove_file(&segments[1]).unwrap();
+
+    let archive_dir = tempdir().unwrap();
+    let archive = archive_dir.path().join("backup.vyrnbkp");
+    let error = backup::create_backup(source_dir.path(), &archive).unwrap_err();
+    assert!(
+        matches!(error, Error::CorruptBackup(_)),
+        "a gapped wal was backed up anyway: {error:?}"
+    );
+    assert!(!archive.exists());
+}
+
+/// Publication is `fs::rename`, which replaces whatever sits at the
+/// destination, so an output path spelled like engine state must be refused
+/// before anything opens — `--output ./db/CURRENT` otherwise prints success
+/// having destroyed the live database it claimed to preserve.
+#[test]
+fn backups_refuse_outputs_that_clobber_engine_state() {
+    let source_dir = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(source_dir.path()).unwrap();
+        engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+        engine.checkpoint().unwrap();
+    }
+
+    let manifest = source_dir.path().join("CURRENT");
+    let page_file: PathBuf = std::fs::read_dir(source_dir.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            let is_page_file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pages-"));
+            is_page_file.then_some(path)
+        })
+        .next()
+        .expect("a checkpointed database has a page file");
+    let segment: PathBuf = std::fs::read_dir(source_dir.path().join("wal"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .next()
+        .expect("an openable database keeps its active segment");
+
+    let manifest_before = std::fs::read(&manifest).unwrap();
+    let page_before = std::fs::read(&page_file).unwrap();
+    let segment_before = std::fs::read(&segment).unwrap();
+
+    let mut doomed_outputs = vec![
+        manifest.clone(),
+        page_file.clone(),
+        segment,
+        source_dir.path().join("values-fabricated.vlog"),
+        source_dir.path().join("revisions-fabricated.vmvcc"),
+        source_dir.path().join("wal").join("planted.vyrnbkp"),
+    ];
+    // And the whole-directory rule: even an innocuous name inside the data
+    // directory being backed up is refused, so an archive can never be mistaken
+    // for part of the database it came from.
+    doomed_outputs.push(source_dir.path().join("backup.vyrnbkp"));
+
+    for output in &doomed_outputs {
+        let error = backup::create_backup(source_dir.path(), output).unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptBackup(_)),
+            "{output:?}: expected a clean refusal, got {error:?}"
+        );
+    }
+
+    // Clean refusal means byte-for-byte intact where something existed, and
+    // nothing created where nothing did.
+    assert_eq!(std::fs::read(&manifest).unwrap(), manifest_before);
+    assert_eq!(std::fs::read(&page_file).unwrap(), page_before);
+    let segment_path = source_dir.path().join("wal").join(
+        std::fs::read_dir(source_dir.path().join("wal"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name(),
+    );
+    assert_eq!(std::fs::read(&segment_path).unwrap(), segment_before);
+    assert!(!source_dir.path().join("values-fabricated.vlog").exists());
+    assert!(!source_dir.path().join("revisions-fabricated.vmvcc").exists());
+    assert!(
+        !source_dir.path().join("wal").join("planted.vyrnbkp").exists(),
+        "the backup planted a file inside wal/"
+    );
+    assert!(
+        !source_dir.path().join("backup.vyrnbkp").exists(),
+        "the backup wrote into the data directory"
+    );
 }

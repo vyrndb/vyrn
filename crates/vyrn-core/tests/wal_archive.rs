@@ -195,6 +195,58 @@ fn rejects_reused_segment_id_with_divergent_crc() {
     );
 }
 
+/// Rot in an archived segment used to be permanent: every later tick compared
+/// the healthy local source against the index entry, found them agreeing, and
+/// skipped — without ever looking at the bytes on disk. The trusted copy stays
+/// damaged until PITR fails on it much later. The tick must re-checksum what is
+/// actually in the archive and heal it from the source it provably matches.
+#[test]
+fn heals_a_rotted_archived_segment_from_its_source() {
+    let database = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let archive = store.path().join("archive");
+    fill(database.path(), 7);
+    let wal_directory = database.path().join("wal");
+    let segments = segment_ids(&wal_directory);
+    assert!(segments.len() >= 2, "expected at least one sealed segment");
+    archive_pending(&wal_directory, &archive).unwrap();
+    vyrn_core::wal_archive::verify_archive(&archive).unwrap();
+
+    // Flip a byte in the middle of the archived copy. The local source and the
+    // index entry remain perfectly consistent with each other, which is exactly
+    // why the old skip-forever behaviour never noticed.
+    let victim = segment_path(&archive, segments[0]);
+    let mut bytes = std::fs::read(&victim).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&victim, bytes).unwrap();
+    assert!(
+        vyrn_core::wal_archive::verify_archive(&archive).is_err(),
+        "the damage was not applied"
+    );
+
+    let healed = archive_pending(&wal_directory, &archive).unwrap();
+    assert_eq!(
+        healed,
+        segments[segments.len() - 2],
+        "watermark must not move"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        std::fs::read(segment_path(&wal_directory, segments[0])).unwrap(),
+        "the rotted copy was not repaired from its source"
+    );
+    // The index entry describes the file again, end to end.
+    vyrn_core::wal_archive::verify_archive(&archive).unwrap();
+
+    // And a healthy archive is left strictly alone: no re-copying on a tick
+    // where everything already matches, or a cron-driven archiver would rewrite
+    // the whole archive forever.
+    let before = std::fs::metadata(&victim).unwrap().modified().unwrap();
+    archive_pending(&wal_directory, &archive).unwrap();
+    assert_eq!(std::fs::metadata(&victim).unwrap().modified().unwrap(), before);
+}
+
 /// In async mode `last_lsn` runs ahead of the records actually written to the
 /// segment file: commits sit in the in-memory buffer until a flush. A rotation
 /// that seals the file without draining that buffer stamps the new segment's
@@ -324,4 +376,39 @@ fn bitrot_in_dead_retained_segment_still_opens() {
         Engine::open(database.path()).is_err(),
         "corruption in a replayed segment must fail closed"
     );
+}
+
+/// Two overlapping ticks used to share fixed temporary names (`{name}.tmp`),
+/// so their truncating writes interleaved and one rename could publish the
+/// other's half-written copy as trusted. Unique temporaries let concurrent
+/// ticks coexist; whatever the interleaving, the archive they converge on must
+/// be complete and verifiable.
+#[test]
+fn overlapping_ticks_converge_on_a_complete_archive() {
+    let database = tempdir().unwrap();
+    let store = tempdir().unwrap();
+    let archive = store.path().join("archive");
+    fill(database.path(), 3);
+    let wal_directory = database.path().join("wal");
+    let segments = segment_ids(&wal_directory);
+    let sealed: Vec<u64> = segments[..segments.len() - 1].to_vec();
+    assert!(sealed.len() >= 2, "expected several sealed segments");
+
+    let watermarks: Vec<u64> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| archive_pending(&wal_directory, &archive).unwrap()))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    });
+    // Every tick agrees on how far the archive reaches — none of them can
+    // return a watermark the others did not also prove.
+    assert!(
+        watermarks.iter().all(|&watermark| watermark == watermarks[0]),
+        "concurrent ticks disagreed: {watermarks:?}"
+    );
+    assert_eq!(segment_ids(&archive), sealed);
+    assert!(vyrn_core::wal_archive::verify_archive(&archive).is_ok());
 }

@@ -64,13 +64,104 @@ fn recovers_acknowledged_writes_when_page_tail_is_lost() {
         original > checkpointed,
         "post-checkpoint commits should have appended pages"
     );
-    // Drop the pages written after the checkpoint, keeping the file page-aligned.
+    // Drop the pages written after the checkpoint. The cut lands on a page
+    // boundary only because the checkpoint image is whole pages; a crash that
+    // stopped part-way into a page is truncated away by the same open, which
+    // `a_partial_page_at_the_tail_is_truncated_on_open` covers separately.
     truncate_page_file(&pages, checkpointed);
 
     let engine = Engine::open(directory.path()).expect("recovery should redo the lost commits");
     assert_eq!(engine.get(b"b").unwrap(), Some(b"two".to_vec()));
     assert_eq!(engine.get(b"c").unwrap(), Some(b"three".to_vec()));
     assert_eq!(engine.get(b"a").unwrap(), None, "the delete was logged too");
+}
+
+/// A crash can stop part-way into a page: pages appended since the last
+/// checkpoint never get a barrier of their own, so the kernel may have reached
+/// only some of the final page's bytes. `open` used to refuse any non-aligned
+/// page file outright, which turned an ordinary power loss into a permanently
+/// unopenable database even though redo reconstructs every page the WAL still
+/// needs.
+#[test]
+fn a_partial_page_at_the_tail_is_truncated_on_open() {
+    let directory = tempdir().unwrap();
+    let checkpointed;
+    {
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"a".to_vec(), b"one".to_vec()).unwrap();
+        engine.checkpoint().unwrap();
+        checkpointed = std::fs::metadata(newest_page_file(directory.path()))
+            .unwrap()
+            .len();
+        engine.put(b"b".to_vec(), b"two".to_vec()).unwrap();
+    }
+    let pages = newest_page_file(directory.path());
+    // The crash stopped 123 bytes into the page after the checkpoint image:
+    // shorter than it was, but no whole-page truncation could have produced it.
+    let damaged = checkpointed + 123;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&pages)
+        .unwrap();
+    file.set_len(damaged).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let engine = Engine::open(directory.path())
+        .expect("a torn page tail must be repaired on open, not refused");
+    assert_eq!(engine.get(b"a").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(engine.get(b"b").unwrap(), Some(b"two".to_vec()));
+    // Redo re-appends the pages the fragment's page held, so length alone does
+    // not prove the truncation — but whatever the file now ends with has to be
+    // whole pages, which a refusal (or a pad-to-alignment) would not produce.
+    let repaired = std::fs::metadata(&pages).unwrap().len();
+    assert_eq!(
+        repaired % 4096,
+        0,
+        "open must leave the page file page-aligned"
+    );
+}
+
+/// An append that fails part-way (ENOSPC) leaves less than a page at the tail
+/// while the manager still counts whole pages only. The next append used to
+/// seek to the raw end of the file, landing its page past the fragment — and
+/// shifting every later offset with it — so the file came back misaligned and
+/// permanently unopenable even though nothing was ever acknowledged.
+#[test]
+fn an_append_after_a_partial_write_lands_on_the_next_page_boundary() {
+    let directory = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"first".to_vec(), b"one".to_vec()).unwrap();
+        // Simulate the interrupted append: a fragment shorter than a page
+        // appears at the tail without the manager being told, exactly as a
+        // failed `write_all` leaves the file.
+        let pages = newest_page_file(directory.path());
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&pages)
+            .unwrap();
+        use std::io::Write;
+        file.write_all(&[0u8; 100]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        // More writes through the SAME handle: its page cursor is still at the
+        // aligned end, and every append must land there rather than past the
+        // fragment.
+        engine.put(b"second".to_vec(), b"two".to_vec()).unwrap();
+        engine.put(b"third".to_vec(), b"three".to_vec()).unwrap();
+    }
+    let pages = newest_page_file(directory.path());
+    let engine = Engine::open(directory.path())
+        .expect("appends must resume from the page-aligned end of the file");
+    assert_eq!(engine.get(b"first").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(engine.get(b"second").unwrap(), Some(b"two".to_vec()));
+    assert_eq!(engine.get(b"third").unwrap(), Some(b"three".to_vec()));
+    assert_eq!(
+        std::fs::metadata(&pages).unwrap().len() % 4096,
+        0,
+        "the recovered appends leave the file page-aligned"
+    );
 }
 
 /// The server applies batches with the flush deferred, then flushes once for

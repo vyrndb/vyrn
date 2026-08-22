@@ -7,6 +7,8 @@ Dependency-free TypeScript client for Vyrn, with two entry points:
 | `@vyrn/client/node` | Native `vyrn://` protocol over TCP/TLS 1.3 | Node.js backend servers |
 | `@vyrn/client` | HTTP + SSE via `vyrn-http` | Browsers and edge runtimes |
 
+> **ESM only.** This package ships ECMAScript modules exclusively — there is no CommonJS build, so `require("@vyrn/client")` fails even though the package declares `engines: node >= 20`. Consume it with `import` from ESM, or with dynamic `import()` from CommonJS. Bundlers must handle ESM output (all modern ones do). The `"type": "module"` field makes this explicit to Node rather than leaving it to file-extension accident.
+
 Use the native entry point for backend servers: it skips the gateway hop and is the only one that supports interactive transactions. It needs Node.js 20+ and cannot run in a browser, since browsers cannot open raw TCP sockets.
 
 ## Backend servers (native protocol)
@@ -60,7 +62,7 @@ await db.transaction(async (tx) => {
 });
 ```
 
-Reads see the snapshot taken at begin plus the transaction's own writes. On commit the server rejects the transaction if another commit touched a written key, a point read, or a scanned range after that snapshot, surfaced as `VyrnServerError` with `code === "conflict"`. Throwing inside the body rolls back.
+Reads see the snapshot taken at begin plus the transaction's own writes. On commit the server rejects the transaction if another commit touched a written key, a point read, or a scanned range after that snapshot, surfaced as `VyrnServerError` with `code === "conflict"`. Throwing inside the body rolls back. A session refuses `begin` while it already has an active transaction.
 
 For manual control use `db.use`, which leases a single connection:
 
@@ -72,9 +74,11 @@ await db.use(async (session) => {
 });
 ```
 
+Forgetting `commit` or `rollback` cannot poison the pool: when a session with an open transaction is returned, the client rolls the transaction back before leasing the session again (and retires the session entirely if that rollback fails).
+
 ### Pooling
 
-Each native connection handles one request at a time, so every call leases a connection and concurrent calls use separate ones, up to `maxConnections` (default 10). Additional callers queue until a connection is returned. Dead connections are discarded rather than reused.
+Each native connection handles one request at a time, so every call leases a connection and concurrent calls use separate ones, up to `maxConnections` (default 10). Additional callers queue until a connection is returned. Dead connections are discarded rather than reused, and their capacity is reclaimed immediately: after a backend restart the pool reconnects on demand instead of silently shrinking, and callers queued while every pooled connection was dead receive the connection error rather than waiting forever. Closing the client rejects queued callers the same way.
 
 ### Subscriptions
 
@@ -86,6 +90,8 @@ for await (const change of db.subscribeCollection("users", controller.signal)) {
 ```
 
 Each subscription uses its own dedicated connection. Delivery starts once the subscription is established and there is no durable cursor, so a subscriber that connects late or reconnects misses the gap and must resynchronize with `listDocuments` (or `scan` for `subscribe`).
+
+The client buffers up to `MAX_STREAM_BUFFER` (10,000) undelivered events per subscription. A consumer that falls further behind than that has its subscription closed with a `VyrnConnectionError` saying so — memory stays bounded, and a slow consumer of a large retained log should resume from its last cursor instead of expecting the client to hold the whole replay. Backlog events coalesced into the same read as the subscribe ack are still delivered in order.
 
 ## Browsers and edge (HTTP gateway)
 

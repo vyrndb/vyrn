@@ -229,6 +229,10 @@ fn a_flip_in_the_unused_runway_never_drops_a_committed_record() {
     }
 }
 
+/// A record's fixed header: 4 magic + 1 version + 8 LSN + 4 operation count +
+/// 4 payload length + 4 checksum + 8 root + 8 length.
+const RECORD_HEADER_BYTES: usize = 45;
+
 fn copy_database(source: &std::path::Path, target: &std::path::Path) {
     fs::create_dir_all(target.join("wal")).unwrap();
     for entry in fs::read_dir(source).unwrap() {
@@ -242,4 +246,149 @@ fn copy_database(source: &std::path::Path, target: &std::path::Path) {
         let entry = entry.unwrap();
         fs::copy(entry.path(), target.join("wal").join(entry.file_name())).unwrap();
     }
+}
+
+/// One past the last byte of a segment that holds a record; reused here to
+/// reach the page files the same way.
+fn newest_page_file(directory: &std::path::Path) -> std::path::PathBuf {
+    fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.extension()
+                .is_some_and(|extension| extension == "vdb")
+                .then_some(path)
+        })
+        .max()
+        .expect("a page file should exist")
+}
+
+/// A manifest naming a generation whose page file is gone is damage, not an
+/// empty database. Opening used to materialise the missing file as a fresh page
+/// store and only then fail looking up the root — after writing an empty file
+/// over the very name a restored backup could have recovered the real bytes
+/// from, leaving the directory permanently broken.
+#[test]
+fn a_missing_page_file_is_reported_without_being_created() {
+    let source = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(source.path()).unwrap();
+        engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    let case = tempdir().unwrap();
+    copy_database(source.path(), case.path());
+    let pages = newest_page_file(case.path());
+    assert!(pages.exists());
+    fs::remove_file(&pages).unwrap();
+
+    let error = match Engine::open(case.path()) {
+        Ok(_) => panic!("opening a database whose page file is gone must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, vyrn_core::Error::CorruptManifest(_)),
+        "a missing generation's page file must be reported as corruption, got {error:?}"
+    );
+    assert!(
+        !pages.exists(),
+        "opening must not recreate the page file it failed to find"
+    );
+}
+
+/// A write-back cache can persist a multi-page record's tail while losing its
+/// head. The frame then lies wholly inside the last byte the writer touched, so
+/// the overrun rule never sees it, and an ordinary crash used to read as fatal
+/// corruption: a database lost to a power cut rather than to damage. An all-zero
+/// header is the unwritten page's signature — the runway ahead of the records is
+/// zero-filled, and no bit flip produces forty-five zero bytes — so recovery
+/// treats exactly that as a torn tail in the ACTIVE segment: everything from the
+/// torn record on is discarded, which is sound because a record whose head was
+/// lost can never have been acknowledged, and nothing after it can either.
+#[test]
+fn a_record_whose_head_page_never_persisted_truncates_instead_of_failing_to_open() {
+    let source = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(source.path()).unwrap();
+        engine.put(b"first".to_vec(), b"one".to_vec()).unwrap();
+    }
+    let wal = source.path().join("wal/00000000000000000001.vwal");
+    let committed = record_end(&fs::read(&wal).unwrap());
+    {
+        let mut engine = Engine::open(source.path()).unwrap();
+        engine.put(b"second".to_vec(), b"two".to_vec()).unwrap();
+    }
+    let logged = fs::read(&wal).unwrap();
+    let full = record_end(&logged);
+    assert!(full > committed, "the second put should have been logged");
+
+    // The crash kept the second record's tail but not its head.
+    let mut torn = logged.clone();
+    torn[committed..committed + RECORD_HEADER_BYTES].fill(0);
+    assert!(
+        torn[committed + RECORD_HEADER_BYTES..full].iter().any(|byte| *byte != 0),
+        "the tail must survive for this to be the case the overrun rule misses"
+    );
+
+    let case = tempdir().unwrap();
+    copy_database(source.path(), case.path());
+    fs::write(case.path().join("wal/00000000000000000001.vwal"), torn).unwrap();
+
+    let mut engine = Engine::open(case.path())
+        .unwrap_or_else(|error| panic!("a lost head page must not make open fail: {error}"));
+    assert_eq!(engine.get(b"first").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(
+        engine.get(b"second").unwrap(),
+        None,
+        "a record whose head was lost was never acknowledged and must be discarded"
+    );
+    let truncated = fs::metadata(case.path().join("wal/00000000000000000001.vwal"))
+        .unwrap()
+        .len();
+    assert!(
+        truncated <= committed as u64,
+        "replay should have truncated the tail at {committed}, segment is {truncated}"
+    );
+    // The engine keeps working, and only the surviving records come back.
+    engine.put(b"third".to_vec(), b"three".to_vec()).unwrap();
+    drop(engine);
+    let engine = Engine::open(case.path()).unwrap();
+    assert_eq!(engine.get(b"first").unwrap(), Some(b"one".to_vec()));
+    assert_eq!(engine.get(b"third").unwrap(), Some(b"three".to_vec()));
+    assert_eq!(engine.get(b"second").unwrap(), None);
+}
+
+/// The other half of the torn-head rule: sealed segments keep strict validation.
+/// Their tails were truncated by the open that sealed them, so a frame that
+/// cannot parse in one is historical rot — and rot must stay loud rather than
+/// quietly buy a truncated log.
+#[test]
+fn a_zeroed_head_in_a_sealed_segment_stays_fatal() {
+    let source = tempdir().unwrap();
+    {
+        let mut engine = Engine::open_with_segment_size(source.path(), 1024).unwrap();
+        for index in 0..12_u32 {
+            engine
+                .put(format!("key-{index}").into_bytes(), vec![index as u8; 32])
+                .unwrap();
+        }
+    }
+    let wal_directory = source.path().join("wal");
+    assert!(
+        fs::read_dir(&wal_directory).unwrap().count() >= 2,
+        "the workload must rotate so that segment 1 is sealed"
+    );
+    let sealed = wal_directory.join("00000000000000000001.vwal");
+    let mut bytes = fs::read(&sealed).unwrap();
+    bytes[32..32 + RECORD_HEADER_BYTES].fill(0);
+    fs::write(&sealed, bytes).unwrap();
+
+    let error = match Engine::open(source.path()) {
+        Ok(_) => panic!("rot in a sealed segment must not be silently truncated"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, vyrn_core::Error::CorruptWal { .. }),
+        "a zeroed frame in a sealed segment must be reported as corruption, got {error:?}"
+    );
 }

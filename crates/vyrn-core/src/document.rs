@@ -1,4 +1,6 @@
-use crate::{BatchOperation, Engine, Error, IndexUpdate, Result, MAX_KEY_SIZE};
+use crate::{
+    index_entry_prefix, BatchOperation, Engine, Error, IndexUpdate, Result, MAX_KEY_SIZE,
+};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -110,6 +112,10 @@ impl CollectionView<'_> {
         get_document(self.engine, &self.name, id)
     }
 
+    /// Finds documents whose indexed `field` equals `value`.
+    ///
+    /// Numeric equality is encoding-exact rather than numeric: a query for
+    /// `10` matches documents that store `10`, not ones that store `10.0`.
     pub fn find(&self, field: &str, value: &Value, limit: usize) -> Result<Vec<Document>> {
         find_documents(self.engine, &self.name, &self.indexes, field, value, limit)
     }
@@ -133,22 +139,39 @@ impl Collection<'_> {
         self.put_object(id, value)
     }
 
+    /// Deletes a document by ID, reporting whether it existed.
     pub fn delete(&mut self, id: &str) -> Result<bool> {
         let key = document_key(&self.name, id)?;
-        let Some(previous) = self.engine.get_internal(&key)? else {
+        let Some(stored) = self.engine.get_internal(&key)? else {
             return Ok(false);
         };
-        let previous = decode_object(&previous)?;
-        let updates = self.index_updates(&key, Some(&previous), None)?;
-        let results = self
-            .engine
-            .write_indexed_internal(vec![BatchOperation::Delete(key)], updates)?;
+        // The previous value is decoded only to work out which index entries it
+        // holds, and nothing in the contract needs its contents. A stored value
+        // whose bytes no longer decode — a partial migration, an external
+        // writer, a legacy import — must still be deletable, so an undecodable
+        // previous falls back to scanning each index for entries pointing at
+        // this key instead of failing the delete forever.
+        let (previous, repairs) = match decode_object(&stored) {
+            Ok(previous) => (Some(previous), Vec::new()),
+            Err(_) => (None, self.orphaned_index_deletes(&key)?),
+        };
+        let updates = match &previous {
+            Some(previous) => self.index_updates(&key, Some(previous), None)?,
+            None => Vec::new(),
+        };
+        let mut operations = vec![BatchOperation::Delete(key)];
+        operations.extend(repairs);
+        let results = self.engine.write_indexed_internal(operations, updates)?;
         Ok(matches!(
             results.first(),
             Some(crate::BatchResult::Delete { existed: true })
         ))
     }
 
+    /// Finds documents whose indexed `field` equals `value`.
+    ///
+    /// Numeric equality is encoding-exact rather than numeric: a query for
+    /// `10` matches documents that store `10`, not ones that store `10.0`.
     pub fn find(&self, field: &str, value: &Value, limit: usize) -> Result<Vec<Document>> {
         find_documents(self.engine, &self.name, &self.indexes, field, value, limit)
     }
@@ -159,17 +182,53 @@ impl Collection<'_> {
 
     fn put_object(&mut self, id: &str, value: Map<String, Value>) -> Result<()> {
         let key = document_key(&self.name, id)?;
-        let previous = self
+        // Overwriting does not need the old value's contents — only the index
+        // entries it holds. Demanding that those bytes decode made a corrupt
+        // stored value impossible to replace: every put returned the same
+        // decode error forever. An undecodable previous is therefore treated as
+        // unknown, and whatever entries still point at this key are retired by
+        // scan so they cannot outlive the write.
+        let (previous, repairs) = match self
             .engine
             .get_internal(&key)?
             .map(|bytes| decode_object(&bytes))
-            .transpose()?;
+            .transpose()
+        {
+            Ok(previous) => (previous, Vec::new()),
+            Err(_) => (None, self.orphaned_index_deletes(&key)?),
+        };
         let updates = self.index_updates(&key, previous.as_ref(), Some(&value))?;
         let bytes = serde_json::to_vec(&Value::Object(value))
             .map_err(|error| invalid_document(format!("document encoding failed: {error}")))?;
-        self.engine
-            .write_indexed_internal(vec![BatchOperation::Put(key, bytes)], updates)?;
+        let mut operations = vec![BatchOperation::Put(key, bytes)];
+        operations.extend(repairs);
+        self.engine.write_indexed_internal(operations, updates)?;
         Ok(())
+    }
+
+    /// Collects deletions for every index entry that points at `primary_key`,
+    /// whatever value it was filed under.
+    ///
+    /// An entry encodes its value in the key, so retiring one normally means
+    /// knowing the value it was written for — which an undecodable document
+    /// cannot supply. Leaving the entries behind would trade one corruption for
+    /// another silent one: `find` would keep returning a deleted or replaced
+    /// document, and a unique value would stay claimed by a key that no longer
+    /// holds it. The scan runs only on this corruption path; ordinary writes
+    /// already know their old values.
+    fn orphaned_index_deletes(&self, primary_key: &[u8]) -> Result<Vec<BatchOperation>> {
+        let mut operations = Vec::new();
+        for field in self.indexes.keys() {
+            let index = index_name(&self.name, field)?;
+            let start = index_entry_prefix(&index);
+            let end = prefix_end(&start);
+            for (entry, _) in self.engine.scan_internal(Some(&start), end.as_deref(), usize::MAX)? {
+                if index_entry_points_at(&entry, &start, primary_key) {
+                    operations.push(BatchOperation::Delete(entry));
+                }
+            }
+        }
+        Ok(operations)
     }
 
     fn index_updates(
@@ -269,6 +328,8 @@ pub(crate) fn list_on_reader(
         .collect()
 }
 
+/// The read-handle path for `find`. Numeric equality is encoding-exact here
+/// too: a query for `10` matches stored `10`, not `10.0`.
 pub(crate) fn find_on_reader(
     reader: &crate::ReadEngine,
     collection: &str,
@@ -513,6 +574,13 @@ fn decode_object(bytes: &[u8]) -> Result<Map<String, Value>> {
     }
 }
 
+/// Encodes a scalar field value for an exact-match index lookup.
+///
+/// Equality is encoding-exact, not numeric: the query's encoded bytes are
+/// matched byte for byte against the stored entry, so a query for `10` finds
+/// documents that store `10` and not ones that store `10.0`. Callers that need
+/// cross-representation numeric equality must normalize values before both
+/// writing and querying.
 fn encode_index_value(value: &Value) -> Result<Vec<u8>> {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
@@ -537,6 +605,172 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Reports whether an index entry filed under `index_prefix` names
+/// `primary_key` as the document it points at.
+///
+/// Entries are `<index prefix><value length><value><primary key>`, so the owner
+/// is recovered exactly by skipping past the length-prefixed value. A malformed
+/// entry parses to nothing and matches nothing, which leaves it in place rather
+/// than failing a repair that is already best-effort.
+fn index_entry_points_at(entry: &[u8], index_prefix: &[u8], primary_key: &[u8]) -> bool {
+    let Some(rest) = entry.strip_prefix(index_prefix) else {
+        return false;
+    };
+    let Some(length) = rest
+        .get(..4)
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let value_len = u32::from_be_bytes(length) as usize;
+    value_len
+        .checked_add(4)
+        .and_then(|offset| rest.get(offset..))
+        .is_some_and(|primary| primary == primary_key)
+}
+
 fn invalid_document(message: impl Into<String>) -> Error {
     Error::InvalidDocument(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn indexes() -> Vec<IndexDefinition> {
+        vec![
+            IndexDefinition::new("email", true),
+            IndexDefinition::new("role", false),
+        ]
+    }
+
+    /// Overwrites a stored document's bytes with garbage, reproducing what a
+    /// partial migration or external writer leaves behind. User-facing writes
+    /// refuse reserved keys, so the internal batch is the honest way in.
+    fn corrupt(engine: &mut Engine, collection: &str, id: &str) {
+        let key = document_key(collection, id).unwrap();
+        engine
+            .write_batch_internal(vec![BatchOperation::Put(key, b"{not json".to_vec())])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_document_can_be_deleted_and_replaced() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        {
+            let mut users = engine.collection("users", &indexes()).unwrap();
+            users
+                .put("one", &json!({"email": "one@example.com", "role": "member"}))
+                .unwrap();
+            users
+                .put("two", &json!({"email": "two@example.com", "role": "member"}))
+                .unwrap();
+        }
+        corrupt(&mut engine, "users", "one");
+
+        let mut users = engine.collection("users", &indexes()).unwrap();
+        assert!(users.get("one").is_err(), "reads must still report the damage");
+
+        // Deletion used to demand that the previous value decode, which made a
+        // corrupt document undeletable forever.
+        assert!(users.delete("one").unwrap());
+        assert!(users.get("one").unwrap().is_none());
+
+        // Its index entries were derived from a value that can no longer be
+        // read, so they must be gone rather than answering queries for it.
+        assert!(users
+            .find("email", &json!("one@example.com"), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            users
+                .find("role", &json!("member"), 10)
+                .unwrap()
+                .iter()
+                .map(|document| document.id.as_str())
+                .collect::<Vec<_>>(),
+            ["two"]
+        );
+
+        // And the document is writable again.
+        users
+            .put("one", &json!({"email": "reborn@example.com", "role": "admin"}))
+            .unwrap();
+        assert_eq!(
+            users.get("one").unwrap().unwrap().value["email"],
+            "reborn@example.com"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_document_can_be_replaced_without_deleting_it_first() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        {
+            let mut users = engine.collection("users", &indexes()).unwrap();
+            users
+                .put("one", &json!({"email": "one@example.com", "role": "member"}))
+                .unwrap();
+        }
+        corrupt(&mut engine, "users", "one");
+
+        let mut users = engine.collection("users", &indexes()).unwrap();
+        // Overwriting never needed the old contents; requiring their decode made
+        // every put of this ID fail with the same error forever.
+        users
+            .put("one", &json!({"email": "new@example.com", "role": "admin"}))
+            .unwrap();
+        assert_eq!(
+            users.get("one").unwrap().unwrap().value["email"],
+            "new@example.com"
+        );
+
+        // The entry the pre-corruption write filed under the old value is gone,
+        // and the replacement answers under its new one.
+        assert!(users
+            .find("email", &json!("one@example.com"), 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            users.find("email", &json!("new@example.com"), 10).unwrap()[0].id,
+            "one"
+        );
+
+        // A unique value the damaged document cannot prove it holds must be
+        // claimable again, not haunted by its stale entry.
+        drop(users);
+        let mut users = engine.collection("users", &indexes()).unwrap();
+        users
+            .put("two", &json!({"email": "one@example.com", "role": "member"}))
+            .unwrap();
+        assert_eq!(
+            users.find("email", &json!("one@example.com"), 10).unwrap()[0].id,
+            "two"
+        );
+    }
+
+    #[test]
+    fn a_malformed_stored_index_name_is_an_error_not_a_panic() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+
+        // A field segment whose length prefix promises five bytes and delivers
+        // two, planted directly among the collection's index definitions.
+        let mut name = INDEX_PREFIX.to_vec();
+        append_segment(&mut name, "users").unwrap();
+        name.extend_from_slice(&[0x00, 0x05, b'a', b'b']);
+        engine.create_index(name, false).unwrap();
+
+        assert!(matches!(
+            engine.open_collection("users"),
+            Err(Error::InvalidDocument(_))
+        ));
+        assert!(matches!(
+            engine.collection_indexes("users"),
+            Err(Error::InvalidDocument(_))
+        ));
+    }
 }

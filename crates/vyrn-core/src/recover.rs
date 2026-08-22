@@ -80,9 +80,14 @@ pub fn recover_to(
         headers.push((id, first_lsn));
     }
     for pair in headers.windows(2) {
-        if pair[1].1 < pair[0].1 {
+        // Equality is a splice too: segment headers carry no filename to
+        // contradict, so one file copied over another's name presents two
+        // adjacent segments claiming the same first LSN. Replaying both would
+        // silently skip or repeat the shared records depending on where the
+        // copy sits, so the merged log must be strictly increasing.
+        if pair[1].1 <= pair[0].1 {
             return Err(failed(format!(
-                "segment {} starts at LSN {} before its predecessor segment {} at {}",
+                "segment {} starts at LSN {}, at or before its predecessor segment {} at {}; the merged WAL contains a duplicated or reordered segment",
                 pair[1].0, pair[1].1, pair[0].0, pair[0].1
             )));
         }
@@ -173,9 +178,20 @@ fn merge_archive(wal_directory: &Path, archive_directory: &Path) -> Result<()> {
         let name = crate::segment_name(entry.segment_id);
         let source = archive_directory.join(&name);
         let destination = wal_directory.join(&name);
+        // The index is the archive's own claim about the bytes it shipped, and
+        // recovery is the one reader that adopts those bytes wholesale, so the
+        // claim has to be re-checked here: `archive_pending` verifies on every
+        // run, but an archive damaged after it was written would otherwise
+        // replace a good base copy with rot under a name replay trusts.
+        let archived = fs::read(&source)?;
+        if crate::checksum(&archived) != entry.crc {
+            return Err(failed(format!(
+                "archived segment {} does not match the checksum recorded for it in the archive index; the archived copy is damaged",
+                entry.segment_id
+            )));
+        }
         if present.contains(&entry.segment_id) {
             let base = fs::read(&destination)?;
-            let archived = fs::read(&source)?;
             // Compared by records rather than by file length. Both copies carry
             // a zero-filled runway past their records, and the archived copy
             // wrote further records into the very bytes the base backup copied
@@ -200,7 +216,6 @@ fn merge_archive(wal_directory: &Path, archive_directory: &Path) -> Result<()> {
             // Only in the archive: a checkpoint deleted the local copy after
             // it was archived. The base's own newest segment may equally be
             // absent from the archive (it was never sealed) — it is kept as is.
-            let archived = fs::read(&source)?;
             write_segment(wal_directory, &name, &archived)?;
         }
     }
@@ -243,17 +258,40 @@ fn wal_ids(directory: &Path) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
+/// One past the last non-zero byte in `bytes`, or the header length when the
+/// segment holds no records at all.
+///
+/// The writer zero-fills and syncs a runway ahead of its records before writing
+/// them, so a crash-torn record still has every physical byte its header
+/// declares — a declared-length check alone therefore counts a torn tail as a
+/// complete record. What separates torn from whole is the last byte a writer
+/// actually touched: every complete record ends with the four non-zero bytes of
+/// its end marker, so a whole record can never reach past this point, and a
+/// frame that does is necessarily torn. The same rule replay itself applies.
+fn last_written_byte(bytes: &[u8]) -> usize {
+    let floor = crate::SEGMENT_HEADER_LEN.min(bytes.len());
+    bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(floor, |index| (index + 1).max(floor))
+}
+
 /// The length of the record frame at `offset`, or `None` where the records end.
 ///
 /// A segment is longer than its records: the writer keeps a zero-filled runway
 /// ahead of them so its barrier has no extent update to journal. Walking the
 /// declared lengths alone would step through that runway frame by frame, since
 /// zeros decode as a zero-length payload, so the frame's magic is what says
-/// whether a record is there at all. Bodies are still left unverified — replay
-/// re-validates every byte it applies, and the framing alone is enough to find
-/// where a torn or partial copy stops being comparable.
-fn record_frame_len(bytes: &[u8], offset: usize) -> Option<usize> {
+/// whether a record starts here at all. The magic alone is not enough — the
+/// runway means even a torn record's declared bytes are all physically present —
+/// so a frame also has to end at or before `written_through`. A tear inside the
+/// header decodes a garbage length or LSN from zeros; either way the forged
+/// frame reaches past the last written byte and stops the walk. Bodies stay
+/// unverified either way — replay re-validates every byte it applies, and the
+/// framing only has to find where comparable history ends.
+fn record_frame_len(bytes: &[u8], offset: usize, written_through: usize) -> Option<usize> {
     if bytes.len() - offset < crate::RECORD_HEADER_LEN
+        || offset + crate::RECORD_HEADER_LEN > written_through
         || &bytes[offset..offset + 4] != crate::RECORD_MAGIC
         || bytes[offset + 4] != crate::VERSION
     {
@@ -263,13 +301,14 @@ fn record_frame_len(bytes: &[u8], offset: usize) -> Option<usize> {
     crate::RECORD_HEADER_LEN
         .checked_add(payload_len)
         .and_then(|size| size.checked_add(crate::RECORD_FOOTER_LEN))
-        .filter(|total| *total <= bytes.len() - offset)
+        .filter(|total| offset + *total <= written_through)
 }
 
 /// Byte offset just past the last complete record frame.
 fn last_record_boundary(bytes: &[u8]) -> usize {
+    let written_through = last_written_byte(bytes);
     let mut offset = crate::SEGMENT_HEADER_LEN.min(bytes.len());
-    while let Some(total_len) = record_frame_len(bytes, offset) {
+    while let Some(total_len) = record_frame_len(bytes, offset, written_through) {
         offset += total_len;
     }
     offset
@@ -277,12 +316,14 @@ fn last_record_boundary(bytes: &[u8]) -> usize {
 
 /// LSN of the last complete record in a segment, or `first_lsn - 1` when it
 /// has none. The restored active segment may carry a torn tail (replay will
-/// truncate it), so an incomplete final frame is ignored rather than fatal.
+/// truncate it), so an incomplete final frame — including one whose declared
+/// bytes the runway makes fully present — is ignored rather than fatal.
 fn last_record_lsn(path: &Path, first_lsn: u64) -> Result<u64> {
     let bytes = fs::read(path)?;
+    let written_through = last_written_byte(&bytes);
     let mut last = first_lsn.saturating_sub(1);
     let mut offset = crate::SEGMENT_HEADER_LEN.min(bytes.len());
-    while let Some(total_len) = record_frame_len(&bytes, offset) {
+    while let Some(total_len) = record_frame_len(&bytes, offset, written_through) {
         last = crate::read_u64(&bytes, offset + 5);
         offset += total_len;
     }
@@ -386,34 +427,52 @@ mod tests {
         );
     }
 
-    /// A crash mid-append leaves a torn frame at the active segment's tail —
-    /// a state a plain `Engine::open` repairs by truncation — and
-    /// `create_backup` copies the crashed, never-reopened directory verbatim,
-    /// so the tear survives into the restored base. The trim scan used to be
-    /// strict about framing, which made `recover_to` fail on exactly those
-    /// bytes on every retry, leaving a fully intact backup permanently
-    /// unrecoverable through the recovery path.
+    /// A crash mid-append tears the active segment's tail: the runway was
+    /// zero-filled and synced before the record began, its first bytes reached
+    /// the disk, and the rest never happened. `create_backup` copies the
+    /// crashed, never-reopened directory verbatim, so recovery meets exactly
+    /// those bytes. Counting declared lengths used to mistake such a tail for a
+    /// complete record — the runway always supplies enough physical bytes — so
+    /// default PITR demanded an LSN the torn log could never deliver and failed
+    /// on every retry; the reachable bound now stops at the last record whose
+    /// every byte lies at or before the last byte a writer touched.
     #[test]
     fn recovers_a_base_backup_whose_active_segment_has_a_torn_tail() {
         let database = tempdir().unwrap();
         let auxiliary = tempdir().unwrap();
         let backup_file = auxiliary.path().join("base.bkp");
+        let segment = database.path().join("wal").join(crate::segment_name(2));
         {
             let mut engine = Engine::open(database.path()).unwrap();
             engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
             engine.checkpoint().unwrap();
             engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
         }
-        // Simulate the crash: 20 bytes of a record header, torn inside the
-        // 45-byte header, appended to the active segment (id 2 after the
-        // checkpoint's rotation).
-        let segment = database.path().join("wal").join(crate::segment_name(2));
-        let mut torn = vec![0u8; 20];
-        torn[0..4].copy_from_slice(b"VTXN");
-        torn[4] = crate::VERSION;
-        let mut file = OpenOptions::new().append(true).open(&segment).unwrap();
-        file.write_all(&torn).unwrap();
-        drop(file);
+        // Everything up to the last non-zero byte is durable history (records
+        // k2's commit); past it is the runway the writer synced before starting
+        // the next record.
+        let history = fs::read(&segment).unwrap();
+        let written_through = last_written_byte(&history);
+        {
+            let mut engine = Engine::open(database.path()).unwrap();
+            engine.put(b"k3".to_vec(), b"v3".to_vec()).unwrap();
+        }
+        let logged = fs::read(&segment).unwrap();
+        let full = last_written_byte(&logged);
+        assert!(
+            full > written_through + crate::RECORD_HEADER_LEN,
+            "the third put should have been logged whole"
+        );
+        // Reconstruct the crash: the record's head landed over the zeroed
+        // runway and the write stopped part-way through its payload, leaving
+        // the header intact and everything from there on untouched zeros.
+        let torn_at = written_through
+            + crate::RECORD_HEADER_LEN
+            + (full - written_through - crate::RECORD_HEADER_LEN) / 2;
+        let mut crashed = vec![0u8; logged.len()];
+        crashed[..torn_at].copy_from_slice(&logged[..torn_at]);
+        fs::write(&segment, &crashed).unwrap();
+
         backup::create_backup(database.path(), &backup_file).unwrap();
         let target = auxiliary.path().join("restored");
         backup::restore_backup(&backup_file, &target).unwrap();
@@ -421,7 +480,108 @@ mod tests {
         let engine = Engine::open(&target).unwrap();
         assert_eq!(engine.get(b"k1").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(engine.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(
+            engine.get(b"k3").unwrap(),
+            None,
+            "the torn commit must not be applied"
+        );
         assert_eq!(engine.sequence(), 2);
+    }
+
+    /// The archive index records a checksum beside every segment it shipped,
+    /// and recovery is the one reader that adopts archived bytes wholesale.
+    /// Skipping that check let damage above the base boundary — invisible to
+    /// the shared-prefix comparison, which stops where the base copy's records
+    /// stop — silently replace good base bytes with rot under a name replay
+    /// trusts.
+    #[test]
+    fn rejects_an_archived_segment_that_no_longer_matches_its_index_checksum() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        let backup_file = auxiliary.path().join("base.bkp");
+        let archive = auxiliary.path().join("archive");
+        seed(database.path(), &backup_file, &archive);
+        let target = auxiliary.path().join("restored");
+        backup::restore_backup(&backup_file, &target).unwrap();
+
+        // Flip a bit in the archived copy of the shared segment, somewhere the
+        // base backup never copied: inside the sealed tail's last record, past
+        // everything the prefix comparison can see.
+        let shared = archive.join(crate::segment_name(2));
+        let mut bytes = fs::read(&shared).unwrap();
+        let base_boundary = last_record_boundary(
+            &fs::read(target.join("wal").join(crate::segment_name(2))).unwrap(),
+        );
+        let flip_at = last_record_boundary(&bytes) - 4;
+        assert!(
+            flip_at > base_boundary,
+            "the damage must sit above the base copy's records for this test to be honest"
+        );
+        bytes[flip_at] ^= 0x80;
+        fs::write(&shared, &bytes).unwrap();
+
+        let error = recover_to(&target, Some(&archive), None, false).unwrap_err();
+        match error {
+            Error::CorruptBackup(message) => assert!(
+                message.contains("checksum"),
+                "the error should name the index checksum mismatch, got: {message}"
+            ),
+            other => panic!("expected a checksum failure, got {other:?}"),
+        }
+    }
+
+    /// Segment headers carry no filename to contradict, so one file copied over
+    /// another's name presents two adjacent segments claiming the same first
+    /// LSN. Only strict increase was enforced, so the duplicate sailed into
+    /// replay, where the shared records are skipped or repeated depending on
+    /// where the copy sits — a spliced WAL recovering as success.
+    #[test]
+    fn rejects_two_adjacent_segments_claiming_the_same_first_lsn() {
+        let database = tempdir().unwrap();
+        let auxiliary = tempdir().unwrap();
+        // Small segments seal after a record or two, giving the log several
+        // real segments to splice.
+        {
+            let mut engine = Engine::open_with_segment_size(database.path(), 128).unwrap();
+            for index in 1..=6_u64 {
+                engine
+                    .put(format!("k{index}").into_bytes(), vec![index as u8; 16])
+                    .unwrap();
+            }
+        }
+        let target = auxiliary.path().join("spliced");
+        copy_wal_tree(database.path(), &target);
+        fs::copy(
+            target.join("wal").join(crate::segment_name(1)),
+            target.join("wal").join(crate::segment_name(2)),
+        )
+        .unwrap();
+
+        let error = recover_to(&target, None, None, false).unwrap_err();
+        match error {
+            Error::CorruptBackup(message) => assert!(
+                message.contains("duplicated or reordered"),
+                "the error should name the duplicated segment, got: {message}"
+            ),
+            other => panic!("expected a splice rejection, got {other:?}"),
+        }
+    }
+
+    /// Copies a stopped database directory without its lock file, so a scenario
+    /// can be tampered with in place.
+    fn copy_wal_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target.join("wal")).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == "LOCK" || entry.file_name() == "wal" {
+                continue;
+            }
+            fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+        }
+        for entry in fs::read_dir(source.join("wal")).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), target.join("wal").join(entry.file_name())).unwrap();
+        }
     }
 
     /// Records left on disk past the bound would be replayed by the next

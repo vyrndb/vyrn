@@ -14,6 +14,13 @@ const MAX_PATH: usize = 4 * 1024;
 pub fn create_backup(data_directory: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
     let data_directory = data_directory.as_ref();
     let output = output.as_ref();
+    reject_reserved_output(output)?;
+    if resolves_inside(data_directory, output)? {
+        return Err(Error::CorruptBackup(format!(
+            "{} is inside the data directory being backed up; writing an archive into a live database lets one mistyped --output destroy what it claims to preserve",
+            output.display()
+        )));
+    }
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -75,6 +82,87 @@ pub fn create_backup(data_directory: impl AsRef<Path>, output: impl AsRef<Path>)
         sync_directory(parent)?;
     }
     Ok(())
+}
+
+/// Refuses an output path that collides with files Vyrn itself writes.
+///
+/// Publication is `fs::rename`, which replaces an existing destination without
+/// complaint, and the logical export truncates what it is handed — so
+/// `--output ./db/CURRENT` reports success and destroys the live manifest.
+/// The names checked here are the engine's own (see `database_files`), plus
+/// anything inside a `wal/` directory; a dump or archive has no business
+/// wearing either. Shared with `portable::export`, whose output path carries
+/// the same hazard without a data directory to compare against.
+pub(crate) fn reject_reserved_output(output: &Path) -> Result<()> {
+    if let Some(name) = output.file_name().and_then(|name| name.to_str()) {
+        if is_reserved_file_name(name) {
+            return Err(Error::CorruptBackup(format!(
+                "output path {output:?} collides with a file Vyrn owns ({name}); choose an output outside the data directory"
+            )));
+        }
+    }
+    // The segment files live one level down, so the destination's ancestors,
+    // not just its final name, decide whether it lands on engine state.
+    if output
+        .ancestors()
+        .any(|ancestor| ancestor.file_name().is_some_and(|name| name == "wal"))
+    {
+        return Err(Error::CorruptBackup(format!(
+            "output path {output:?} resolves inside a wal directory"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `name` is one the engine writes into a data directory or an
+/// extension only engine files carry.
+fn is_reserved_file_name(name: &str) -> bool {
+    name == "CURRENT"
+        || name.starts_with("pages-")
+        || name.starts_with("values-")
+        || name.starts_with("revisions-")
+        || name.starts_with("revision-values-")
+        || name.ends_with(".vwal")
+        || name.ends_with(".vlog")
+}
+
+/// Whether `output` resolves inside `directory`, for an output that usually
+/// does not exist yet: the nearest existing ancestor is canonicalized through
+/// the filesystem and the not-yet-existing tail appended, so `.`, `..`, and
+/// Windows short-path spellings of the same place compare equal instead of
+/// lexically.
+fn resolves_inside(directory: &Path, output: &Path) -> std::io::Result<bool> {
+    let directory = std::fs::canonicalize(directory)?;
+    // A bare relative name has no ancestor to resolve through, so anchor it to
+    // the working directory first; otherwise the walk below would end at an
+    // empty path instead of at a real directory.
+    let mut probe = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(output)
+    };
+    let mut tail = Vec::new();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(resolved) => {
+                let mut resolved = resolved;
+                for component in &tail {
+                    resolved.push(component);
+                }
+                return Ok(resolved.starts_with(directory));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match probe.file_name() {
+            Some(name) => tail.insert(0, name.to_owned()),
+            None => return Ok(false),
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            None => return Ok(false),
+        }
+    }
 }
 
 pub fn verify_backup(path: impl AsRef<Path>) -> Result<()> {
@@ -207,6 +295,58 @@ fn database_files(directory: &Path) -> Result<Vec<PathBuf>> {
         return Err(Error::CorruptBackup(
             "database has no page file; the directory is not a Vyrn database".into(),
         ));
+    }
+    // A published manifest claims every commit above its LSN lives only in the
+    // WAL, so the surviving segments have to be able to deliver them. Two
+    // shapes of loss pass every other guard here and verify clean, because an
+    // empty segment list simply skips replay:
+    //
+    //   - wal/ wiped entirely. Restore rolls silently back to the last
+    //     checkpoint, discarding acknowledged commits.
+    //   - a middle segment deleted. The lowest survivor still starts below the
+    //     manifest's LSN, so nothing above looks wrong until restore refuses a
+    //     discontinuous sequence hours later, with no live database left.
+    //
+    // Both mean the bytes exist nowhere else, so refusing costs only a backup
+    // of an already-broken directory and catches the damage while it can still
+    // be repaired from the source or its archive.
+    if let Some(state) = crate::read_manifest(directory)? {
+        let mut segments: Vec<u64> = files
+            .iter()
+            .filter(|path| path.starts_with("wal"))
+            .filter_map(|path| {
+                path.file_name()?
+                    .to_str()?
+                    .strip_suffix(".vwal")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        segments.sort_unstable();
+        let Some(&lowest) = segments.first() else {
+            return Err(Error::CorruptBackup(
+                "the database has a checkpoint manifest but no WAL segments; restoring it would roll back to the checkpoint and silently drop every commit since".into(),
+            ));
+        };
+        // Segment ids are contiguous in any healthy wal/ — `Engine::open`
+        // refuses a gapped sequence too — so a hole in the ids is a deleted
+        // segment rather than an unusual layout.
+        if segments.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+            return Err(Error::CorruptBackup(format!(
+                "the WAL is missing a segment between {} and {}; replay would refuse the restored copy as discontinuous",
+                segments[0],
+                segments[1]
+            )));
+        }
+        let lowest_first_lsn = crate::read_segment_first_lsn(
+            &directory.join("wal").join(crate::segment_name(lowest)),
+        )?;
+        if lowest_first_lsn > state.lsn.saturating_add(1) {
+            return Err(Error::CorruptBackup(format!(
+                "the earliest surviving WAL segment starts at record {lowest_first_lsn} but the checkpoint manifest covers only through {}; the records between were lost and restore cannot reproduce them",
+                state.lsn
+            )));
+        }
     }
     Ok(files)
 }

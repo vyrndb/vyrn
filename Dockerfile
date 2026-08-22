@@ -19,8 +19,12 @@ RUN printf '#!/bin/sh\nexec curl --fail --silent http://127.0.0.1:7433/health/re
 USER vyrn
 VOLUME ["/var/lib/vyrn"]
 EXPOSE 7432 7433
+# The admin/metrics listener is unauthenticated; default it to loopback inside
+# the container so publishing the port never exposes it by accident. The
+# container-internal healthcheck still works. Operators who want metrics from
+# outside override VYRN_ADMIN_BIND explicitly.
 ENV VYRN_BIND=0.0.0.0:7432 \
-    VYRN_ADMIN_BIND=0.0.0.0:7433 \
+    VYRN_ADMIN_BIND=127.0.0.1:7433 \
     VYRN_DATA=/var/lib/vyrn \
     VYRN_USERNAME=vyrn \
     VYRN_DATABASE=default \

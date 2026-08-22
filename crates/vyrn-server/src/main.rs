@@ -7,9 +7,10 @@ use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     io::BufReader,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -39,6 +40,25 @@ use vyrn_protocol::{
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CHANGE_REPLAY_BATCH: usize = 512;
+
+/// Frame ceiling applied until a connection has authenticated.
+///
+/// An unauthenticated peer can otherwise make the server buffer up to the full
+/// 64 MiB `MAX_FRAME_SIZE` per connection just by sending a length header, before
+/// showing a single credential — multiply that by the connection limit and a
+/// handful of sockets exhaust server memory for free. Nothing legitimate needs
+/// the large ceiling during a handshake: the only frame accepted here is an
+/// `Authenticate`, whose password this server caps at 4 KiB anyway. The full
+/// ceiling is restored once the peer is trusted.
+const PREAUTH_MAX_FRAME_SIZE: usize = 64 * 1024;
+
+/// How long a single response write may stay pending before the peer is
+/// treated as gone.
+///
+/// Generous on purpose: a healthy but slow consumer on a thin link must not be
+/// disconnected mid-scan, so this bounds pathological wedges rather than
+/// policing throughput. See `send_frame` for why every response path is bounded.
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
@@ -168,6 +188,18 @@ struct Metrics {
     wal_archive_lag_segments: AtomicU64,
     wal_archived_total: AtomicU64,
     wal_archive_failures_total: AtomicU64,
+    /// Every rejected authentication, including throttle refusals that never
+    /// reached the password check. A rising rate here is the signal that someone
+    /// is guessing; without it a lockout is invisible to operators.
+    auth_failures_total: AtomicU64,
+    /// Engine snapshots currently pinned by open client transactions (gauge).
+    ///
+    /// The MVCC floor is the minimum over live snapshots, so a pin that is never
+    /// released stops version collection for the rest of the process's life. That
+    /// failure is otherwise invisible — throughput and error rates stay normal
+    /// while history grows without bound — so the count is published: if this
+    /// does not return to zero on an idle server, a pin has leaked.
+    active_transaction_snapshots: AtomicU64,
     storage_failed: AtomicBool,
     drained: Notify,
 }
@@ -192,6 +224,8 @@ impl Default for Metrics {
             wal_archive_lag_segments: AtomicU64::new(0),
             wal_archived_total: AtomicU64::new(0),
             wal_archive_failures_total: AtomicU64::new(0),
+            auth_failures_total: AtomicU64::new(0),
+            active_transaction_snapshots: AtomicU64::new(0),
             storage_failed: AtomicBool::new(false),
             drained: Notify::new(),
         }
@@ -361,6 +395,200 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Total bytes of pending write payload allowed in the pipeline at once.
+///
+/// WHY A BYTE BOUND AND NOT JUST A SLOT COUNT: `--write-queue-capacity` bounds
+/// the number of queued requests, not their size. At the default 4096 slots and
+/// the 16 MiB `MAX_VALUE_SIZE`, a queue that is merely full holds up to ~64 GiB
+/// of values — and it fills exactly when the pipeline is slowest, because the
+/// write worker stalls behind a checkpoint or a slow barrier while clients keep
+/// submitting. The process is then killed by the OOM killer at the worst possible
+/// moment: mid-checkpoint, with a full WAL to replay.
+///
+/// 256 MiB is chosen to be far above any legitimate burst (it is 16 concurrent
+/// maximum-size values, or tens of thousands of ordinary ones) while keeping the
+/// worst case a number a host can actually hold. Exceeding it makes writers wait
+/// rather than fail: back-pressure is the correct response to a slow disk, and a
+/// client that waits gets its commit, where a client that is refused has to
+/// decide whether retrying is safe.
+const WRITE_QUEUE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// Consecutive failed authentications from one address before it is locked out.
+const AUTH_FAILURE_LIMIT: u32 = 10;
+
+/// How long a locked-out address stays refused, and how long an idle address's
+/// failure count is remembered.
+const AUTH_LOCKOUT: Duration = Duration::from_secs(60);
+
+/// Addresses tracked at once, bounding the throttle's own memory.
+const AUTH_THROTTLE_CAPACITY: usize = 4096;
+
+/// Reserves queue memory for one pending write, releasing it on drop.
+///
+/// A permit is acquired before the request enters the channel and held until the
+/// client's answer has been received, which is the whole interval during which
+/// the payload occupies memory: the channel slot, then the write worker's batch,
+/// then the `PendingFlush` awaiting its barrier. Releasing any earlier would
+/// under-count exactly the backlog this bounds.
+///
+/// Tied to a semaphore rather than a counter so that an over-budget writer waits
+/// instead of failing, and so the release cannot be forgotten on an error path —
+/// dropping the guard is the release, and every early return drops it.
+struct WriteBudget {
+    /// `None` for requests too large to ever fit the budget on their own; they
+    /// proceed unmetered rather than deadlocking. A single request cannot exceed
+    /// `MAX_VALUE_SIZE` plus a key, which is far under the budget, so this is
+    /// unreachable in practice and exists so the arithmetic has no failure mode.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl WriteBudget {
+    /// Waits until `bytes` of queue budget is available.
+    async fn acquire(budget: &Arc<Semaphore>, bytes: usize) -> Self {
+        // Clamped because `acquire_many` takes a u32 and panics if the request
+        // exceeds the semaphore's total.
+        let permits = bytes.min(WRITE_QUEUE_MAX_BYTES) as u32;
+        let permit = Arc::clone(budget)
+            .acquire_many_owned(permits.max(1))
+            .await
+            .ok();
+        Self { _permit: permit }
+    }
+}
+
+/// Queue-memory cost of one write request.
+///
+/// Counts payload only. The per-request overhead is a fixed few hundred bytes
+/// against a budget measured in hundreds of megabytes, so tracking it would add
+/// arithmetic without changing when the bound trips.
+fn operation_bytes(operation: &BatchOperation) -> usize {
+    match operation {
+        BatchOperation::Put(key, value) => key.len() + value.len(),
+        BatchOperation::Delete(key) => key.len(),
+    }
+}
+
+fn document_write_bytes(request: &DocumentWrite) -> usize {
+    match request {
+        DocumentWrite::CreateCollection {
+            collection,
+            indexes,
+        } => {
+            collection.len() + indexes.iter().map(|index| index.field.len()).sum::<usize>()
+        }
+        DocumentWrite::Put {
+            collection,
+            id,
+            document,
+        } => collection.len() + id.len() + document.len(),
+        DocumentWrite::Delete { collection, id } => collection.len() + id.len(),
+    }
+}
+
+/// Per-address failed-authentication throttle.
+///
+/// WHY THIS EXISTS: verifying a password is deliberately expensive — that is what
+/// makes the stored hash worth storing. Argon2 with the default parameters costs
+/// tens of milliseconds and a chunk of memory per attempt, so an unauthenticated
+/// peer could pin server CPU and memory just by guessing, and the guesses are
+/// free for it. `--max-auth-jobs` already caps how many verifications run at
+/// once, but a cap alone does not end the attack: it converts CPU exhaustion into
+/// a queue every legitimate client also waits in.
+///
+/// So refusal has to happen BEFORE the verification. After
+/// `AUTH_FAILURE_LIMIT` consecutive failures an address is refused outright for
+/// `AUTH_LOCKOUT`, without touching Argon2 — which is also why the correct
+/// password is refused during a lockout, and why that is the observable proof
+/// the check runs early enough to matter.
+///
+/// Keyed on IP, not on address-with-port: a source port changes per connection,
+/// so counting it would reset on every attempt and never trip.
+///
+/// SCOPE, stated plainly: this raises the cost of online guessing against a
+/// single-credential server. It is not a defence against a distributed attacker,
+/// who simply spreads attempts across addresses, and against a spoofed source it
+/// is a self-inflicted denial of service for the address being impersonated.
+/// The real fix for both is per-principal credentials with revocation, which
+/// this server does not have (see the deferred list in `todo.md`).
+struct AuthThrottle {
+    /// Sorted by nothing — small, capacity-bounded, and only touched on the
+    /// handshake path, so a plain map under a mutex is cheaper than anything
+    /// cleverer. Never held across an `await`.
+    addresses: std::sync::Mutex<HashMap<IpAddr, AuthFailures>>,
+}
+
+struct AuthFailures {
+    consecutive: u32,
+    /// When the most recent failure was recorded, so entries expire.
+    last: Instant,
+}
+
+impl AuthThrottle {
+    fn new() -> Self {
+        Self {
+            addresses: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// True when this address is currently locked out.
+    fn is_locked_out(&self, address: IpAddr) -> bool {
+        let Ok(mut addresses) = self.addresses.lock() else {
+            /* A poisoned throttle must not become an authentication bypass, but
+             * it must not lock everyone out either: the mutex only guards a
+             * counter, and a panic while holding it cannot corrupt anything a
+             * later attempt depends on. Fail open on the throttle and let the
+             * password check decide, which is the pre-throttle behaviour. */
+            return false;
+        };
+        match addresses.get(&address) {
+            Some(failures) if failures.consecutive >= AUTH_FAILURE_LIMIT => {
+                if failures.last.elapsed() < AUTH_LOCKOUT {
+                    true
+                } else {
+                    // The lockout expired: forget it and let this attempt run.
+                    addresses.remove(&address);
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn record_failure(&self, address: IpAddr) {
+        let Ok(mut addresses) = self.addresses.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        // Drop expired entries before inserting, so a long run of one-off
+        // failures from many addresses cannot grow this map without bound.
+        if addresses.len() >= AUTH_THROTTLE_CAPACITY {
+            addresses.retain(|_, failures| failures.last.elapsed() < AUTH_LOCKOUT);
+            /* Still full: every tracked address is live, so this is either a
+             * broad attack or a very large legitimate fleet. Refusing to track
+             * the new address is the safe direction — it gets the ordinary
+             * password check, and the addresses already failing stay locked. */
+            if addresses.len() >= AUTH_THROTTLE_CAPACITY {
+                return;
+            }
+        }
+        let entry = addresses.entry(address).or_insert(AuthFailures {
+            consecutive: 0,
+            last: now,
+        });
+        // Saturating so a very long attack cannot wrap the counter back under
+        // the limit and release the lockout.
+        entry.consecutive = entry.consecutive.saturating_add(1);
+        entry.last = now;
+    }
+
+    /// Clears an address's history after a successful authentication.
+    fn record_success(&self, address: IpAddr) {
+        if let Ok(mut addresses) = self.addresses.lock() {
+            addresses.remove(&address);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChangeEvent {
     sequence: u64,
@@ -368,6 +596,102 @@ struct ChangeEvent {
     value: Option<Vec<u8>>,
     /// Durable position of this change, when it was published to the change log.
     cursor: Option<change_log::Cursor>,
+    /// True when the ring dropped this event's value to stay inside its byte
+    /// bound, so `value` is `None` for a change that was NOT a delete.
+    ///
+    /// Subscribers must not report this as a deletion. They treat it exactly like
+    /// a lagged subscription — tell the client to resynchronize — because that is
+    /// what it is: a change whose contents this server can no longer supply from
+    /// memory. See [`ChangeRing`].
+    elided: bool,
+}
+
+/// Bytes of change payload the broadcast ring may hold.
+///
+/// WHY: the ring keeps the last `--write-queue-capacity` events so slow
+/// subscribers can catch up, and it keeps them whether or not anybody is
+/// subscribed. At the default 4096 events and the 16 MiB `MAX_VALUE_SIZE` that is
+/// another ~64 GiB of resident memory reachable by ordinary writes — the same
+/// exposure as the write queue, on a structure that exists purely as a
+/// convenience for subscribers.
+///
+/// 64 MiB is far more than any subscriber needs to ride out a scheduling hiccup,
+/// and it is bounded regardless of value size.
+const CHANGE_RING_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The change broadcast plus enough accounting to bound its memory.
+///
+/// A `broadcast::Sender` retains the last `capacity` messages and offers no way
+/// to ask how much memory that is, so this mirrors the ring: one entry per live
+/// message, evicted in the same order the channel evicts. That mirror is exact
+/// because tokio's ring holds precisely the most recent `capacity` sends.
+///
+/// When admitting an event would exceed the byte bound, its VALUE is dropped and
+/// `elided` set, rather than dropping the event or blocking the writer. That
+/// choice is deliberate:
+///
+///   - dropping the event would make a subscriber miss a change silently, which
+///     is the one failure a change feed must never have;
+///   - blocking the commit path on subscriber memory would let one idle
+///     subscription stall every writer.
+///
+/// An elided event still carries its key and sequence, so a subscriber learns
+/// that the key changed and is told to resynchronize. Losing the payload is
+/// visible and recoverable; losing the notification is neither.
+struct ChangeRing {
+    sender: broadcast::Sender<ChangeEvent>,
+    /// Sizes of the events currently retained, oldest first, with their total.
+    /// Never held across an `await`.
+    live: std::sync::Mutex<RingBytes>,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct RingBytes {
+    sizes: std::collections::VecDeque<usize>,
+    total: usize,
+}
+
+impl ChangeRing {
+    fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            live: std::sync::Mutex::new(RingBytes::default()),
+            capacity,
+        }
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
+        self.sender.subscribe()
+    }
+
+    /// Publishes one change, eliding its value if the ring is at its byte bound.
+    fn send(&self, mut event: ChangeEvent) {
+        let value_bytes = event.value.as_ref().map_or(0, Vec::len);
+        let mut bytes = event.key.len() + value_bytes;
+        if let Ok(mut live) = self.live.lock() {
+            if live.total + bytes > CHANGE_RING_MAX_BYTES && value_bytes > 0 {
+                /* Keep the notification, drop the payload. A key alone is at
+                 * most `MAX_KEY_SIZE`, so even an all-elided ring stays bounded
+                 * by capacity × 64 KiB. */
+                event.value = None;
+                event.elided = true;
+                bytes = event.key.len();
+            }
+            live.sizes.push_back(bytes);
+            live.total = live.total.saturating_add(bytes);
+            // Mirror the channel's eviction: one message leaves for each that
+            // arrives once the ring is full.
+            while live.sizes.len() > self.capacity {
+                let evicted = live.sizes.pop_front().unwrap_or(0);
+                live.total = live.total.saturating_sub(evicted);
+            }
+        }
+        /* A send with no subscribers is not an error: the ring exists for
+         * whoever attaches next, and the commit path must not care. */
+        let _ = self.sender.send(event);
+    }
 }
 
 enum ReadRequest {
@@ -479,7 +803,7 @@ struct WriteWorkerConfig {
     delay: Duration,
     checkpoint_writes: u64,
     readers: Arc<Vec<RwLock<ReadEngine>>>,
-    changes: broadcast::Sender<ChangeEvent>,
+    changes: Arc<ChangeRing>,
     metrics: Arc<Metrics>,
     /// Set when accumulated writes have crossed the checkpoint threshold, so the
     /// background task compacts instead of a client's commit paying for it.
@@ -493,7 +817,7 @@ struct WriteWorkerConfig {
 
 struct FlushWorkerConfig {
     readers: Arc<Vec<RwLock<ReadEngine>>>,
-    changes: broadcast::Sender<ChangeEvent>,
+    changes: Arc<ChangeRing>,
     metrics: Arc<Metrics>,
     /// The engine, consulted only when a reader refresh fails, to decide
     /// whether a concurrent checkpoint retired the batch's generation (a lost
@@ -567,7 +891,12 @@ struct ServerState {
     password_hash: PasswordHashString,
     database: String,
     auth_limit: Arc<Semaphore>,
-    changes: broadcast::Sender<ChangeEvent>,
+    /// Per-address failed-authentication throttle; see [`AuthThrottle`].
+    auth_throttle: Arc<AuthThrottle>,
+    /// Bytes of pending write payload allowed in the pipeline; see
+    /// [`WRITE_QUEUE_MAX_BYTES`].
+    write_budget: Arc<Semaphore>,
+    changes: Arc<ChangeRing>,
     read_queues: Vec<std::sync::mpsc::SyncSender<ReadRequest>>,
     next_reader: AtomicU64,
     engine: Arc<RwLock<Engine>>,
@@ -722,7 +1051,7 @@ async fn main() -> Result<()> {
     let read_queues = start_read_workers(&readers, args.write_queue_capacity);
     let engine = Arc::new(RwLock::new(engine));
     let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
-    let (change_sender, _) = broadcast::channel(args.write_queue_capacity);
+    let change_sender = Arc::new(ChangeRing::new(args.write_queue_capacity));
     if args.transaction_timeout_seconds == 0
         || args.mvcc_gc_ms == 0
         || args.mvcc_gc_checkpoint_versions == 0
@@ -773,7 +1102,7 @@ async fn main() -> Result<()> {
         flush_receiver,
         FlushWorkerConfig {
             readers: Arc::clone(&readers),
-            changes: change_sender.clone(),
+            changes: Arc::clone(&change_sender),
             metrics: Arc::clone(&metrics),
             engine: Arc::clone(&engine),
             in_flight: Arc::clone(&in_flight),
@@ -790,7 +1119,7 @@ async fn main() -> Result<()> {
             delay: Duration::from_micros(args.write_batch_delay_us),
             checkpoint_writes: args.checkpoint_writes,
             readers: Arc::clone(&readers),
-            changes: change_sender.clone(),
+            changes: Arc::clone(&change_sender),
             metrics: Arc::clone(&metrics),
             checkpoint_due: Arc::clone(&checkpoint_due),
             in_flight,
@@ -803,6 +1132,8 @@ async fn main() -> Result<()> {
         password_hash,
         database: args.database,
         auth_limit: Arc::new(Semaphore::new(args.max_auth_jobs)),
+        auth_throttle: Arc::new(AuthThrottle::new()),
+        write_budget: Arc::new(Semaphore::new(WRITE_QUEUE_MAX_BYTES)),
         changes: change_sender,
         read_queues,
         next_reader: AtomicU64::new(0),
@@ -886,7 +1217,9 @@ async fn main() -> Result<()> {
                 let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_connection(stream, tls_acceptor, state).await {
+                    if let Err(error) =
+                        handle_connection(stream, tls_acceptor, state, peer.ip()).await
+                    {
                         eprintln!("connection {peer} closed: {error}");
                     }
                 });
@@ -900,12 +1233,55 @@ async fn main() -> Result<()> {
         }
     }
 
+    /* DRAIN, WITHOUT THE RACE.
+     *
+     * `Notify::notify_waiters` only wakes waiters that are ALREADY registered —
+     * it stores no permit for a future one. Checking the count and then awaiting
+     * `notified()` left a window between the two in which the last connection
+     * finished and notified nobody, and shutdown then waited the entire
+     * `--shutdown-timeout-seconds` with an idle server. That turned a clean
+     * redeploy into a 30-second stall often enough to look like a hang.
+     *
+     * Registering the future FIRST closes the window: any notification from here
+     * on is delivered to this waiter, so the count can be re-checked safely
+     * afterwards. `tokio::pin!` because the future must stay put across the
+     * check.
+     */
+    let drained = metrics.drained.notified();
+    tokio::pin!(drained);
     if metrics.active_connections.load(Ordering::Acquire) != 0 {
-        let _ = timeout(
-            Duration::from_secs(args.shutdown_timeout_seconds),
-            metrics.drained.notified(),
-        )
-        .await;
+        let _ = timeout(Duration::from_secs(args.shutdown_timeout_seconds), drained).await;
+    }
+
+    /* FINAL SYNC. In `--durability async` mode a commit is acknowledged before
+     * its WAL record is flushed, and the background syncer runs on an interval,
+     * so a clean shutdown here would otherwise discard whatever landed in that
+     * last interval — losing acknowledged writes on an ORDERLY stop, which is
+     * exactly when an operator expects nothing to be lost. In durable mode this
+     * is a cheap no-op: everything is already synced.
+     *
+     * `spawn_blocking` because `sync` is blocking, and failures are reported
+     * rather than ignored: a shutdown that could not make acknowledged writes
+     * durable must not exit 0 and let a deploy script conclude all is well.
+     */
+    let sync_engine = Arc::clone(&engine);
+    match task::spawn_blocking(move || {
+        sync_engine
+            .write()
+            .map_err(|_| StorageError::Poisoned)?
+            .sync()
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            eprintln!("failed to sync storage on shutdown: {error}");
+            bail!("shutdown could not make acknowledged writes durable: {error}");
+        }
+        Err(error) => {
+            eprintln!("storage sync task failed on shutdown: {error}");
+            bail!("shutdown could not make acknowledged writes durable");
+        }
     }
     println!("vyrnd shutdown complete");
     Ok(())
@@ -928,6 +1304,7 @@ async fn handle_connection(
     stream: TcpStream,
     tls_acceptor: Option<TlsAcceptor>,
     state: Arc<ServerState>,
+    peer: IpAddr,
 ) -> Result<()> {
     state
         .metrics
@@ -944,7 +1321,13 @@ async fn handle_connection(
     } else {
         Box::new(stream)
     };
-    let mut framed = Framed::new(transport, VyrnCodec::default());
+    // Small ceiling for the handshake; raised after authentication below.
+    let mut framed = Framed::new(
+        transport,
+        VyrnCodec::builder()
+            .max_frame_length(PREAUTH_MAX_FRAME_SIZE)
+            .build(),
+    );
     let Some(first) = next_message(&mut framed, HANDSHAKE_TIMEOUT).await? else {
         return Ok(());
     };
@@ -960,29 +1343,44 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let authenticated = match first.message {
-        Message::Authenticate {
-            username,
-            password,
-            database,
-        } if password.len() <= 4096 => {
-            let permit = Arc::clone(&state.auth_limit).acquire_owned().await?;
-            let expected_username = state.username.clone();
-            let expected_database = state.database.clone();
-            let password_hash = state.password_hash.clone();
-            task::spawn_blocking(move || {
-                let _permit = permit;
-                let verified = Argon2::default()
-                    .verify_password(password.as_bytes(), &password_hash.password_hash())
-                    .is_ok();
-                verified && username == expected_username && database == expected_database
-            })
-            .await
-            .context("authentication worker failed")?
+    /* Locked-out addresses are refused here, BEFORE the Argon2 verification and
+     * before the auth-job permit is taken. That ordering is the whole point:
+     * refusing after the hash would leave the expensive work reachable by an
+     * unauthenticated peer, which is what the throttle exists to prevent. */
+    let authenticated = if state.auth_throttle.is_locked_out(peer) {
+        false
+    } else {
+        match first.message {
+            Message::Authenticate {
+                username,
+                password,
+                database,
+            } if password.len() <= 4096 => {
+                let permit = Arc::clone(&state.auth_limit).acquire_owned().await?;
+                let expected_username = state.username.clone();
+                let expected_database = state.database.clone();
+                let password_hash = state.password_hash.clone();
+                task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let verified = Argon2::default()
+                        .verify_password(password.as_bytes(), &password_hash.password_hash())
+                        .is_ok();
+                    verified && username == expected_username && database == expected_database
+                })
+                .await
+                .context("authentication worker failed")?
+            }
+            _ => false,
         }
-        _ => false,
     };
     if !authenticated {
+        /* Counted before the response is written, so a rejection is recorded even
+         * if the peer has already gone away and the write fails. */
+        state
+            .metrics
+            .auth_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        state.auth_throttle.record_failure(peer);
         send_error(
             &mut framed,
             first.request_id,
@@ -992,11 +1390,53 @@ async fn handle_connection(
         .await?;
         return Ok(());
     }
-    framed
-        .send(Envelope::new(first.request_id, Message::Authenticated))
-        .await?;
+    state.auth_throttle.record_success(peer);
+    send_frame(
+        &mut framed,
+        Envelope::new(first.request_id, Message::Authenticated),
+    )
+    .await?;
+    /* The peer is trusted now, so it gets the full frame ceiling. Swapping the
+     * codec keeps any bytes already buffered: `map_codec` preserves the read
+     * buffer, and a client that pipelined its first request behind the
+     * handshake would otherwise have it silently dropped. */
+    let framed = framed.map_codec(|_| VyrnCodec::default());
     let mut transaction: Option<ConnectionTransaction> = None;
 
+    /* The session runs in its own function purely so that the release below is
+     * unavoidable.
+     *
+     * WHY: a transaction pins an engine snapshot, and that pin is what stops
+     * MVCC collection from reclaiming versions the transaction can still see.
+     * The loop is full of `?` on response writes, and a client that vanishes
+     * mid-transaction makes those writes fail — which returned straight out of
+     * `handle_connection`, past the release. The pin then survived the
+     * connection that owned it, and because the MVCC floor is the minimum over
+     * live snapshots, one such disconnect stopped version collection for the
+     * remaining lifetime of the process: history grew without bound while every
+     * metric still looked healthy.
+     *
+     * Holding the release in the caller makes every exit — clean end, protocol
+     * error, failed write, or an early `return` some later edit adds inside the
+     * loop — pass through it.
+     */
+    let session = run_session(framed, Arc::clone(&state), &mut transaction).await;
+    if let Some(transaction) = transaction {
+        release_transaction_snapshot(&state, transaction.sequence).await;
+    }
+    session
+}
+
+/// Serves authenticated requests until the connection ends.
+///
+/// Takes the transaction by `&mut` rather than owning it so that
+/// `handle_connection` still sees an in-progress transaction after any exit
+/// from here and can release its snapshot pin. See the comment at the call site.
+async fn run_session(
+    mut framed: Framed<BoxedTransport, VyrnCodec>,
+    state: Arc<ServerState>,
+    transaction: &mut Option<ConnectionTransaction>,
+) -> Result<()> {
     let mut connection_error = None;
     loop {
         let request_timeout = transaction
@@ -1176,7 +1616,7 @@ async fn handle_connection(
             Message::Begin if transaction.is_none() => {
                 match register_transaction_snapshot(&state).await {
                     Ok(sequence) => {
-                        transaction = Some(ConnectionTransaction {
+                        *transaction = Some(ConnectionTransaction {
                             sequence,
                             started: tokio::time::Instant::now(),
                             read_keys: BTreeMap::new(),
@@ -1222,10 +1662,7 @@ async fn handle_connection(
                 }
             }
         };
-        framed.send(Envelope::new(request_id, response)).await?;
-    }
-    if let Some(transaction) = transaction {
-        release_transaction_snapshot(&state, transaction.sequence).await;
+        send_frame(&mut framed, Envelope::new(request_id, response)).await?;
     }
     match connection_error {
         Some(error) => Err(error),
@@ -1240,13 +1677,20 @@ async fn handle_connection(
 /// behind the writer before doing any work.
 async fn register_transaction_snapshot(state: &ServerState) -> std::result::Result<u64, String> {
     let engine = Arc::clone(&state.engine);
-    task::spawn_blocking(move || {
+    let sequence = task::spawn_blocking(move || {
         let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
         Ok::<_, StorageError>(engine.register_snapshot_shared())
     })
     .await
     .map_err(|_| "snapshot registration task failed".to_owned())?
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    // Counted only once the pin actually exists, so a failed registration cannot
+    // inflate the gauge that is used to detect leaks.
+    state
+        .metrics
+        .active_transaction_snapshots
+        .fetch_add(1, Ordering::Relaxed);
+    Ok(sequence)
 }
 
 /// Releases a transaction's snapshot.
@@ -1256,12 +1700,29 @@ async fn register_transaction_snapshot(state: &ServerState) -> std::result::Resu
 /// write lock on every single commit.
 async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
     let engine = Arc::clone(&state.engine);
-    let _ = task::spawn_blocking(move || {
+    let released = task::spawn_blocking(move || {
         if let Ok(engine) = engine.read() {
             engine.release_snapshot_shared(sequence);
+            true
+        } else {
+            false
         }
     })
     .await;
+    /* Decremented only when the pin was really dropped. A poisoned lock leaves
+     * the snapshot pinned, and the gauge should keep saying so — that is exactly
+     * the state an operator needs to see, and hiding it would defeat the purpose
+     * of publishing the number. */
+    if matches!(released, Ok(true)) {
+        let _ = state
+            .metrics
+            .active_transaction_snapshots
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                // Saturating: a double release would otherwise wrap the gauge to
+                // u64::MAX and look like a catastrophic leak.
+                Some(count.saturating_sub(1))
+            });
+    }
 }
 
 /// Feeds WAL records to a replica and collects its acknowledgements.
@@ -1374,17 +1835,38 @@ async fn stream_changes(
 ) -> Result<()> {
     loop {
         match receiver.recv().await {
+            /* An elided event has lost its payload to the ring's byte bound, so
+             * forwarding it would say `value: None` — indistinguishable from a
+             * delete, and a subscriber applying that would erase a live key.
+             * Treated like a lag, because it is the same situation: this server
+             * cannot supply the contents from memory, and the client must reread.
+             * Checked before the prefix filter so the guard cannot be skipped. */
+            Ok(change) if change.elided => {
+                if change.key.starts_with(&prefix) {
+                    send_error(
+                        framed,
+                        0,
+                        ErrorCode::Storage,
+                        "change payload dropped under memory pressure; \
+                         reconnect and resynchronize",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             Ok(change) if change.key.starts_with(&prefix) => {
-                framed
-                    .send(Envelope::new(
+                send_frame(
+                    framed,
+                    Envelope::new(
                         0,
                         Message::Change {
                             sequence: change.sequence,
                             key: change.key,
                             value: change.value,
                         },
-                    ))
-                    .await?;
+                    ),
+                )
+                .await?;
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1410,21 +1892,38 @@ async fn stream_document_changes(
 ) -> Result<()> {
     loop {
         match receiver.recv().await {
+            // See `stream_changes`: a payload the ring dropped must not reach a
+            // subscriber as `document: None`, which reads as a deletion.
+            Ok(change) if change.elided => {
+                if change.key.starts_with(&prefix) {
+                    send_error(
+                        framed,
+                        0,
+                        ErrorCode::Storage,
+                        "change payload dropped under memory pressure; \
+                         reconnect and resynchronize",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
             Ok(change) if change.key.starts_with(&prefix) => {
                 let Ok(id) = vyrn_core::document::document_id_from_key(collection, &change.key)
                 else {
                     continue;
                 };
-                framed
-                    .send(Envelope::new(
+                send_frame(
+                    framed,
+                    Envelope::new(
                         0,
                         Message::DocumentChange {
                             sequence: change.sequence,
                             id,
                             document: change.value,
                         },
-                    ))
-                    .await?;
+                    ),
+                )
+                .await?;
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1532,6 +2031,25 @@ async fn stream_from_cursor(
                 // Skip anything the backlog replay already delivered.
                 if change.cursor.is_some_and(|position| position <= cursor) {
                     continue;
+                }
+                /* The ring dropped this payload, but a cursor subscription is
+                 * recoverable without the client doing anything: the change log
+                 * on disk still has the record. Tell it to resume from the last
+                 * cursor actually delivered — NOT from this event's position,
+                 * which would skip the change whose payload is missing. */
+                if change.elided {
+                    send_error(
+                        framed,
+                        0,
+                        ErrorCode::Storage,
+                        &format!(
+                            "change payload dropped under memory pressure; \
+                             resume from cursor {}",
+                            cursor.to_token()
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
                 }
                 if let Some(position) = change.cursor {
                     cursor = position;
@@ -2071,6 +2589,7 @@ fn encode_documents(documents: Vec<vyrn_core::document::Document>) -> vyrn_core:
 }
 
 async fn submit_document(state: &Arc<ServerState>, request: DocumentWrite) -> Message {
+    let _budget = WriteBudget::acquire(&state.write_budget, document_write_bytes(&request)).await;
     let (sender, receiver) = oneshot::channel();
     if state
         .writes
@@ -2091,6 +2610,8 @@ async fn submit_document(state: &Arc<ServerState>, request: DocumentWrite) -> Me
 }
 
 async fn submit_write(state: &Arc<ServerState>, operation: BatchOperation) -> Message {
+    // Held until this request has been answered; see `WriteBudget`.
+    let _budget = WriteBudget::acquire(&state.write_budget, operation_bytes(&operation)).await;
     let (sender, receiver) = oneshot::channel();
     if state
         .writes
@@ -2279,7 +2800,7 @@ async fn commit_transaction(
         release_transaction_snapshot(state, snapshot_sequence).await;
         return Message::Committed;
     }
-    let operations = transaction
+    let operations: Vec<_> = transaction
         .writes
         .into_iter()
         .map(|(key, value)| match value {
@@ -2287,6 +2808,15 @@ async fn commit_transaction(
             None => BatchOperation::Delete(key),
         })
         .collect();
+    /* A transaction is the largest thing that enters the queue — every write it
+     * accumulated arrives as one request — so this is the path the byte bound
+     * exists for. Acquired after the early return above, so an empty commit
+     * never waits on budget. */
+    let _budget = WriteBudget::acquire(
+        &state.write_budget,
+        operations.iter().map(operation_bytes).sum(),
+    )
+    .await;
     let (sender, receiver) = oneshot::channel();
     if state
         .writes
@@ -2498,28 +3028,84 @@ fn start_async_sync(engine: Arc<RwLock<Engine>>, interval: Duration, metrics: Ar
     });
 }
 
+/// Starts the write pipeline under supervision.
+///
+/// WHY: the pipeline is a single task, and if it dies — a panic today, or
+/// an early return some future edit introduces — writes would fail while
+/// `/health/ready` kept answering 200 forever. Silence is the worst failure
+/// mode a readiness probe exists to catch, so the probe is wired to the
+/// worker's survival: an abnormal termination marks storage failed and
+/// readiness down exactly like an engine error does, plus stderr.
+///
+/// RESTART IS DELIBERATELY NOT ATTEMPTED. A batch can be half-way through
+/// the pipeline at death: applied to the tree with its WAL record written
+/// but not yet flushed or acknowledged, while `in_flight` and
+/// `flush_completed` carry barrier accounting shared with the flush stage.
+/// A replacement worker cannot know which requests were already applied,
+/// so restarting risks answering a client twice for one commit, or
+/// stranding later batches behind a barrier nobody will ever complete.
+/// A panic here is a bug rather than a transient fault, so the honest
+/// behaviour is readiness down and "storage writer stopped" errors until
+/// an operator restarts the process, which recovery handles cleanly.
 fn start_write_worker(
+    engine: Arc<RwLock<Engine>>,
+    receiver: mpsc::Receiver<WriteRequest>,
+    flushes: mpsc::Sender<PendingFlush>,
+    config: WriteWorkerConfig,
+) {
+    let metrics = Arc::clone(&config.metrics);
+    tokio::spawn(async move {
+        let pipeline = task::spawn(run_write_pipeline(engine, receiver, flushes, config));
+        match pipeline.await {
+            /* A clean return happens only when every write sender was
+             * dropped, which is process shutdown. The flush-stage-gone exit
+             * reports itself inside the pipeline. */
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!(
+                    "write worker terminated abnormally: {error}; \
+                     writes are unavailable until the process is restarted"
+                );
+                metrics.storage_failed.store(true, Ordering::Release);
+                metrics.ready.store(false, Ordering::Release);
+            }
+        }
+    });
+}
+
+async fn run_write_pipeline(
     engine: Arc<RwLock<Engine>>,
     mut receiver: mpsc::Receiver<WriteRequest>,
     flushes: mpsc::Sender<PendingFlush>,
     config: WriteWorkerConfig,
 ) {
-    tokio::spawn(async move {
-        let mut writes_since_checkpoint = 0_u64;
-        let mut pending = None;
-        loop {
-            let first = match pending.take() {
+    let mut writes_since_checkpoint = 0_u64;
+    let mut pending = None;
+    loop {
+        let first = match pending.take() {
+            Some(request) => request,
+            None => match receiver.recv().await {
                 Some(request) => request,
-                None => match receiver.recv().await {
-                    Some(request) => request,
-                    None => break,
-                },
-            };
-            let mut requests = vec![first];
-            if matches!(requests.first(), Some(WriteRequest::Document { .. })) {
-                let Some(WriteRequest::Document { request, response }) = requests.pop() else {
-                    unreachable!()
-                };
+                None => break,
+            },
+        };
+        /* Non-data requests are dispatched by MOVING the request out of `first`
+         * in one exhaustive match, rather than by pushing it into the batch and
+         * popping it back out under a `matches!` guard.
+         *
+         * The guard-and-pop version needed `unreachable!()` arms to discharge
+         * pattern matches the guard had already decided. Each one was a panic in
+         * the write pipeline — which takes down writes for EVERY client, not just
+         * the request that tripped it — sitting one careless edit away from a new
+         * request kind that the guard and the pattern disagreed about. Matching
+         * on the value proves the correspondence to the compiler, so a new
+         * variant becomes a compile error here instead of a runtime panic.
+         *
+         * Data requests fall through to the batching path below, carrying the
+         * request with them.
+         */
+        let first = match first {
+            WriteRequest::Document { request, response } => {
                 let engine = Arc::clone(&engine);
                 let result = task::spawn_blocking(move || {
                     let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
@@ -2551,7 +3137,7 @@ fn start_write_worker(
                             }
                         }
                         for record in published {
-                            let _ = config.changes.send(ChangeEvent {
+                            config.changes.send(ChangeEvent {
                                 sequence: record.sequence,
                                 key: record.key,
                                 value: record.value,
@@ -2559,6 +3145,8 @@ fn start_write_worker(
                                     record.sequence,
                                     record.index,
                                 )),
+                                // The ring sets this if it has to shed the payload.
+                                elided: false,
                             });
                         }
                         let _ = response.send(match outcome {
@@ -2579,324 +3167,359 @@ fn start_write_worker(
                 }
                 continue;
             }
-            if matches!(
-                requests.first(),
-                Some(WriteRequest::CreateIndex { .. } | WriteRequest::DropIndex { .. })
-            ) {
-                let request = requests.pop().unwrap();
+            /* Index changes rewrite the whole index under the engine write lock,
+             * so they run alone rather than joining a batch. Both arms are
+             * handled here, with the response extracted before the blocking task
+             * so the task returns only the result. */
+            WriteRequest::CreateIndex {
+                name,
+                unique,
+                response,
+            } => {
                 let engine = Arc::clone(&engine);
                 let result = task::spawn_blocking(move || {
                     let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-                    match request {
-                        WriteRequest::CreateIndex {
-                            name,
-                            unique,
-                            response,
-                        } => {
-                            let result = engine.create_index(name, unique);
-                            Ok::<_, StorageError>((response, result))
-                        }
-                        WriteRequest::DropIndex { name, response } => {
-                            let result = engine.drop_index(&name);
-                            Ok((response, result))
-                        }
-                        _ => unreachable!(),
-                    }
+                    Ok::<_, StorageError>(engine.create_index(name, unique))
                 })
                 .await;
-                match result {
-                    Ok(Ok((response, result))) => {
-                        let _ = response.send(result);
-                    }
-                    Ok(Err(error)) => record_storage_error(&config.metrics, &error),
-                    Err(_) => {
-                        config.metrics.storage_failed.store(true, Ordering::Release);
-                        config.metrics.ready.store(false, Ordering::Release);
-                    }
-                }
+                finish_index_change(&config, response, result);
                 continue;
             }
-            // Group-commit: collect more single writes or transactions so one
-            // page/WAL flush covers many clients. Each transaction is still
-            // validated against its own snapshot below, so batching does not
-            // weaken serializability.
-            if matches!(
-                requests.first(),
-                Some(WriteRequest::Operation { .. } | WriteRequest::Transaction { .. })
-            ) {
-                // Take everything already queued first. Under load the queue is
-                // rarely empty, and sleeping in that case only adds latency to a
-                // batch that was already worth committing.
-                drain_writes(
-                    &mut receiver,
-                    &mut requests,
-                    &mut pending,
-                    config.maximum_batch,
-                );
-                // Then keep accumulating for as long as a barrier is already in
-                // flight. Those clients cannot be answered until that flush
-                // finishes regardless, so the wait is free, and it is self-tuning:
-                // on slow storage the flush is long and batches grow, on fast
-                // storage it returns immediately and latency stays low.
-                //
-                // Without this, the pipeline's own success works against it. When
-                // the flush blocked the write worker, arriving requests piled up
-                // behind it and were swept into one batch; now that it does not
-                // block, each small batch would take its own barrier.
-                if requests.len() < config.maximum_batch {
-                    let mut completed = config.flush_completed.subscribe();
-                    // A hard ceiling, so a permanently busy flush stage cannot
-                    // hold a batch open indefinitely.
-                    let deadline = tokio::time::Instant::now() + config.delay;
-                    while requests.len() < config.maximum_batch
-                        && config.in_flight.load(Ordering::Acquire) > 0
-                    {
-                        let timeout = tokio::time::sleep_until(deadline);
-                        tokio::select! {
-                            biased;
-                            received = receiver.recv() => match received {
-                                Some(
-                                    request @ (WriteRequest::Operation { .. }
-                                    | WriteRequest::Transaction { .. }),
-                                ) => requests.push(request),
-                                Some(request) => {
-                                    pending = Some(request);
-                                    break;
-                                }
-                                None => break,
-                            },
-                            // The barrier this batch was waiting behind has landed,
-                            // so stop accumulating and commit what is here.
-                            _ = completed.changed() => break,
-                            _ = timeout => break,
-                        }
-                    }
-                }
-            }
-            // Validate every batched transaction against its own snapshot, and
-            // also against the writes of earlier transactions in this same batch
-            // so grouping cannot let two conflicting commits through together.
-            if requests
-                .iter()
-                .any(|request| matches!(request, WriteRequest::Transaction { .. }))
-            {
-                let checks: Vec<_> = requests
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, request)| match request {
-                        WriteRequest::Transaction {
-                            snapshot_sequence,
-                            read_keys,
-                            read_ranges,
-                            index_reads,
-                            operations,
-                            index_updates,
-                            ..
-                        } => Some(TransactionCheck {
-                            index,
-                            snapshot_sequence: *snapshot_sequence,
-                            read_keys: read_keys.clone(),
-                            read_ranges: read_ranges.clone(),
-                            index_reads: index_reads.clone(),
-                            operations: operations.clone(),
-                            index_updates: index_updates.clone(),
-                        }),
-                        _ => None,
-                    })
-                    .collect();
-                let conflict_engine = Arc::clone(&engine);
-                let verdict = task::spawn_blocking(move || {
-                    let engine = conflict_engine.read().map_err(|_| StorageError::Poisoned)?;
-                    let mut rejected = Vec::new();
-                    // A hash set rather than a list: scanning every earlier write
-                    // for each read key made validation quadratic in batch size,
-                    // which capped transaction throughput as queue depth grew.
-                    let mut committed_keys: HashSet<Vec<u8>> = HashSet::new();
-                    for check in &checks {
-                        let overlaps_batch = check
-                            .read_keys
-                            .iter()
-                            .any(|key| committed_keys.contains(key));
-                        if overlaps_batch
-                            || has_conflict(
-                                &engine,
-                                check.snapshot_sequence,
-                                &check.read_keys,
-                                &check.read_ranges,
-                                &check.index_reads,
-                                &check.operations,
-                                &check.index_updates,
-                            )?
-                        {
-                            rejected.push(check.index);
-                        } else {
-                            committed_keys.extend(
-                                check.operations.iter().map(|op| operation_key(op).to_vec()),
-                            );
-                        }
-                    }
-                    Ok::<_, StorageError>(rejected)
+            WriteRequest::DropIndex { name, response } => {
+                let engine = Arc::clone(&engine);
+                let result = task::spawn_blocking(move || {
+                    let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+                    Ok::<_, StorageError>(engine.drop_index(&name))
                 })
                 .await;
-                match verdict {
-                    Ok(Ok(rejected)) if !rejected.is_empty() => {
-                        // Answer the conflicted transactions now and re-queue the
-                        // rest of the batch for this same loop iteration.
-                        let mut survivors = Vec::with_capacity(requests.len());
-                        let mut conflicted = Vec::with_capacity(rejected.len());
-                        for (index, request) in requests.into_iter().enumerate() {
-                            if rejected.contains(&index) {
-                                conflicted.push(request);
-                            } else {
-                                survivors.push(request);
+                finish_index_change(&config, response, result);
+                continue;
+            }
+            // Data requests: batched below.
+            request @ (WriteRequest::Operation { .. } | WriteRequest::Transaction { .. }) => request,
+        };
+        let mut requests = vec![first];
+        // Group-commit: collect more single writes or transactions so one
+        // page/WAL flush covers many clients. Each transaction is still
+        // validated against its own snapshot below, so batching does not
+        // weaken serializability.
+        if matches!(
+            requests.first(),
+            Some(WriteRequest::Operation { .. } | WriteRequest::Transaction { .. })
+        ) {
+            // Take everything already queued first. Under load the queue is
+            // rarely empty, and sleeping in that case only adds latency to a
+            // batch that was already worth committing.
+            drain_writes(
+                &mut receiver,
+                &mut requests,
+                &mut pending,
+                config.maximum_batch,
+            );
+            // Then keep accumulating for as long as a barrier is already in
+            // flight. Those clients cannot be answered until that flush
+            // finishes regardless, so the wait is free, and it is self-tuning:
+            // on slow storage the flush is long and batches grow, on fast
+            // storage it returns immediately and latency stays low.
+            //
+            // Without this, the pipeline's own success works against it. When
+            // the flush blocked the write worker, arriving requests piled up
+            // behind it and were swept into one batch; now that it does not
+            // block, each small batch would take its own barrier.
+            if requests.len() < config.maximum_batch {
+                let mut completed = config.flush_completed.subscribe();
+                // A hard ceiling, so a permanently busy flush stage cannot
+                // hold a batch open indefinitely.
+                let deadline = tokio::time::Instant::now() + config.delay;
+                while requests.len() < config.maximum_batch
+                    && config.in_flight.load(Ordering::Acquire) > 0
+                {
+                    let timeout = tokio::time::sleep_until(deadline);
+                    tokio::select! {
+                        biased;
+                        received = receiver.recv() => match received {
+                            Some(
+                                request @ (WriteRequest::Operation { .. }
+                                | WriteRequest::Transaction { .. }),
+                            ) => requests.push(request),
+                            Some(request) => {
+                                pending = Some(request);
+                                break;
                             }
-                        }
-                        respond_writes(conflicted, Err(StorageError::Conflict.to_string()));
-                        requests = survivors;
-                        if requests.is_empty() {
-                            continue;
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        record_storage_error(&config.metrics, &error);
-                        respond_writes(requests, Err(error.to_string()));
-                        continue;
-                    }
-                    Err(_) => {
-                        config.metrics.storage_failed.store(true, Ordering::Release);
-                        config.metrics.ready.store(false, Ordering::Release);
-                        respond_writes(requests, Err("conflict check task failed".into()));
-                        continue;
+                            None => break,
+                        },
+                        // The barrier this batch was waiting behind has landed,
+                        // so stop accumulating and commit what is here.
+                        _ = completed.changed() => break,
+                        _ = timeout => break,
                     }
                 }
             }
-            // Everything up to here — queue wait, accumulation, and any conflict
-            // validation — is time a client spent before its batch could start
-            // work, so it is charged per request rather than per batch.
-            let batch_closed = Instant::now();
-            {
-                let profile = &config.metrics.write_profile;
-                for queued in requests.iter().filter_map(WriteRequest::queued) {
-                    profile
-                        .front
-                        .record(batch_closed.saturating_duration_since(queued));
-                    profile.requests.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            let operations: Vec<_> = requests
+        }
+        // Validate every batched transaction against its own snapshot, and
+        // also against the writes of earlier transactions in this same batch
+        // so grouping cannot let two conflicting commits through together.
+        if requests
+            .iter()
+            .any(|request| matches!(request, WriteRequest::Transaction { .. }))
+        {
+            let checks: Vec<_> = requests
                 .iter()
-                .flat_map(|request| match request {
-                    WriteRequest::Operation { operation, .. } => vec![operation.clone()],
-                    WriteRequest::Transaction { operations, .. } => operations.clone(),
-                    WriteRequest::Document { .. }
-                    | WriteRequest::CreateIndex { .. }
-                    | WriteRequest::DropIndex { .. } => {
-                        unreachable!()
+                .enumerate()
+                .filter_map(|(index, request)| match request {
+                    WriteRequest::Transaction {
+                        snapshot_sequence,
+                        read_keys,
+                        read_ranges,
+                        index_reads,
+                        operations,
+                        index_updates,
+                        ..
+                    } => Some(TransactionCheck {
+                        index,
+                        snapshot_sequence: *snapshot_sequence,
+                        read_keys: read_keys.clone(),
+                        read_ranges: read_ranges.clone(),
+                        index_reads: index_reads.clone(),
+                        operations: operations.clone(),
+                        index_updates: index_updates.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let conflict_engine = Arc::clone(&engine);
+            let verdict = task::spawn_blocking(move || {
+                let engine = conflict_engine.read().map_err(|_| StorageError::Poisoned)?;
+                let mut rejected = Vec::new();
+                // A hash set rather than a list: scanning every earlier write
+                // for each read key made validation quadratic in batch size,
+                // which capped transaction throughput as queue depth grew.
+                let mut committed_keys: HashSet<Vec<u8>> = HashSet::new();
+                for check in &checks {
+                    let overlaps_batch = check
+                        .read_keys
+                        .iter()
+                        .any(|key| committed_keys.contains(key));
+                    if overlaps_batch
+                        || has_conflict(
+                            &engine,
+                            check.snapshot_sequence,
+                            &check.read_keys,
+                            &check.read_ranges,
+                            &check.index_reads,
+                            &check.operations,
+                            &check.index_updates,
+                        )?
+                    {
+                        rejected.push(check.index);
+                    } else {
+                        committed_keys.extend(
+                            check.operations.iter().map(|op| operation_key(op).to_vec()),
+                        );
                     }
-                })
-                .collect();
-            let index_updates: Vec<_> = requests
-                .iter()
-                .flat_map(|request| match request {
-                    WriteRequest::Transaction { index_updates, .. } => index_updates.clone(),
-                    _ => Vec::new(),
-                })
-                .collect();
-            let operation_count = operations.len() as u64;
-            config.metrics.write_batches.fetch_add(1, Ordering::Relaxed);
-            config
-                .metrics
-                .batched_writes
-                .fetch_add(operation_count, Ordering::Relaxed);
-            // Checkpoint compaction rewrites the whole tree, so it is handed to
-            // the background task rather than run inline. Otherwise the client
-            // whose commit happened to cross the threshold pays for compacting
-            // everyone else's writes, which is what produced the write-path p95
-            // spikes.
-            let should_checkpoint =
-                writes_since_checkpoint + operation_count >= config.checkpoint_writes;
-            if should_checkpoint {
-                config.checkpoint_due.store(true, Ordering::Release);
-            }
-            // Moved rather than cloned: a 128-key batch of 128-byte values copied
-            // every key and value twice on the way to the engine.
-            let commit_operations = operations;
-            let commit_index_updates = index_updates;
-            let apply_engine = Arc::clone(&engine);
-            // Apply the batch and write its WAL record, but do not flush here.
-            // The flush is the most expensive part of a commit, and holding the
-            // write lock across it would stop the next batch from doing any work
-            // until this one is durable.
-            let result = task::spawn_blocking(move || {
-                let mut engine = apply_engine.write().map_err(|_| StorageError::Poisoned)?;
-                let locked = Instant::now();
-                let (results, lsn) = if commit_index_updates.is_empty() {
-                    engine.write_batch_deferred(commit_operations)?
-                } else {
-                    engine.write_indexed_deferred(commit_operations, commit_index_updates)?
-                };
-                // The engine records what it published, so no change-log scan is
-                // needed on the commit path.
-                let published = engine.last_published().to_vec();
-                let (generation, root, len) = engine.committed_root();
-                Ok::<_, StorageError>((
-                    PendingFlush {
-                        lsn,
-                        requests: Vec::new(),
-                        results,
-                        published,
-                        generation,
-                        root,
-                        len,
-                        queued: locked,
-                    },
-                    locked,
-                ))
+                }
+                Ok::<_, StorageError>(rejected)
             })
             .await;
-            match result {
-                Ok(Ok((mut flush, locked))) => {
-                    let applied = Instant::now();
-                    let profile = &config.metrics.write_profile;
-                    profile.batches.fetch_add(1, Ordering::Relaxed);
-                    profile
-                        .lock
-                        .record(locked.saturating_duration_since(batch_closed));
-                    profile
-                        .apply
-                        .record(applied.saturating_duration_since(locked));
-                    flush.queued = applied;
-                    flush.requests = requests;
-                    writes_since_checkpoint = if should_checkpoint {
-                        config.metrics.checkpoints.fetch_add(1, Ordering::Relaxed);
-                        0
-                    } else {
-                        writes_since_checkpoint + operation_count
-                    };
-                    // Counted before queueing so the next iteration sees that a
-                    // barrier is outstanding and accumulates behind it.
-                    config.in_flight.fetch_add(1, Ordering::AcqRel);
-                    // Queued rather than awaited: the completion stage flushes and
-                    // acknowledges in arrival order while this loop moves on to the
-                    // next batch, so the barrier is amortised across committers.
-                    if flushes.send(flush).await.is_err() {
-                        config.in_flight.fetch_sub(1, Ordering::AcqRel);
-                        return;
+            match verdict {
+                Ok(Ok(rejected)) if !rejected.is_empty() => {
+                    // Answer the conflicted transactions now and re-queue the
+                    // rest of the batch for this same loop iteration.
+                    let mut survivors = Vec::with_capacity(requests.len());
+                    let mut conflicted = Vec::with_capacity(rejected.len());
+                    for (index, request) in requests.into_iter().enumerate() {
+                        if rejected.contains(&index) {
+                            conflicted.push(request);
+                        } else {
+                            survivors.push(request);
+                        }
+                    }
+                    respond_writes(conflicted, Err(StorageError::Conflict.to_string()));
+                    requests = survivors;
+                    if requests.is_empty() {
+                        continue;
                     }
                 }
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     record_storage_error(&config.metrics, &error);
                     respond_writes(requests, Err(error.to_string()));
+                    continue;
                 }
                 Err(_) => {
                     config.metrics.storage_failed.store(true, Ordering::Release);
                     config.metrics.ready.store(false, Ordering::Release);
-                    respond_writes(requests, Err("storage writer task failed".into()));
+                    respond_writes(requests, Err("conflict check task failed".into()));
+                    continue;
                 }
             }
         }
-    });
+        // Everything up to here — queue wait, accumulation, and any conflict
+        // validation — is time a client spent before its batch could start
+        // work, so it is charged per request rather than per batch.
+        let batch_closed = Instant::now();
+        {
+            let profile = &config.metrics.write_profile;
+            for queued in requests.iter().filter_map(WriteRequest::queued) {
+                profile
+                    .front
+                    .record(batch_closed.saturating_duration_since(queued));
+                profile.requests.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        /* Only data requests reach here — the dispatch match above `continue`s on
+         * every other kind, and `drain_writes` parks them in `pending`. An empty
+         * contribution rather than a panic if that ever stops holding: a
+         * misrouted request then gets an error from `respond_writes` below and
+         * the pipeline keeps serving everyone else, where a panic would take
+         * writes down for every connected client. */
+        let operations: Vec<_> = requests
+            .iter()
+            .flat_map(|request| match request {
+                WriteRequest::Operation { operation, .. } => vec![operation.clone()],
+                WriteRequest::Transaction { operations, .. } => operations.clone(),
+                WriteRequest::Document { .. }
+                | WriteRequest::CreateIndex { .. }
+                | WriteRequest::DropIndex { .. } => Vec::new(),
+            })
+            .collect();
+        let index_updates: Vec<_> = requests
+            .iter()
+            .flat_map(|request| match request {
+                WriteRequest::Transaction { index_updates, .. } => index_updates.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let operation_count = operations.len() as u64;
+        config.metrics.write_batches.fetch_add(1, Ordering::Relaxed);
+        config
+            .metrics
+            .batched_writes
+            .fetch_add(operation_count, Ordering::Relaxed);
+        // Checkpoint compaction rewrites the whole tree, so it is handed to
+        // the background task rather than run inline. Otherwise the client
+        // whose commit happened to cross the threshold pays for compacting
+        // everyone else's writes, which is what produced the write-path p95
+        // spikes.
+        let should_checkpoint =
+            writes_since_checkpoint + operation_count >= config.checkpoint_writes;
+        if should_checkpoint {
+            config.checkpoint_due.store(true, Ordering::Release);
+        }
+        // Moved rather than cloned: a 128-key batch of 128-byte values copied
+        // every key and value twice on the way to the engine.
+        let commit_operations = operations;
+        let commit_index_updates = index_updates;
+        let apply_engine = Arc::clone(&engine);
+        // Apply the batch and write its WAL record, but do not flush here.
+        // The flush is the most expensive part of a commit, and holding the
+        // write lock across it would stop the next batch from doing any work
+        // until this one is durable.
+        let result = task::spawn_blocking(move || {
+            let mut engine = apply_engine.write().map_err(|_| StorageError::Poisoned)?;
+            let locked = Instant::now();
+            let (results, lsn) = if commit_index_updates.is_empty() {
+                engine.write_batch_deferred(commit_operations)?
+            } else {
+                engine.write_indexed_deferred(commit_operations, commit_index_updates)?
+            };
+            // The engine records what it published, so no change-log scan is
+            // needed on the commit path.
+            let published = engine.last_published().to_vec();
+            let (generation, root, len) = engine.committed_root();
+            Ok::<_, StorageError>((
+                PendingFlush {
+                    lsn,
+                    requests: Vec::new(),
+                    results,
+                    published,
+                    generation,
+                    root,
+                    len,
+                    queued: locked,
+                },
+                locked,
+            ))
+        })
+        .await;
+        match result {
+            Ok(Ok((mut flush, locked))) => {
+                let applied = Instant::now();
+                let profile = &config.metrics.write_profile;
+                profile.batches.fetch_add(1, Ordering::Relaxed);
+                profile
+                    .lock
+                    .record(locked.saturating_duration_since(batch_closed));
+                profile
+                    .apply
+                    .record(applied.saturating_duration_since(locked));
+                flush.queued = applied;
+                flush.requests = requests;
+                writes_since_checkpoint = if should_checkpoint {
+                    config.metrics.checkpoints.fetch_add(1, Ordering::Relaxed);
+                    0
+                } else {
+                    writes_since_checkpoint + operation_count
+                };
+                // Counted before queueing so the next iteration sees that a
+                // barrier is outstanding and accumulates behind it.
+                config.in_flight.fetch_add(1, Ordering::AcqRel);
+                // Queued rather than awaited: the completion stage flushes and
+                // acknowledges in arrival order while this loop moves on to the
+                // next batch, so the barrier is amortised across committers.
+                if flushes.send(flush).await.is_err() {
+                    config.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
+            }
+            Ok(Err(error)) => {
+                record_storage_error(&config.metrics, &error);
+                respond_writes(requests, Err(error.to_string()));
+            }
+            Err(_) => {
+                config.metrics.storage_failed.store(true, Ordering::Release);
+                config.metrics.ready.store(false, Ordering::Release);
+                respond_writes(requests, Err("storage writer task failed".into()));
+            }
+        }
+    }
+}
+
+/// Answers an index create/drop and records any storage failure.
+///
+/// Shared by both index arms of the write loop so the two cannot drift: the
+/// earlier version handled them in one blocking task and needed an
+/// `unreachable!()` arm to name the variant it had already matched on.
+fn finish_index_change(
+    config: &WriteWorkerConfig,
+    response: oneshot::Sender<vyrn_core::Result<()>>,
+    result: std::result::Result<
+        std::result::Result<vyrn_core::Result<()>, StorageError>,
+        task::JoinError,
+    >,
+) {
+    match result {
+        Ok(Ok(outcome)) => {
+            if let Err(error) = &outcome {
+                record_storage_error(&config.metrics, error);
+            }
+            let _ = response.send(outcome);
+        }
+        // The engine lock was poisoned, so the request never ran.
+        Ok(Err(error)) => {
+            record_storage_error(&config.metrics, &error);
+            let _ = response.send(Err(error));
+        }
+        /* The blocking task itself died. Earlier this left the client waiting on
+         * a dropped sender, which surfaces as the generic "storage writer
+         * stopped"; answering explicitly keeps the reason attached to the
+         * request. */
+        Err(_) => {
+            config.metrics.storage_failed.store(true, Ordering::Release);
+            config.metrics.ready.store(false, Ordering::Release);
+            let _ = response.send(Err(StorageError::Poisoned));
+        }
+    }
 }
 
 /// Moves every already-queued data write into `requests` without waiting.
@@ -3053,7 +3676,8 @@ fn start_flush_worker(
             }
             let covered = batch.len() as u64;
             let mut stop = false;
-            for flush in batch {
+            let mut remaining = batch.into_iter();
+            for flush in remaining.by_ref() {
                 let PendingFlush {
                     requests,
                     results,
@@ -3075,6 +3699,35 @@ fn start_flush_worker(
                     .write_profile
                     .publish
                     .record(Instant::now().saturating_duration_since(durable));
+            }
+            /* ANSWER THE REST OF THE GROUP, rather than dropping it.
+             *
+             * The publish stage failed part-way through a coalesced group. Every
+             * batch here already crossed the same barrier as the one that failed,
+             * so their records are durable — but they have not been published to
+             * the read engines, and this worker is about to stop.
+             *
+             * Dropping them was the bug: a `PendingFlush` owns its requests, and
+             * each request owns the oneshot sender its client is waiting on.
+             * Dropping the struct closed those channels, so the client saw the
+             * generic "storage writer died" that a closed channel produces — the
+             * least informative answer available, for a write that is in fact on
+             * disk and will be there after a restart.
+             *
+             * The message says exactly that instead. It is still an error: the
+             * commit is not visible to readers yet, so reporting success would be
+             * a lie in the other direction. `publish_commit` has already answered
+             * the batch it failed on, which is why this drains what is left
+             * rather than the whole group.
+             */
+            for flush in remaining {
+                respond_writes(
+                    flush.requests,
+                    Err("write is durable but was not published: \
+                         the storage writer stopped before readers were refreshed; \
+                         it is readable after a restart"
+                        .into()),
+                );
             }
             // Release the writer before returning, so a failure here cannot leave
             // it accumulating behind a barrier that will never land.
@@ -3153,11 +3806,13 @@ fn publish_commit(
     // Broadcast the records the commit actually published, so a live cursor
     // always matches a durable one.
     for record in published {
-        let _ = config.changes.send(ChangeEvent {
+        config.changes.send(ChangeEvent {
             sequence: record.sequence,
             key: record.key,
             value: record.value,
             cursor: Some(change_log::Cursor::new(record.sequence, record.index)),
+            // The ring sets this if it has to shed the payload.
+            elided: false,
         });
     }
     respond_writes(requests, Ok(results));
@@ -3238,10 +3893,20 @@ fn respond_writes(
                             .ok_or_else(|| "storage returned no write result".into());
                         let _ = response.send(result);
                     }
-                    WriteRequest::Document { .. }
-                    | WriteRequest::CreateIndex { .. }
-                    | WriteRequest::DropIndex { .. } => {
-                        unreachable!()
+                    /* Not expected: this function answers batched data requests,
+                     * and every other kind is dispatched before batching. If one
+                     * arrives anyway it is answered with an error instead of
+                     * panicking — the panic would run inside the write pipeline
+                     * and stop writes for every client, to report a routing bug
+                     * that affects one request. Dropping the request silently is
+                     * not an option either: its sender is owned here, so the
+                     * client would block until its connection timed out. */
+                    WriteRequest::Document { response, .. } => {
+                        let _ = response.send(Err(StorageError::Poisoned));
+                    }
+                    WriteRequest::CreateIndex { response, .. }
+                    | WriteRequest::DropIndex { response, .. } => {
+                        let _ = response.send(Err(StorageError::Poisoned));
                     }
                     WriteRequest::Transaction {
                         operations,
@@ -3266,10 +3931,13 @@ fn respond_writes(
                     WriteRequest::Operation { response, .. } => {
                         let _ = response.send(Err(message.clone()));
                     }
-                    WriteRequest::Document { .. }
-                    | WriteRequest::CreateIndex { .. }
-                    | WriteRequest::DropIndex { .. } => {
-                        unreachable!()
+                    // See the matching arms above: answered, not panicked.
+                    WriteRequest::Document { response, .. } => {
+                        let _ = response.send(Err(StorageError::Poisoned));
+                    }
+                    WriteRequest::CreateIndex { response, .. }
+                    | WriteRequest::DropIndex { response, .. } => {
+                        let _ = response.send(Err(StorageError::Poisoned));
                     }
                     WriteRequest::Transaction { response, .. } => {
                         let _ = response.send(Err(message.clone()));
@@ -3364,7 +4032,7 @@ async fn serve_admin(
                     "200 OK",
                     "text/plain; version=0.0.4",
                     format!(
-                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\nvyrn_commit_batches_total {}\nvyrn_commit_requests_total {}\n{}",
+                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\nvyrn_auth_failures_total {}\nvyrn_active_transaction_snapshots {}\nvyrn_commit_batches_total {}\nvyrn_commit_requests_total {}\n{}",
                         u8::from(ready),
                         u8::from(metrics.storage_failed.load(Ordering::Relaxed)),
                         metrics.active_connections.load(Ordering::Relaxed),
@@ -3382,6 +4050,8 @@ async fn serve_admin(
                         metrics.wal_archive_lag_segments.load(Ordering::Relaxed),
                         metrics.wal_archived_total.load(Ordering::Relaxed),
                         metrics.wal_archive_failures_total.load(Ordering::Relaxed),
+                        metrics.auth_failures_total.load(Ordering::Relaxed),
+                        metrics.active_transaction_snapshots.load(Ordering::Relaxed),
                         metrics.write_profile.batches.load(Ordering::Relaxed),
                         metrics.write_profile.requests.load(Ordering::Relaxed),
                         metrics.write_profile.render(),
@@ -3457,16 +4127,35 @@ async fn next_message(
     }
 }
 
+/// Sends one frame, refusing to block forever on a peer that stopped reading.
+///
+/// A `send` only completes once the kernel has accepted every byte; a peer that
+/// never reads — a wedged consumer, a half-open NAT mapping — leaves its socket
+/// buffer full and this future pending indefinitely, while the session task
+/// keeps holding a connection-limit permit and an active-connections slot (and,
+/// mid-transaction, an engine snapshot pin). Bounding the write turns such a
+/// peer into an ordinary disconnect: the session ends through the same cleanup
+/// path as any other exit, so nothing is leaked. Every response path in this
+/// file goes through here for exactly that reason.
+async fn send_frame(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    envelope: Envelope,
+) -> Result<()> {
+    match timeout(RESPONSE_WRITE_TIMEOUT, framed.send(envelope)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => bail!(
+            "peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"
+        ),
+    }
+}
+
 async fn send_error(
     framed: &mut Framed<BoxedTransport, VyrnCodec>,
     request_id: u64,
     code: ErrorCode,
     message: &str,
 ) -> Result<()> {
-    framed
-        .send(Envelope::new(request_id, server_error(code, message)))
-        .await?;
-    Ok(())
+    send_frame(framed, Envelope::new(request_id, server_error(code, message))).await
 }
 
 fn load_password_hash(path: &Path) -> Result<PasswordHashString> {

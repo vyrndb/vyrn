@@ -138,3 +138,53 @@ test("parses fragmented SSE changes", async () => {
   assert.equal(text(changes[0].key), "users/1");
   assert.equal(changes[0].value, null);
 });
+
+test("rejects malformed base64 instead of decoding garbage", async () => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      // Buffer.from(value, "base64") silently ignores invalid characters, so
+      // this used to surface as corrupted bytes rather than an error.
+      controller.enqueue(encoder.encode('data: {"sequence":1,"key":"!! not base64 !!","value":null}\n\n'));
+      controller.close();
+    },
+  });
+  const client = new VyrnClient({
+    url: "https://db.example",
+    token: "secret",
+    fetch: async () => new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+  });
+  await assert.rejects(
+    (async () => {
+      for await (const change of client.subscribe("users/")) change;
+    })(),
+    (error) => error instanceof VyrnError && error.code === "invalid_response",
+  );
+});
+
+test("parses SSE data lines with and without the optional leading space", async () => {
+  const encoder = new TextEncoder();
+  const key = Buffer.from("users/1").toString("base64");
+  const block = (data) => `data:${data}\n\n`;
+  const stream = new ReadableStream({
+    start(controller) {
+      // No space after the colon.
+      controller.enqueue(encoder.encode(block(`{"sequence":1,"key":"${key}","value":null}`)));
+      // Exactly one space (the spec-optional form).
+      controller.enqueue(encoder.encode(block(` {"sequence":2,"key":"${key}","value":null}`)));
+      // A tab is not stripped: only a single leading space is, per spec.
+      controller.enqueue(encoder.encode(block(`\t{"sequence":3,"key":"${key}","value":null}`)));
+      // Multi-line data joins with newlines.
+      controller.enqueue(encoder.encode(block(' {"sequence":\ndata: 4,"key":"' + key + '","value":null}')));
+      controller.close();
+    },
+  });
+  const client = new VyrnClient({
+    url: "https://db.example",
+    token: "secret",
+    fetch: async () => new Response(stream, { headers: { "content-type": "text/event-stream" } }),
+  });
+  const changes = [];
+  for await (const change of client.subscribe("users/")) changes.push(change);
+  assert.deepEqual(changes.map((change) => change.sequence), [1, 2, 3, 4]);
+});

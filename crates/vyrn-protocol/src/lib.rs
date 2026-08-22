@@ -28,6 +28,57 @@ const MAX_REPLICA_RECORDS: usize = 4_096;
 /// under `MAX_FRAME_SIZE` so one oversized record cannot fill a frame by itself.
 const MAX_REPLICA_RECORD: usize = 32 * 1024 * 1024;
 
+/// Which wire limit applies to the field currently being written.
+///
+/// The decoder has always enforced a ceiling on every length-delimited field;
+/// this names those same ceilings on the encode side, so both directions fail
+/// on exactly the same input. It exists because "how long may this field be"
+/// is a property of the field's meaning, not of its Rust type: a cursor and a
+/// document name are both `String` and both bounded, by very different amounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldLimit {
+    /// Username, password and database names.
+    AuthField,
+    /// Collection names and document ids.
+    DocumentName,
+    /// Durable subscription cursors.
+    Cursor,
+    /// Human-readable text carried by `Error` and `ReplicaDiverged`.
+    ErrorMessage,
+    /// The short label a replica is known by in logs and metrics.
+    ReplicaId,
+    /// One WAL record carried on the replication stream.
+    ReplicaRecord,
+    /// Keys, values and prefixes: bounded only by the frame that carries them.
+    Opaque,
+}
+
+impl FieldLimit {
+    fn maximum(self) -> usize {
+        match self {
+            Self::AuthField => MAX_AUTH_FIELD,
+            Self::DocumentName => MAX_DOCUMENT_NAME,
+            Self::Cursor => MAX_CURSOR,
+            Self::ErrorMessage => MAX_ERROR_MESSAGE,
+            Self::ReplicaId => MAX_REPLICA_ID,
+            Self::ReplicaRecord => MAX_REPLICA_RECORD,
+            Self::Opaque => MAX_FRAME_SIZE,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AuthField => "authentication field",
+            Self::DocumentName => "document name",
+            Self::Cursor => "cursor",
+            Self::ErrorMessage => "error message",
+            Self::ReplicaId => "replica identifier",
+            Self::ReplicaRecord => "replication record",
+            Self::Opaque => "byte field",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentIndex {
     pub field: String,
@@ -527,19 +578,70 @@ pub enum CodecError {
     Io(#[from] io::Error),
     #[error("malformed protocol message: {0}")]
     Malformed(&'static str),
+    #[error("{field} is {found} bytes, above the {maximum}-byte wire limit")]
+    FieldTooLong {
+        field: &'static str,
+        found: usize,
+        maximum: usize,
+    },
+    #[error("peer speaks protocol version {found}; this codec speaks version {PROTOCOL_VERSION}")]
+    VersionMismatch { found: u16 },
 }
 
 pub struct VyrnCodec {
     frames: LengthDelimitedCodec,
+    max_frame_length: usize,
+}
+
+impl VyrnCodec {
+    /// Begins configuring a codec. Everything except the frame ceiling is fixed
+    /// by the protocol, so it is the only knob.
+    pub fn builder() -> VyrnCodecBuilder {
+        VyrnCodecBuilder {
+            max_frame_length: MAX_FRAME_SIZE,
+        }
+    }
+
+    fn with_frame_ceiling(max_frame_length: usize) -> Self {
+        assert!(
+            max_frame_length > 0,
+            "max_frame_length must be greater than zero"
+        );
+        Self {
+            frames: LengthDelimitedCodec::builder()
+                .max_frame_length(max_frame_length)
+                .new_codec(),
+            max_frame_length,
+        }
+    }
+}
+
+/// Builder for [`VyrnCodec`].
+///
+/// The intended use is the pre-auth tier: an unauthenticated peer can make the
+/// server buffer up to the frame ceiling per connection before it has shown a
+/// single credential, so a server can lower that ceiling for the handshake and
+/// raise it once the peer is trusted. The default stays `MAX_FRAME_SIZE`.
+#[derive(Debug, Clone)]
+pub struct VyrnCodecBuilder {
+    max_frame_length: usize,
+}
+
+impl VyrnCodecBuilder {
+    /// Caps the length of one framed message, in both directions.
+    pub fn max_frame_length(mut self, max_frame_length: usize) -> Self {
+        self.max_frame_length = max_frame_length;
+        self
+    }
+
+    pub fn build(self) -> VyrnCodec {
+        VyrnCodec::with_frame_ceiling(self.max_frame_length)
+    }
 }
 
 impl Default for VyrnCodec {
     fn default() -> Self {
-        Self {
-            frames: LengthDelimitedCodec::builder()
-                .max_frame_length(MAX_FRAME_SIZE)
-                .new_codec(),
-        }
+        Self::with_frame_ceiling(MAX_FRAME_SIZE)
     }
 }
 
@@ -564,7 +666,7 @@ impl Encoder<Envelope> for VyrnCodec {
 
     fn encode(&mut self, message: Envelope, destination: &mut BytesMut) -> Result<(), Self::Error> {
         let encoded = encode_envelope(message)?;
-        if encoded.len() > MAX_FRAME_SIZE {
+        if encoded.len() > self.max_frame_length {
             return Err(
                 io::Error::new(io::ErrorKind::InvalidData, "message exceeds frame limit").into(),
             );
@@ -590,13 +692,13 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             database,
         } => {
             output.put_u8(1);
-            put_string(output, &username)?;
-            put_string(output, &password)?;
-            put_string(output, &database)?;
+            put_string(output, &username, FieldLimit::AuthField)?;
+            put_string(output, &password, FieldLimit::AuthField)?;
+            put_string(output, &database, FieldLimit::AuthField)?;
         }
         Message::Get { key } => {
             output.put_u8(2);
-            put_bytes(output, &key)?;
+            put_bytes(output, &key, FieldLimit::Opaque)?;
         }
         Message::MultiGet { keys } => {
             output.put_u8(29);
@@ -606,43 +708,43 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many keys"))?,
             );
             for key in keys {
-                put_bytes(output, &key)?;
+                put_bytes(output, &key, FieldLimit::Opaque)?;
             }
         }
         Message::Put { key, value } => {
             output.put_u8(3);
-            put_bytes(output, &key)?;
-            put_bytes(output, &value)?;
+            put_bytes(output, &key, FieldLimit::Opaque)?;
+            put_bytes(output, &value, FieldLimit::Opaque)?;
         }
         Message::Delete { key } => {
             output.put_u8(4);
-            put_bytes(output, &key)?;
+            put_bytes(output, &key, FieldLimit::Opaque)?;
         }
         Message::Scan { start, end, limit } => {
             output.put_u8(5);
-            put_optional_bytes(output, start.as_deref())?;
-            put_optional_bytes(output, end.as_deref())?;
+            put_optional_bytes(output, start.as_deref(), FieldLimit::Opaque)?;
+            put_optional_bytes(output, end.as_deref(), FieldLimit::Opaque)?;
             output.put_u32(limit);
         }
         Message::Subscribe { prefix } => {
             output.put_u8(12);
-            put_bytes(output, &prefix)?;
+            put_bytes(output, &prefix, FieldLimit::Opaque)?;
         }
         Message::SubscribeFrom { prefix, cursor } => {
             output.put_u8(45);
-            put_bytes(output, &prefix)?;
-            put_optional_string(output, cursor.as_deref())?;
+            put_bytes(output, &prefix, FieldLimit::Opaque)?;
+            put_optional_string(output, cursor.as_deref(), FieldLimit::Cursor)?;
         }
         Message::SubscribeCollectionFrom { collection, cursor } => {
             output.put_u8(46);
-            put_string(output, &collection)?;
-            put_optional_string(output, cursor.as_deref())?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
+            put_optional_string(output, cursor.as_deref(), FieldLimit::Cursor)?;
         }
         Message::CursorChange { cursor, key, value } => {
             output.put_u8(47);
-            put_string(output, &cursor)?;
-            put_bytes(output, &key)?;
-            put_optional_bytes(output, value.as_deref())?;
+            put_string(output, &cursor, FieldLimit::Cursor)?;
+            put_bytes(output, &key, FieldLimit::Opaque)?;
+            put_optional_bytes(output, value.as_deref(), FieldLimit::Opaque)?;
         }
         Message::CursorDocumentChange {
             cursor,
@@ -651,14 +753,14 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             document,
         } => {
             output.put_u8(48);
-            put_string(output, &cursor)?;
-            put_string(output, &collection)?;
-            put_string(output, &id)?;
-            put_optional_bytes(output, document.as_deref())?;
+            put_string(output, &cursor, FieldLimit::Cursor)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
+            put_string(output, &id, FieldLimit::DocumentName)?;
+            put_optional_bytes(output, document.as_deref(), FieldLimit::Opaque)?;
         }
         Message::Caught { cursor } => {
             output.put_u8(49);
-            put_string(output, &cursor)?;
+            put_string(output, &cursor, FieldLimit::Cursor)?;
         }
         Message::ReplicaHello {
             database,
@@ -666,9 +768,9 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             replica_id,
         } => {
             output.put_u8(50);
-            put_string(output, &database)?;
+            put_string(output, &database, FieldLimit::AuthField)?;
             output.put_u64(last_lsn);
-            put_string(output, &replica_id)?;
+            put_string(output, &replica_id, FieldLimit::ReplicaId)?;
         }
         Message::ReplicaStream { first_lsn } => {
             output.put_u8(51);
@@ -683,7 +785,7 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many replication records"))?,
             );
             for record in records {
-                put_bytes(output, &record)?;
+                put_bytes(output, &record, FieldLimit::ReplicaRecord)?;
             }
         }
         Message::ReplicaAck { durable_lsn } => {
@@ -692,19 +794,19 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
         }
         Message::ReplicaDiverged { reason } => {
             output.put_u8(54);
-            put_string(output, &reason)?;
+            put_string(output, &reason, FieldLimit::ErrorMessage)?;
         }
         Message::Begin => output.put_u8(15),
         Message::Commit => output.put_u8(16),
         Message::Rollback => output.put_u8(17),
         Message::CreateIndex { name, unique } => {
             output.put_u8(21);
-            put_bytes(output, &name)?;
+            put_bytes(output, &name, FieldLimit::Opaque)?;
             output.put_u8(u8::from(unique));
         }
         Message::DropIndex { name } => {
             output.put_u8(22);
-            put_bytes(output, &name)?;
+            put_bytes(output, &name, FieldLimit::Opaque)?;
         }
         Message::IndexUpdate {
             index,
@@ -713,10 +815,10 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             new_value,
         } => {
             output.put_u8(23);
-            put_bytes(output, &index)?;
-            put_bytes(output, &primary_key)?;
-            put_optional_bytes(output, old_value.as_deref())?;
-            put_optional_bytes(output, new_value.as_deref())?;
+            put_bytes(output, &index, FieldLimit::Opaque)?;
+            put_bytes(output, &primary_key, FieldLimit::Opaque)?;
+            put_optional_bytes(output, old_value.as_deref(), FieldLimit::Opaque)?;
+            put_optional_bytes(output, new_value.as_deref(), FieldLimit::Opaque)?;
         }
         Message::IndexLookup {
             index,
@@ -724,8 +826,8 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             limit,
         } => {
             output.put_u8(24);
-            put_bytes(output, &index)?;
-            put_bytes(output, &value)?;
+            put_bytes(output, &index, FieldLimit::Opaque)?;
+            put_bytes(output, &value, FieldLimit::Opaque)?;
             output.put_u32(limit);
         }
         Message::CreateCollection {
@@ -733,7 +835,7 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             indexes,
         } => {
             output.put_u8(31);
-            put_string(output, &collection)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
             output.put_u32(
                 indexes
                     .len()
@@ -741,14 +843,14 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many document indexes"))?,
             );
             for index in indexes {
-                put_string(output, &index.field)?;
+                put_string(output, &index.field, FieldLimit::DocumentName)?;
                 output.put_u8(u8::from(index.unique));
             }
         }
         Message::GetDocument { collection, id } => {
             output.put_u8(32);
-            put_string(output, &collection)?;
-            put_string(output, &id)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
+            put_string(output, &id, FieldLimit::DocumentName)?;
         }
         Message::PutDocument {
             collection,
@@ -756,18 +858,18 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             document,
         } => {
             output.put_u8(33);
-            put_string(output, &collection)?;
-            put_string(output, &id)?;
-            put_bytes(output, &document)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
+            put_string(output, &id, FieldLimit::DocumentName)?;
+            put_bytes(output, &document, FieldLimit::Opaque)?;
         }
         Message::DeleteDocument { collection, id } => {
             output.put_u8(34);
-            put_string(output, &collection)?;
-            put_string(output, &id)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
+            put_string(output, &id, FieldLimit::DocumentName)?;
         }
         Message::ListDocuments { collection, limit } => {
             output.put_u8(35);
-            put_string(output, &collection)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
             output.put_u32(limit);
         }
         Message::QueryDocuments {
@@ -777,19 +879,19 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
             limit,
         } => {
             output.put_u8(36);
-            put_string(output, &collection)?;
-            put_string(output, &field)?;
-            put_bytes(output, &value)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
+            put_string(output, &field, FieldLimit::DocumentName)?;
+            put_bytes(output, &value, FieldLimit::Opaque)?;
             output.put_u32(limit);
         }
         Message::SubscribeCollection { collection } => {
             output.put_u8(37);
-            put_string(output, &collection)?;
+            put_string(output, &collection, FieldLimit::DocumentName)?;
         }
         Message::CollectionCreated => output.put_u8(38),
         Message::DocumentValue { document } => {
             output.put_u8(39);
-            put_optional_bytes(output, document.as_deref())?;
+            put_optional_bytes(output, document.as_deref(), FieldLimit::Opaque)?;
         }
         Message::DocumentWritten => output.put_u8(40),
         Message::DocumentDeleted { existed } => {
@@ -805,8 +907,8 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many documents"))?,
             );
             for (id, document) in documents {
-                put_string(output, &id)?;
-                put_bytes(output, &document)?;
+                put_string(output, &id, FieldLimit::DocumentName)?;
+                put_bytes(output, &document, FieldLimit::Opaque)?;
             }
         }
         Message::CollectionSubscribed => output.put_u8(43),
@@ -817,13 +919,13 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
         } => {
             output.put_u8(44);
             output.put_u64(sequence);
-            put_string(output, &id)?;
-            put_optional_bytes(output, document.as_deref())?;
+            put_string(output, &id, FieldLimit::DocumentName)?;
+            put_optional_bytes(output, document.as_deref(), FieldLimit::Opaque)?;
         }
         Message::Authenticated => output.put_u8(6),
         Message::Value { value } => {
             output.put_u8(7);
-            put_optional_bytes(output, value.as_deref())?;
+            put_optional_bytes(output, value.as_deref(), FieldLimit::Opaque)?;
         }
         Message::Values { values } => {
             output.put_u8(30);
@@ -834,7 +936,7 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many values"))?,
             );
             for value in values {
-                put_optional_bytes(output, value.as_deref())?;
+                put_optional_bytes(output, value.as_deref(), FieldLimit::Opaque)?;
             }
         }
         Message::Written => output.put_u8(8),
@@ -850,8 +952,8 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many rows"))?,
             );
             for (key, value) in rows {
-                put_bytes(output, &key)?;
-                put_bytes(output, &value)?;
+                put_bytes(output, &key, FieldLimit::Opaque)?;
+                put_bytes(output, &value, FieldLimit::Opaque)?;
             }
         }
         Message::Subscribed => output.put_u8(13),
@@ -869,7 +971,7 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
                     .map_err(|_| CodecError::Malformed("too many keys"))?,
             );
             for key in keys {
-                put_bytes(output, &key)?;
+                put_bytes(output, &key, FieldLimit::Opaque)?;
             }
         }
         Message::Change {
@@ -879,13 +981,13 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
         } => {
             output.put_u8(14);
             output.put_u64(sequence);
-            put_bytes(output, &key)?;
-            put_optional_bytes(output, value.as_deref())?;
+            put_bytes(output, &key, FieldLimit::Opaque)?;
+            put_optional_bytes(output, value.as_deref(), FieldLimit::Opaque)?;
         }
         Message::Error { code, message } => {
             output.put_u8(11);
             output.put_u8(error_code(code));
-            put_string(output, &message)?;
+            put_string(output, &message, FieldLimit::ErrorMessage)?;
         }
     }
     Ok(())
@@ -894,6 +996,14 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
 fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
     require(input, 11)?;
     let version = input.get_u16();
+    // The version describes the layout of every byte that follows, so a peer
+    // announcing a different one cannot have its frames interpreted safely:
+    // they would be misread field by field rather than fail visibly. Enforcing
+    // it here puts the check in the layer that owns the wire format instead of
+    // leaving each peer to remember to do it.
+    if version != PROTOCOL_VERSION {
+        return Err(CodecError::VersionMismatch { found: version });
+    }
     let request_id = input.get_u64();
     let kind = input.get_u8();
     let message = match kind {
@@ -992,7 +1102,12 @@ fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
         }
         29 => {
             let count = get_u32(input)? as usize;
-            if count == 0 || count > MAX_SCAN_LIMIT as usize {
+            // An empty multi-get is odd but harmless, and every other collection
+            // in the protocol (rows, keys, values, documents) accepts zero. The
+            // codec's job is framing, not policy: refusing emptiness here would
+            // kill the connection for something the request layer can decline
+            // with an ordinary error response.
+            if count > MAX_SCAN_LIMIT as usize {
                 return Err(CodecError::Malformed("multi-get key count is out of range"));
             }
             let mut keys = Vec::with_capacity(count);
@@ -1153,11 +1268,15 @@ fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
     })
 }
 
-fn put_optional_bytes(output: &mut BytesMut, value: Option<&[u8]>) -> Result<(), CodecError> {
+fn put_optional_bytes(
+    output: &mut BytesMut,
+    value: Option<&[u8]>,
+    limit: FieldLimit,
+) -> Result<(), CodecError> {
     match value {
         Some(value) => {
             output.put_u8(1);
-            put_bytes(output, value)
+            put_bytes(output, value, limit)
         }
         None => {
             output.put_u8(0);
@@ -1174,12 +1293,16 @@ fn get_optional_bytes(input: &mut BytesMut, maximum: usize) -> Result<Option<Vec
     }
 }
 
-fn put_string(output: &mut BytesMut, value: &str) -> Result<(), CodecError> {
-    put_bytes(output, value.as_bytes())
+fn put_string(output: &mut BytesMut, value: &str, limit: FieldLimit) -> Result<(), CodecError> {
+    put_bytes(output, value.as_bytes(), limit)
 }
 
-fn put_optional_string(output: &mut BytesMut, value: Option<&str>) -> Result<(), CodecError> {
-    put_optional_bytes(output, value.map(str::as_bytes))
+fn put_optional_string(
+    output: &mut BytesMut,
+    value: Option<&str>,
+    limit: FieldLimit,
+) -> Result<(), CodecError> {
+    put_optional_bytes(output, value.map(str::as_bytes), limit)
 }
 
 fn get_optional_string(input: &mut BytesMut, maximum: usize) -> Result<Option<String>, CodecError> {
@@ -1195,7 +1318,19 @@ fn get_string(input: &mut BytesMut, maximum: usize) -> Result<String, CodecError
         .map_err(|_| CodecError::Malformed("string is not UTF-8"))
 }
 
-fn put_bytes(output: &mut BytesMut, value: &[u8]) -> Result<(), CodecError> {
+fn put_bytes(output: &mut BytesMut, value: &[u8], limit: FieldLimit) -> Result<(), CodecError> {
+    // The decoder answers an over-limit field by killing the connection, so
+    // encoding one would trade a local, describable error for a remote fatal
+    // one. Everything written here is produced by our own side, which makes
+    // refusing it here a plain programming or input error the caller can
+    // report, instead of a race against the peer's decoder.
+    if value.len() > limit.maximum() {
+        return Err(CodecError::FieldTooLong {
+            field: limit.label(),
+            maximum: limit.maximum(),
+            found: value.len(),
+        });
+    }
     output.put_u32(
         value
             .len()
@@ -1426,6 +1561,99 @@ mod tests {
         ] {
             round_trip(message);
         }
+    }
+
+    #[test]
+    fn an_empty_multi_get_round_trips() {
+        // The codec frames, it does not judge: emptiness is the request layer's
+        // business. This is the one collection the decoder used to refuse.
+        round_trip(Message::MultiGet { keys: Vec::new() });
+    }
+
+    #[test]
+    fn a_foreign_protocol_version_is_named_not_misread() {
+        for version in [PROTOCOL_VERSION - 1, 999] {
+            let mut body = BytesMut::new();
+            body.put_u16(version);
+            body.put_u64(1);
+            body.put_u8(2); // Get, with a complete body: only the version is wrong.
+            body.put_u32(0);
+            match decode_envelope(&mut body) {
+                Err(CodecError::VersionMismatch { found }) => assert_eq!(found, version),
+                other => panic!("version {version} must be rejected as a version, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fields_at_their_limit_still_encode() {
+        round_trip(Message::Caught {
+            cursor: "c".repeat(MAX_CURSOR),
+        });
+        round_trip(Message::GetDocument {
+            collection: "c".repeat(MAX_DOCUMENT_NAME),
+            id: String::new(),
+        });
+    }
+
+    #[test]
+    fn an_oversized_cursor_fails_at_encode_not_on_the_wire() {
+        let mut codec = VyrnCodec::default();
+        let mut bytes = BytesMut::new();
+        let error = codec
+            .encode(
+                Envelope::new(
+                    1,
+                    Message::Caught {
+                        cursor: "c".repeat(MAX_CURSOR + 1),
+                    },
+                ),
+                &mut bytes,
+            )
+            .unwrap_err();
+        let CodecError::FieldTooLong {
+            field,
+            found,
+            maximum,
+        } = error
+        else {
+            panic!("expected FieldTooLong, got {error}");
+        };
+        assert_eq!(field, "cursor");
+        assert_eq!(found, MAX_CURSOR + 1);
+        assert_eq!(maximum, MAX_CURSOR);
+        // Nothing was written: a half-built frame must not reach the transport.
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_document_name_fails_at_encode_not_on_the_wire() {
+        let mut codec = VyrnCodec::default();
+        let mut bytes = BytesMut::new();
+        let error = codec
+            .encode(
+                Envelope::new(
+                    1,
+                    Message::GetDocument {
+                        collection: "users".into(),
+                        id: "d".repeat(MAX_DOCUMENT_NAME + 1),
+                    },
+                ),
+                &mut bytes,
+            )
+            .unwrap_err();
+        let CodecError::FieldTooLong {
+            field,
+            found,
+            maximum,
+        } = error
+        else {
+            panic!("expected FieldTooLong, got {error}");
+        };
+        assert_eq!(field, "document name");
+        assert_eq!(found, MAX_DOCUMENT_NAME + 1);
+        assert_eq!(maximum, MAX_DOCUMENT_NAME);
+        assert!(bytes.is_empty());
     }
 
     #[test]

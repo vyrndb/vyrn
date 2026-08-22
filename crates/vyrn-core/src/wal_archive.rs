@@ -12,7 +12,8 @@ use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// Deliberately not the WAL's magic, so a tool pointed at the wrong file can
@@ -126,16 +127,30 @@ pub fn archive_pending(wal_directory: &Path, archive_directory: &Path) -> Result
         // predecessor's archive while the watermark still advances — and a
         // checkpoint then deletes the only local copy of the real bytes.
         if let Some(existing) = indexed {
-            if existing.crc == crc
-                && existing.first_lsn == first_lsn
-                && existing.byte_len == bytes.len() as u64
+            if existing.crc != crc
+                || existing.first_lsn != first_lsn
+                || existing.byte_len != bytes.len() as u64
             {
+                return Err(Error::CorruptBackup(format!(
+                    "segment {segment_id} (LSNs {first_lsn}..={last_lsn}) does not match the archived copy (LSNs {}..={}); the archive belongs to a different timeline",
+                    existing.first_lsn, existing.last_lsn
+                )));
+            }
+            // The source still agrees with the index, but the index records
+            // what was copied, not what is still on disk: rot after the fact
+            // leaves a perfectly consistent index over damaged bytes, which is
+            // why the archived copy itself is re-checksummed here even though
+            // it doubles this tick's reads. Skipping that check is how a rotted
+            // segment survived every future tick — each one compared a healthy
+            // source against an index that had never looked at the disk — and
+            // surfaced only when PITR failed on it much later.
+            if archived_copy_matches(archive_directory, &name, &existing) {
                 continue;
             }
-            return Err(Error::CorruptBackup(format!(
-                "segment {segment_id} (LSNs {first_lsn}..={last_lsn}) does not match the archived copy (LSNs {}..={}); the archive belongs to a different timeline",
-                existing.first_lsn, existing.last_lsn
-            )));
+            // Fall through to the copy below: the just-scanned source is the
+            // only surviving proof of what these bytes should be, so it heals
+            // the trusted copy. The index entry it provably matches already
+            // exists, so re-copying changes no timeline facts.
         }
         if let Some(other) = entries.iter().find(|entry| {
             entry.segment_id != segment_id
@@ -153,7 +168,7 @@ pub fn archive_pending(wal_directory: &Path, archive_directory: &Path) -> Result
         // the archived copy matches the scan's checksum by construction; a
         // concurrent rewrite of the source (illegal for a sealed segment)
         // cannot leak unvalidated bytes into the archive.
-        let temporary = archive_directory.join(format!("{name}.tmp"));
+        let temporary = temporary_path(archive_directory, &name);
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -168,20 +183,48 @@ pub fn archive_pending(wal_directory: &Path, archive_directory: &Path) -> Result
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
-        entries.push(IndexEntry {
+        let entry = IndexEntry {
             segment_id,
             first_lsn,
             last_lsn,
             byte_len: bytes.len() as u64,
             crc,
             archived_at,
-        });
-        entries.sort_unstable_by_key(|entry| entry.segment_id);
+        };
+        // A heal replaces its entry in place — pushing would give one segment
+        // id two rows and break the sorted index — while a first archive adds
+        // a new one. Either way the index now describes the file just
+        // published.
+        match entries
+            .iter_mut()
+            .find(|existing| existing.segment_id == segment_id)
+        {
+            Some(slot) => *slot = entry,
+            None => {
+                entries.push(entry);
+                entries.sort_unstable_by_key(|entry| entry.segment_id);
+            }
+        }
         // Durable before the next candidate: the index is the archive's source
         // of truth, and an unindexed copy is merely redone after a crash.
         write_index(archive_directory, &entries)?;
     }
     Ok(entries.last().map_or(0, |entry| entry.segment_id))
+}
+
+/// Whether the trusted copy on disk still matches its index entry.
+///
+/// The index records what was copied, not what is there now: disk rot after
+/// archiving leaves a perfectly consistent index over damaged bytes. A failed
+/// or impossible read counts as a mismatch so the caller re-copies from the
+/// source — whose scan has just re-proved those bytes against the same entry —
+/// and a genuinely unreadable disk then fails the copy with the real error
+/// instead of hiding behind this check.
+fn archived_copy_matches(archive_directory: &Path, name: &str, entry: &IndexEntry) -> bool {
+    match fs::read(archive_directory.join(name)) {
+        Ok(bytes) => bytes.len() as u64 == entry.byte_len && crate::checksum(&bytes) == entry.crc,
+        Err(_) => false,
+    }
 }
 
 /// Re-proves every archived byte: index checksum, id contiguity, LSN chain,
@@ -374,6 +417,19 @@ pub(crate) fn read_index(archive_directory: &Path) -> Result<Vec<IndexEntry>> {
     Ok(entries)
 }
 
+/// A temporary name unique to this call.
+///
+/// A fixed `{name}.tmp` is claimed by every writer in the process, so two
+/// overlapping ticks would interleave their truncating writes and each rename
+/// could publish the other's half-written bytes. Process id plus a process-wide
+/// counter keeps concurrent writers out of each other's files while staying
+/// recognizable in a directory listing.
+fn temporary_path(directory: &Path, name: &str) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let ticket = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    directory.join(format!("{name}.{}.{}.tmp", std::process::id(), ticket))
+}
+
 /// Rewrites the whole index durably: tmp file, sync, rename, directory sync.
 ///
 /// The index is small (44 bytes per segment), so rewriting it whole keeps a
@@ -397,7 +453,7 @@ fn write_index(archive_directory: &Path, entries: &[IndexEntry]) -> Result<()> {
     }
     let index_checksum = crate::checksum(&bytes);
     bytes.extend_from_slice(&index_checksum.to_be_bytes());
-    let temporary = archive_directory.join(format!("{INDEX_FILE}.tmp"));
+    let temporary = temporary_path(archive_directory, INDEX_FILE);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -604,6 +660,19 @@ mod tests {
         archive_pending(&first.path().join("wal"), &archive).unwrap();
         let error = archive_pending(&second.path().join("wal"), &archive).unwrap_err();
         assert!(matches!(error, Error::CorruptBackup(_)));
+    }
+
+    /// Two overlapping ticks must not claim the same temporary file: with a
+    /// fixed name their truncating writes interleave and a rename can publish
+    /// a half-written copy as trusted.
+    #[test]
+    fn temporary_names_are_unique_within_a_process() {
+        let directory = tempdir().unwrap();
+        let name = crate::segment_name(1);
+        let first = temporary_path(directory.path(), &name);
+        let second = temporary_path(directory.path(), &name);
+        assert_ne!(first, second, "two calls shared one temporary path");
+        assert!(first.starts_with(directory.path()));
     }
 
     /// The index alone cannot notice disk rot that happens after archiving, so

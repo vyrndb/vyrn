@@ -287,19 +287,35 @@ function encode(value: VyrnBytes): string {
 }
 
 function decode(value: string): Uint8Array {
+  if (!isBase64(value)) {
+    throw new VyrnError(0, "invalid_response", "received value is not valid base64");
+  }
   if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(value, "base64"));
   const binary = atob(value);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+// The gateway encodes with standard padded base64; anything else is a
+// malformed response, which `Buffer.from` would otherwise silently mangle.
+const BASE64_PATTERN = /^[A-Za-z0-9+/]*={0,2}$/;
+
+function isBase64(value: string): boolean {
+  return value.length % 4 === 0 && BASE64_PATTERN.test(value);
 }
 
 function parseEvent(block: string): { event: string; data: string } {
   let event = "message";
   const data: string[] = [];
   for (const line of block.split("\n")) {
-    if (line.startsWith("event:")) event = line.slice(6).trimStart();
-    if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+    if (line.startsWith("event:")) event = stripLeadingSpace(line.slice(6));
+    if (line.startsWith("data:")) data.push(stripLeadingSpace(line.slice(5)));
   }
   return { event, data: data.join("\n") };
+}
+
+/** Per the SSE spec, exactly one leading space after the colon is removed. */
+function stripLeadingSpace(value: string): string {
+  return value.startsWith(" ") ? value.slice(1) : value;
 }
 
 async function responseError(response: Response): Promise<VyrnError> {

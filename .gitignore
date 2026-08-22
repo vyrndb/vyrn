@@ -5,6 +5,12 @@ benchmark-results-*.csv
 .env
 *.pem
 *.key
+# Credential files the README workflow creates at the repo root (secrets/
+# only covers copies placed in that directory).
+password.txt
+client-password.txt
+http-token.txt
+*.phc
 secrets/
 /sdk/typescript/dist/
 /sdk/typescript/node_modules/

@@ -2,6 +2,13 @@ services:
   vyrn:
     build: .
     restart: unless-stopped
+    mem_limit: 4g
+    cpus: 4
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     ports:
       - "127.0.0.1:7432:7432"
       - "127.0.0.1:7433:7433"
@@ -64,6 +71,13 @@ services:
   vyrn-http:
     build: .
     restart: unless-stopped
+    mem_limit: 1g
+    cpus: 2
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     entrypoint: ["vyrn-http"]
     environment:
       VYRN_HTTP_BIND: 0.0.0.0:7434

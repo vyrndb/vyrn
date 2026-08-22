@@ -7,6 +7,7 @@ import {
   encodeEnvelope,
 } from "../dist/protocol.js";
 import { parseConnectionUrl } from "../dist/connection.js";
+import { serverFrame } from "./fake-server.mjs";
 
 const utf8 = (value) => new TextEncoder().encode(value);
 
@@ -25,101 +26,9 @@ test("encodes requests with a length-delimited frame header", () => {
 });
 
 /**
- * Encodes a server response the way vyrnd does, so the decoder can be tested
- * without a live server. Mirrors encode_message in crates/vyrn-protocol.
+ * The server-frame encoder lives in fake-server.mjs, where the pool and
+ * subscription tests reuse it against a real socket.
  */
-function serverFrame(message) {
-  const parts = [];
-  const u8 = (value) => parts.push(Uint8Array.of(value));
-  const u32 = (value) => {
-    const bytes = new Uint8Array(4);
-    new DataView(bytes.buffer).setUint32(0, value, false);
-    parts.push(bytes);
-  };
-  const u64 = (value) => {
-    const bytes = new Uint8Array(8);
-    new DataView(bytes.buffer).setBigUint64(0, BigInt(value), false);
-    parts.push(bytes);
-  };
-  const raw = (value) => {
-    u32(value.length);
-    parts.push(value);
-  };
-  const str = (value) => raw(utf8(value));
-  const optional = (value) => {
-    if (value === null) {
-      u8(0);
-      return;
-    }
-    u8(1);
-    raw(value);
-  };
-
-  const version = new Uint8Array(2);
-  new DataView(version.buffer).setUint16(0, PROTOCOL_VERSION, false);
-  parts.push(version);
-  u64(1);
-
-  switch (message.type) {
-    case "authenticated": u8(6); break;
-    case "value": u8(7); optional(message.value); break;
-    case "written": u8(8); break;
-    case "deleted": u8(9); u8(message.existed ? 1 : 0); break;
-    case "rows":
-      u8(10);
-      u32(message.rows.length);
-      for (const [key, value] of message.rows) { raw(key); raw(value); }
-      break;
-    case "error": {
-      const codes = { authentication_failed: 1, invalid_request: 2, unsupported_version: 3, storage: 4, internal: 5, conflict: 6 };
-      u8(11); u8(codes[message.code]); str(message.message);
-      break;
-    }
-    case "subscribed": u8(13); break;
-    case "change": u8(14); u64(message.sequence); raw(message.key); optional(message.value); break;
-    case "begun": u8(18); break;
-    case "committed": u8(19); break;
-    case "rolledBack": u8(20); break;
-    case "indexCreated": u8(25); break;
-    case "indexDropped": u8(26); break;
-    case "indexUpdated": u8(27); break;
-    case "keys":
-      u8(28);
-      u32(message.keys.length);
-      for (const key of message.keys) raw(key);
-      break;
-    case "values":
-      u8(30);
-      u32(message.values.length);
-      for (const value of message.values) optional(value);
-      break;
-    case "collectionCreated": u8(38); break;
-    case "documentValue": u8(39); optional(message.document); break;
-    case "documentWritten": u8(40); break;
-    case "documentDeleted": u8(41); u8(message.existed ? 1 : 0); break;
-    case "documents":
-      u8(42);
-      u32(message.documents.length);
-      for (const [id, document] of message.documents) { str(id); raw(document); }
-      break;
-    case "collectionSubscribed": u8(43); break;
-    case "documentChange":
-      u8(44); u64(message.sequence); str(message.id); optional(message.document);
-      break;
-    default:
-      throw new Error(`test encoder missing ${message.type}`);
-  }
-
-  const payloadLength = parts.reduce((total, part) => total + part.length, 0);
-  const frame = new Uint8Array(4 + payloadLength);
-  new DataView(frame.buffer).setUint32(0, payloadLength, false);
-  let offset = 4;
-  for (const part of parts) {
-    frame.set(part, offset);
-    offset += part.length;
-  }
-  return frame;
-}
 
 test("round-trips every server response through the frame decoder", () => {
   const responses = [
@@ -147,6 +56,15 @@ test("round-trips every server response through the frame decoder", () => {
     { type: "collectionSubscribed" },
     { type: "documentChange", sequence: 42, id: "user_1", document: utf8("{}") },
     { type: "change", sequence: 9, key: utf8("k"), value: null },
+    { type: "cursorChange", cursor: "c1", key: utf8("k"), value: utf8("v") },
+    {
+      type: "cursorDocumentChange",
+      cursor: "c2",
+      collection: "users",
+      id: "user_1",
+      document: null,
+    },
+    { type: "caught", cursor: "c2" },
     { type: "error", code: "conflict", message: "conflicted" },
   ];
 

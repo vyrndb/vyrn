@@ -98,8 +98,23 @@ pub enum FailurePoint {
     AfterPageSync,
     AfterWalWrite,
     BeforeWalSync,
+    /// Fails the staging of historical MVCC values in `apply_batch`, before the
+    /// batch's root is published — the shape of an ENOSPC inside the revision
+    /// value log while the mutation is still invisible.
+    BeforeValuePrepare,
+    /// Fails the post-commit maintenance of MVCC history, after the batch's WAL
+    /// record is durable and its root visible.
+    BeforeHistoryAppend,
     BeforeManifestPublish,
     AfterManifestPublish,
+    /// Fails a checkpoint after the engine has adopted the published generation:
+    /// the manifest names it, the tree and value log live on it, and only the
+    /// cleanup (segment rotation and retirement) remains.
+    AfterTreeAdoption,
+    /// Fails a `sync` that is draining buffered async records, after at least
+    /// one record has already left the buffer — the shape of an ENOSPC
+    /// mid-drain rather than before the first write.
+    BetweenBufferedAppends,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +194,20 @@ pub enum Error {
     },
     #[error("storage is poisoned after a failed commit; reopen to recover")]
     Poisoned,
+    /// A commit that reached the WAL and was fsynced, after which maintaining
+    /// the engine's in-memory read state failed.
+    ///
+    /// Deliberately distinct from [`Error::Poisoned`]: `Poisoned` promises that
+    /// nothing was acknowledged, so a caller may retry the batch. Here the write
+    /// IS on disk — retrying it would apply it twice — and the missing history
+    /// entry would corrupt snapshot reads if the engine kept serving. The engine
+    /// refuses all further work either way; the only honest answer is to tell
+    /// the caller their data survived and make them reopen before continuing.
+    #[error(
+        "commit {lsn} is durable but the engine was poisoned before its read state \
+         caught up; do not retry the write — reopen the database to recover"
+    )]
+    CommittedThenPoisoned { lsn: u64 },
     #[error("corrupt WAL segment {segment} at byte {offset}: {reason}")]
     CorruptWal {
         segment: u64,
@@ -209,6 +238,13 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The pre-batch state of every key a batch touched: its previous revision and
+/// value, or `None` for a key that did not exist.
+///
+/// Used to hand `maintain_history` what the batch displaced, so those versions
+/// can be retained for snapshots that still need them.
+type PreviousVersions = BTreeMap<Vec<u8>, (Option<u64>, Option<Vec<u8>>)>;
 
 #[derive(Debug, Clone)]
 pub enum BatchOperation {
@@ -427,6 +463,9 @@ impl ReadEngine {
     }
 
     /// Reads documents from a collection by indexed field value.
+    ///
+    /// Numeric equality is encoding-exact: a query for `10` matches stored `10`,
+    /// not `10.0`.
     pub fn find_documents(
         &self,
         collection: &str,
@@ -483,7 +522,11 @@ pub struct Engine {
     indexes: BTreeMap<Vec<u8>, bool>,
     active_snapshots: BTreeMap<u64, usize>,
     user_len: usize,
-    pending_wal: Vec<Vec<u8>>,
+    /// Async-mode records awaiting their flush, each paired with the LSN it was
+    /// issued at. The LSN travels with the record because `last_lsn` names only
+    /// the newest one; stamping it onto every drained append would let a
+    /// concurrent barrier declare records durable that were never written.
+    pending_wal: Vec<(u64, Vec<u8>)>,
     failure: Option<FailureInjector>,
     /// Change records published by the most recent commit, so subscribers can be
     /// notified without re-reading the change log.
@@ -615,8 +658,7 @@ impl Engine {
             && read_segment_first_lsn(&wal_path)? != state.lsn + 1
         {
             drop(wal_file);
-            fs::remove_file(&wal_path)?;
-            wal_file = create_segment(&wal_directory, segment_id, state.lsn + 1)?;
+            wal_file = republish_segment_header(&wal_directory, segment_id, state.lsn + 1)?;
             wal_len = SEGMENT_HEADER_LEN as u64;
         }
         let segment_size = options.segment_size.max((SEGMENT_HEADER_LEN + 1) as u64);
@@ -1421,26 +1463,53 @@ impl Engine {
             return Ok((results, None));
         }
         profile::add(&profile::PLAN_NS, phase);
-        let phase = std::time::Instant::now();
-        let outcome = self.tree.prepare_batch(&mutations)?;
-        profile::add(&profile::TREE_NS, phase);
-        self.tree.publish(outcome.root, outcome.len);
-        self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
-        let phase = std::time::Instant::now();
+        // Historical values are staged BEFORE the batch's root is published.
+        // Appending to the revision value log is the one commit step that fails
+        // on resources the caller controls — a full disk most of all — and it
+        // used to run after `publish`, so such a failure returned an error for a
+        // batch that was already visible with no rollback; worse, the next
+        // successful commit encoded the phantom root into its own WAL record,
+        // letting a crash promote the unacknowledged write into permanent
+        // existence. Staging first means every failure below happens while the
+        // mutation is still invisible. The cost is unreachable bytes: values
+        // staged here are orphaned if the batch later fails anywhere before its
+        // WAL record lands, and stay as garbage until checkpoint compaction
+        // reclaims them.
         let mut prepared = Vec::with_capacity(pending.len());
         if oldest_snapshot.is_some() {
+            if let Err(error) = self.inject(FailurePoint::BeforeValuePrepare) {
+                self.abandon_staged_changes();
+                return Err(error);
+            }
             for operation in pending.iter().filter(|op| is_versioned_key(&op.key)) {
-                prepared.push((
-                    operation.key.clone(),
-                    mvcc::prepare_value(
-                        &mut self.mvcc_values,
-                        revision,
-                        (operation.op == OP_PUT).then_some(operation.value.as_slice()),
-                    )?,
-                ));
+                let staged = mvcc::prepare_value(
+                    &mut self.mvcc_values,
+                    revision,
+                    (operation.op == OP_PUT).then_some(operation.value.as_slice()),
+                );
+                match staged {
+                    Ok(value) => prepared.push((operation.key.clone(), value)),
+                    Err(error) => {
+                        self.abandon_staged_changes();
+                        return Err(error);
+                    }
+                }
             }
         }
         profile::add(&profile::MVCC_NS, phase);
+        let phase = std::time::Instant::now();
+        let outcome = match self.tree.prepare_batch(&mutations) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.abandon_staged_changes();
+                return Err(error);
+            }
+        };
+        profile::add(&profile::TREE_NS, phase);
+        // Past this line the batch is visible, so only the WAL-stage error path
+        // below may answer for it.
+        self.tree.publish(outcome.root, outcome.len);
+        self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
         let phase = std::time::Instant::now();
         // A deferred barrier only appends here; the caller flushes once it has
         // released the write lock, and must not acknowledge before it returns.
@@ -1459,31 +1528,80 @@ impl Engine {
         let lsn = match committed {
             Ok(lsn) => lsn,
             Err(error) => {
+                // The tree is copy-on-write, so the pre-batch root is still
+                // intact and republishing it withdraws every mutation the batch
+                // made. It does not undo the WAL record if one landed — hence
+                // the poison below.
                 self.tree.publish(original_root, original_len);
                 self.user_len = original_user_len;
+                self.abandon_staged_changes();
                 self.poisoned = true;
                 return Err(error);
             }
         };
+        // History maintenance runs after `commit_batch` has fsynced, so a
+        // failure here must not travel to the caller as an ordinary error: the
+        // write IS durable, and returning "retry" would invite a double apply.
+        // Poisoning matches the WAL-stage convention, with an error that says
+        // the data survived.
         if let Some(oldest_snapshot) = oldest_snapshot {
-            for (key, (revision, value)) in previous {
-                if let Some(revision) = revision.filter(|revision| *revision <= oldest_snapshot) {
-                    if self.mvcc.histories.get(&key).is_none_or(|versions| {
-                        versions
-                            .last()
-                            .is_none_or(|version| version.revision < revision)
-                    }) {
-                        mvcc::append(&mut self.mvcc, &mut self.mvcc_values, key, revision, value)?;
-                    }
-                }
-            }
-            for (key, value) in prepared {
-                mvcc::append_prepared(&mut self.mvcc, key, self.last_lsn, value);
+            if let Err(error) =
+                self.maintain_history(previous, prepared, oldest_snapshot)
+            {
+                self.poisoned = true;
+                eprintln!(
+                    "vyrn: commit {} is durable but history maintenance failed ({error}); \
+                     the engine refuses further work until it is reopened",
+                    self.last_lsn
+                );
+                return Err(Error::CommittedThenPoisoned {
+                    lsn: self.last_lsn,
+                });
             }
         }
         // Hide results for the change records appended by with_change_log.
         results.truncate(requested);
         Ok((results, lsn))
+    }
+
+    /// Discards the change records `with_change_log` staged for a batch that
+    /// failed before it became visible.
+    ///
+    /// The staging happens at the very start of a batch, before anything can
+    /// fail. A batch that never published must not leave those records behind:
+    /// they describe mutations that did not happen, and `last_published` is
+    /// exactly what subscribers are told to broadcast.
+    fn abandon_staged_changes(&mut self) {
+        self.last_published = Vec::new();
+    }
+
+    /// Records a committed batch's historical versions in the MVCC state.
+    ///
+    /// Fallible only through the revision value log, and only ever called after
+    /// the batch's WAL record is durable — see the caller for what that means
+    /// for error handling.
+    fn maintain_history(
+        &mut self,
+        previous: PreviousVersions,
+        prepared: Vec<(Vec<u8>, Option<value_log::ValueRef>)>,
+        oldest_snapshot: u64,
+    ) -> Result<()> {
+        self.inject(FailurePoint::BeforeHistoryAppend)?;
+        for (key, (revision, value)) in previous {
+            if let Some(revision) = revision.filter(|revision| *revision <= oldest_snapshot) {
+                if self.mvcc.histories.get(&key).is_none_or(|versions| {
+                    versions
+                        .last()
+                        .is_none_or(|version| version.revision < revision)
+                }) {
+                    mvcc::append(&mut self.mvcc, &mut self.mvcc_values, key, revision, value)?;
+                }
+            }
+        }
+        for (key, value) in prepared {
+            mvcc::append_prepared(&mut self.mvcc, key, self.last_lsn, value);
+        }
+        Ok(())
     }
 
     pub fn scan(
@@ -1736,9 +1854,31 @@ impl Engine {
         if !self.pending_wal.is_empty() {
             self.tree.sync()?;
             self.mvcc_values.sync()?;
-            let lsn = self.last_lsn;
-            for record in self.pending_wal.drain(..) {
-                self.wal.append(&record, lsn)?;
+            let pending = std::mem::take(&mut self.pending_wal);
+            // Each record is appended with the LSN it was issued at. Draining
+            // them all at `last_lsn` published that highest LSN to
+            // `appended_lsn` on the very first append, so a concurrent
+            // `sync_through` could declare every buffered record durable while
+            // most of them had not even been handed to the kernel.
+            let flushed = pending.into_iter().enumerate().try_for_each(
+                |(index, (lsn, record))| {
+                    // Offered from the second record on only, so an injected
+                    // failure lands after one record has already left the
+                    // buffer — the shape of an ENOSPC mid-drain.
+                    if index > 0 {
+                        self.inject(FailurePoint::BetweenBufferedAppends)?;
+                    }
+                    self.wal.append(&record, lsn)
+                },
+            );
+            if let Err(error) = flushed {
+                // Whatever was drained is gone from the buffer and the records
+                // behind it were never issued; neither can be put back. Keeping
+                // quiet here would leave an engine that looks healthy while
+                // acknowledged async writes silently vanish at the next
+                // restart, which is the one outcome worse than refusing work.
+                self.poisoned = true;
+                return Err(error);
             }
         }
         // Also covers a durable commit whose flush was deferred to the caller,
@@ -1759,31 +1899,55 @@ impl Engine {
         self.ensure_healthy()?;
         self.sync()?;
         self.tree.validate()?;
-        let generation = self.checkpoint_generation + 1;
+        // The next generation is derived from the published manifest rather than
+        // read back from this counter alone. Both belt and braces, because each
+        // guards a different failure:
+        //
+        // - Updating the counter immediately after `write_manifest` (below) is
+        //   what makes a FAILED checkpoint harmless. The manifest publish is the
+        //   commit point — past it, recovery will name that generation whether
+        //   or not the rest of the checkpoint finished — so the counter must
+        //   move at the same instant. It used to move only on the last line,
+        //   so any failure in between left the engine live on files of
+        //   generation G+1 while the counter still said G; the NEXT checkpoint
+        //   recomputed G+1 and its pre-cleanup unlinked those very files, which
+        //   on POSIX deleted the ground under the running engine (and, once the
+        //   sealed segments were gone, made a crash there unrecoverable) and on
+        //   Windows failed every future rename over the still-open file.
+        //
+        // - Deriving from the manifest on entry additionally protects against
+        //   drift from any other source — an earlier crash between publishing a
+        //   generation's files and writing the manifest, or a stale counter
+        //   carried by an older build — by refusing to reuse a number the disk
+        //   already claims. One 48-byte read per checkpoint costs nothing.
+        let generation = read_manifest(&self.path)?
+            .map(|state| state.generation)
+            .unwrap_or(0)
+            .max(self.checkpoint_generation)
+            + 1;
+        // Whichever generation is newest on disk is the one whose files this
+        // checkpoint retires.
+        let retiring = generation - 1;
         let temporary = self
             .path
             .join(format!("{}.tmp", page_file_name(generation)));
         let published = self.path.join(page_file_name(generation));
-        let old = self.path.join(page_file_name(self.checkpoint_generation));
+        let old = self.path.join(page_file_name(retiring));
         let temporary_values = self
             .path
             .join(format!("{}.tmp", value_file_name(generation)));
         let published_values = self.path.join(value_file_name(generation));
-        let old_values = self.path.join(value_file_name(self.checkpoint_generation));
+        let old_values = self.path.join(value_file_name(retiring));
         let temporary_revisions = self
             .path
             .join(format!("{}.tmp", revision_file_name(generation)));
         let published_revisions = self.path.join(revision_file_name(generation));
-        let old_revisions = self
-            .path
-            .join(revision_file_name(self.checkpoint_generation));
+        let old_revisions = self.path.join(revision_file_name(retiring));
         let temporary_revision_values = self
             .path
             .join(format!("{}.tmp", revision_value_file_name(generation)));
         let published_revision_values = self.path.join(revision_value_file_name(generation));
-        let old_revision_values = self
-            .path
-            .join(revision_value_file_name(self.checkpoint_generation));
+        let old_revision_values = self.path.join(revision_value_file_name(retiring));
         let _ = fs::remove_file(&temporary);
         let _ = fs::remove_file(&published);
         let _ = fs::remove_file(&temporary_values);
@@ -1810,13 +1974,30 @@ impl Engine {
         };
         self.inject(FailurePoint::BeforeManifestPublish)?;
         write_manifest(&self.path, new_state)?;
+        // The publish above was the commit point, so the counter moves NOW —
+        // before anything else can fail. Every step after this line either
+        // adopts what was published (and may fail without unmaking the
+        // checkpoint) or retires files this engine no longer needs (and must
+        // never fail the checkpoint at all).
+        self.checkpoint_generation = generation;
         self.inject(FailurePoint::AfterManifestPublish)?;
+        // Adopting the published generation can fail (a bad page file, an I/O
+        // error). That aborts the checkpoint safely now: the manifest already
+        // names `generation` and its files are complete, the previous
+        // generation's files and every sealed segment are still in place
+        // because the retirement below never runs, and the engine keeps serving
+        // from its current tree. The next checkpoint simply tries again.
         self.tree = PageTree::open(&published, &published_values, root, len)?;
         self.tree.validate()?;
         self.mvcc_values = value_log::ValueLog::open(&published_revision_values)?;
         self.mvcc = compacted_mvcc;
+        self.inject(FailurePoint::AfterTreeAdoption)?;
         self.rotate_segment()?;
         let wal_directory = self.path.join("wal");
+        // Everything past this point is janitorial: the checkpoint is committed
+        // and adopted, so a failed deletion or directory sync is a warning about
+        // leaked files, not a reason to report the checkpoint as failed.
+        //
         // Once pages are checkpointed, an unarchived sealed segment is the only
         // copy of its LSN range anywhere, so deletion additionally waits for
         // the archiver's watermark. With no archiver configured the barrier is
@@ -1825,28 +2006,27 @@ impl Engine {
             .archived_through
             .as_ref()
             .map(|watermark| watermark.load(std::sync::atomic::Ordering::Acquire));
-        for segment in list_segments(&wal_directory)? {
-            if segment < self.segment_id
-                && archived_through.is_none_or(|watermark| segment <= watermark)
-            {
-                fs::remove_file(wal_directory.join(segment_name(segment)))?;
+        match list_segments(&wal_directory) {
+            Ok(segments) => {
+                for segment in segments {
+                    if segment < self.segment_id
+                        && archived_through.is_none_or(|watermark| segment <= watermark)
+                    {
+                        retire(wal_directory.join(segment_name(segment)), "WAL segment");
+                    }
+                }
             }
+            Err(error) => eprintln!(
+                "vyrn: checkpoint could not list retired WAL segments ({error}); \
+                 they will be offered again by the next checkpoint"
+            ),
         }
-        sync_directory(&wal_directory)?;
-        if old.exists() {
-            fs::remove_file(old)?;
-        }
-        if old_values.exists() {
-            fs::remove_file(old_values)?;
-        }
-        if old_revisions.exists() {
-            fs::remove_file(old_revisions)?;
-        }
-        if old_revision_values.exists() {
-            fs::remove_file(old_revision_values)?;
-        }
-        sync_directory(&self.path)?;
-        self.checkpoint_generation = generation;
+        let _ = sync_directory(&wal_directory);
+        retire(old, "page file");
+        retire(old_values, "value log");
+        retire(old_revisions, "revision log");
+        retire(old_revision_values, "revision value log");
+        let _ = sync_directory(&self.path);
         Ok(())
     }
 
@@ -2082,7 +2262,7 @@ impl Engine {
             self.inject(FailurePoint::BeforeWalSync)?;
         } else {
             self.wal_len += record.len() as u64;
-            self.pending_wal.push(record);
+            self.pending_wal.push((lsn, record));
         }
         self.last_lsn = lsn;
         Ok(lsn)
@@ -2145,7 +2325,26 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        let _ = self.sync();
+        // Shutdown is the last chance to flush buffered async records, and a
+        // failure here used to vanish without a trace: those writes were
+        // acknowledged in memory, so discarding them quietly turns "async" into
+        // "lost". No caller remains to receive an error, so the failure is
+        // announced loudly — plain stderr until tracing lands — and recorded in
+        // the engine state for anything still holding a handle.
+        //
+        // This path is not covered by an automated test: failing the flush
+        // requires a fault between the last `sync` and the drop, which only a
+        // manual run can arrange (inject a WAL failure into `sync`, drop the
+        // engine without retrying, watch for the warning).
+        if !self.poisoned {
+            if let Err(error) = self.sync() {
+                self.poisoned = true;
+                eprintln!(
+                    "vyrn: shutdown flush failed ({error}); async commits since the \
+                     last successful flush were discarded"
+                );
+            }
+        }
         let _ = FileExt::unlock(&self.lock);
     }
 }
@@ -2173,6 +2372,37 @@ fn create_segment(directory: &Path, segment_id: u64, first_lsn: u64) -> Result<F
         .read(true)
         .write(true)
         .open(directory.join(segment_name(segment_id)))?;
+    write_segment_header(&mut file, segment_id, first_lsn)?;
+    sync_directory(directory)?;
+    Ok(file)
+}
+
+/// Replaces an empty segment's header without ever unlinking the segment.
+///
+/// The replacement is built under a temporary name and renamed into place. It
+/// used to be `remove_file` then `create_segment`: a kill between the two left
+/// a permanent hole in the segment sequence, which `list_segments` rejects on
+/// every future open — a database bricked by its own repair. A rename is atomic,
+/// so after a crash at any point the directory holds either the old header (and
+/// the next open retries the repair) or the new one. A temporary left behind by
+/// an interrupted attempt is truncated and reused rather than an obstacle.
+fn republish_segment_header(directory: &Path, segment_id: u64, first_lsn: u64) -> Result<File> {
+    let target = directory.join(segment_name(segment_id));
+    let temporary = directory.join(format!("{}.tmp", segment_name(segment_id)));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&temporary)?;
+    write_segment_header(&mut file, segment_id, first_lsn)?;
+    drop(file);
+    fs::rename(&temporary, &target)?;
+    sync_directory(directory)?;
+    Ok(OpenOptions::new().read(true).write(true).open(target)?)
+}
+
+fn write_segment_header(file: &mut File, segment_id: u64, first_lsn: u64) -> Result<()> {
     let mut header = [0; SEGMENT_HEADER_LEN];
     header[0..4].copy_from_slice(SEGMENT_MAGIC);
     header[4] = VERSION;
@@ -2182,8 +2412,28 @@ fn create_segment(directory: &Path, segment_id: u64, first_lsn: u64) -> Result<F
     write_u32(&mut header, 24, header_checksum);
     file.write_all(&header)?;
     file.sync_all()?;
-    sync_directory(directory)?;
-    Ok(file)
+    Ok(())
+}
+
+/// Deletes a file a finished checkpoint has retired, treating failure as a
+/// warning rather than an error.
+///
+/// Everything past the manifest publish is janitorial: the checkpoint is
+/// committed and adopted, so a deletion that fails — an antivirus handle on
+/// Windows, a read handle still open — must not fail it. Failing here used to
+/// strand the engine between generations; warning instead leaks at worst a file
+/// that the next checkpoint will offer again. A missing file is not a warning:
+/// retiring a generation that never existed is the common case on a database
+/// that has checkpointed once.
+fn retire(path: PathBuf, description: &str) {
+    if let Err(error) = fs::remove_file(&path) {
+        if path.exists() {
+            eprintln!(
+                "vyrn: checkpoint could not delete retired {description} {}: {error}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// One committed WAL record's mutations, kept so recovery can reapply them when
@@ -2347,7 +2597,27 @@ fn replay_segment(
         let mut record_header = [0; RECORD_HEADER_LEN];
         file.read_exact(&mut record_header)?;
         if &record_header[0..4] != RECORD_MAGIC || record_header[4] != VERSION {
-            return Err(corrupt(segment_id, offset, "invalid transaction header"));
+            // An all-zero header is the signature of a head page that never
+            // reached the disk, not of damage. The runway ahead of the records
+            // is zero-filled, and a write-back cache can persist a multi-page
+            // record's tail while losing its head; the frame then lies wholly
+            // inside `written_through` — so the overrun rule below never sees
+            // it — with its header still holding the runway's zeros. No bit
+            // flip or rot produces forty-five zero bytes, so accepting exactly
+            // that signature as a torn tail survives an ordinary crash without
+            // turning damage into silence. A tear that spares the header (an
+            // intact first page, lost middle pages) still fails its checksum and
+            // stays fatal: it is indistinguishable from rot, and rotting bytes
+            // must not buy a truncated log.
+            return stop_at_torn_record(
+                &mut file,
+                is_last,
+                segment_id,
+                offset,
+                &record_header,
+                "invalid transaction header",
+            )
+            .map(|()| offset);
         }
         let lsn = read_u64(&record_header, 5);
         let operation_count = read_u32(&record_header, 13) as usize;
@@ -2547,6 +2817,28 @@ fn truncate_or_corrupt(file: &mut File, is_last: bool, segment: u64, offset: u64
     file.set_len(offset)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Ends replay at `offset`, where the frame that begins there failed to parse.
+///
+/// The tail is truncated only when the segment is the active one AND the frame
+/// carries the zero-header tear signature — a record whose head page never
+/// persisted, which is an ordinary crash rather than damage. Everything else is
+/// reported as corruption: sealed segments were truncated at the open that
+/// sealed them, so a frame that cannot parse in one is historical rot, and rot
+/// must stay loud. See the call site for why nothing narrower qualifies.
+fn stop_at_torn_record(
+    file: &mut File,
+    is_last: bool,
+    segment: u64,
+    offset: u64,
+    record_header: &[u8; RECORD_HEADER_LEN],
+    reason: &'static str,
+) -> Result<()> {
+    if is_last && record_header.iter().all(|byte| *byte == 0) {
+        return truncate_or_corrupt(file, true, segment, offset);
+    }
+    Err(corrupt(segment, offset, reason))
 }
 
 fn encode_record(lsn: u64, operations: &[PendingCommit], root: u64, len: u64) -> Result<Vec<u8>> {
@@ -3080,6 +3372,54 @@ mod tests {
             assert_eq!(engine.get(key).unwrap(), Some(value.to_vec()));
         }
         assert_eq!(engine.sequence(), 4);
+    }
+
+    /// The same repair must never unlink the segment it is replacing. Removing
+    /// the segment and creating its replacement as two steps meant a kill
+    /// between them left a permanent hole in the segment sequence — which
+    /// `list_segments` rejects on every future open, so the database could never
+    /// open again. The replacement is now built under a temporary name and
+    /// renamed into place; a temporary left behind by an interrupted attempt is
+    /// truncated and reused rather than an obstacle. (The crash window itself is
+    /// not injectable; what is testable is that a retry after an interrupted
+    /// attempt succeeds and leaves nothing temporary behind.)
+    #[test]
+    fn open_repairs_an_empty_active_segment_without_unlinking_it() {
+        let directory = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            engine.put(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.put(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+            engine.put(b"k3".to_vec(), b"v3".to_vec()).unwrap();
+        }
+        let wal_directory = directory.path().join("wal");
+        // The orphan successor of a failed rotation: empty, with a header
+        // claiming a first LSN the log does not support.
+        drop(create_segment(&wal_directory, 2, 2).unwrap());
+        // What a repair killed before its rename leaves behind.
+        fs::write(
+            wal_directory.join(format!("{}.tmp", segment_name(2))),
+            b"half-written",
+        )
+        .unwrap();
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            assert_eq!(engine.sequence(), 3);
+            engine.put(b"k4".to_vec(), b"v4".to_vec()).unwrap();
+        }
+        let engine = Engine::open(directory.path()).unwrap();
+        for (key, value) in [
+            (b"k1", b"v1"),
+            (b"k2", b"v2"),
+            (b"k3", b"v3"),
+            (b"k4", b"v4"),
+        ] {
+            assert_eq!(engine.get(key).unwrap(), Some(value.to_vec()));
+        }
+        assert_eq!(engine.sequence(), 4);
+        // The repair renamed its replacement into place; nothing temporary
+        // remains to confuse the next open.
+        assert!(!wal_directory.join(format!("{}.tmp", segment_name(2))).exists());
     }
 
     #[test]

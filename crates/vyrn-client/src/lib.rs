@@ -5,8 +5,6 @@ use rustls::{
 };
 use std::{
     fmt,
-    fs::File,
-    io::BufReader,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -132,8 +130,22 @@ pub enum Error {
     InvalidConnectionString(String),
     #[error("TLS requires a CA certificate file")]
     MissingCa,
+    /// The request did not complete within the timeout.
+    ///
+    /// The operation's outcome on the server is unknown — a write may still be
+    /// applied after this error, so retrying blindly can apply it twice. The
+    /// connection is retired: every later request on it fails fast with
+    /// [`Error::UnusableConnection`] instead of reading the late response as
+    /// the answer to the wrong request.
     #[error("connection timed out")]
     Timeout,
+    /// An earlier request on this connection timed out, so the server's late
+    /// response could still arrive and be mistaken for the answer to a later
+    /// request. The connection refuses all further requests; open a fresh one
+    /// and re-check the server's state before repeating the timed-out
+    /// operation, whose outcome remains unknown.
+    #[error("connection is unusable after an earlier request timed out")]
+    UnusableConnection,
     #[error("connection has an unfinished transaction")]
     TransactionActive,
     #[error("connection closed by server")]
@@ -195,11 +207,20 @@ pub struct CursorSubscription {
 }
 
 impl CursorSubscription {
+    /// Returns the next event, or `None` once the server closes the stream.
+    ///
+    /// Fails with [`Error::Server`] when the server reports an error and
+    /// [`Error::Protocol`] if the server speaks a different protocol version.
     pub async fn next(&mut self) -> Result<Option<StreamEvent>, Error> {
         let Some(message) = self.framed.next().await else {
             return Ok(None);
         };
         let envelope = message.map_err(|error| Error::Transport(error.to_string()))?;
+        if envelope.version != PROTOCOL_VERSION {
+            return Err(Error::Protocol(
+                "server used an unsupported protocol version".into(),
+            ));
+        }
         match envelope.message {
             Message::CursorChange { cursor, key, value } => {
                 Ok(Some(StreamEvent::Change { cursor, key, value }))
@@ -254,11 +275,20 @@ pub struct DocumentSubscription {
 }
 
 impl DocumentSubscription {
+    /// Returns the next change, or `None` once the server closes the stream.
+    ///
+    /// Fails with [`Error::Server`] when the server reports an error and
+    /// [`Error::Protocol`] if the server speaks a different protocol version.
     pub async fn next(&mut self) -> Result<Option<DocumentChange>, Error> {
         let Some(message) = self.framed.next().await else {
             return Ok(None);
         };
         let envelope = message.map_err(|error| Error::Transport(error.to_string()))?;
+        if envelope.version != PROTOCOL_VERSION {
+            return Err(Error::Protocol(
+                "server used an unsupported protocol version".into(),
+            ));
+        }
         match envelope.message {
             Message::DocumentChange {
                 sequence,
@@ -280,11 +310,20 @@ pub struct Subscription {
 }
 
 impl Subscription {
+    /// Returns the next change, or `None` once the server closes the stream.
+    ///
+    /// Fails with [`Error::Server`] when the server reports an error and
+    /// [`Error::Protocol`] if the server speaks a different protocol version.
     pub async fn next(&mut self) -> Result<Option<Change>, Error> {
         let Some(message) = self.framed.next().await else {
             return Ok(None);
         };
         let envelope = message.map_err(|error| Error::Transport(error.to_string()))?;
+        if envelope.version != PROTOCOL_VERSION {
+            return Err(Error::Protocol(
+                "server used an unsupported protocol version".into(),
+            ));
+        }
         match envelope.message {
             Message::Change {
                 sequence,
@@ -305,6 +344,9 @@ pub struct Client {
     framed: Framed<BoxedTransport, VyrnCodec>,
     next_request_id: u64,
     transaction_active: bool,
+    /// Set once a request times out: the transport is still open, so the
+    /// late response would desynchronize every later exchange.
+    unusable: bool,
 }
 
 pub struct Transaction<'a> {
@@ -335,7 +377,7 @@ impl Client {
 
         let transport: BoxedTransport = if options.tls_required {
             let ca_path = ca_path.ok_or(Error::MissingCa)?;
-            let roots = load_ca(ca_path)?;
+            let roots = load_ca(ca_path).await?;
             let config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_root_certificates(roots)
                 .with_no_client_auth();
@@ -357,6 +399,7 @@ impl Client {
             framed: Framed::new(transport, VyrnCodec::default()),
             next_request_id: 1,
             transaction_active: false,
+            unusable: false,
         };
         match client
             .request(Message::Authenticate {
@@ -657,22 +700,48 @@ impl Client {
         self.request_raw(message).await
     }
 
+    /// Sends one request and awaits the response addressed to it.
+    ///
+    /// A timeout retires the connection: the request may already have been
+    /// delivered, so its outcome on the server is UNKNOWN when
+    /// [`Error::Timeout`] is returned — a write can still be applied after the
+    /// caller sees the error — and the server's late response would otherwise
+    /// be read as the answer to the next request. Every later request on this
+    /// client therefore fails fast with [`Error::UnusableConnection`]; open a
+    /// fresh connection instead of retrying on this one.
     async fn request_raw(&mut self, message: Message) -> Result<Message, Error> {
+        if self.unusable {
+            return Err(Error::UnusableConnection);
+        }
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.checked_add(1).unwrap_or(1);
-        timeout(
+        match timeout(
             REQUEST_TIMEOUT,
             self.framed.send(Envelope::new(request_id, message)),
         )
         .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|error| Error::Transport(error.to_string()))?;
+        {
+            // A timed-out send may have written part of a frame, and the
+            // request can still reach the server: its outcome is unknown.
+            Err(_) => {
+                self.unusable = true;
+                return Err(Error::Timeout);
+            }
+            Ok(Err(error)) => return Err(Error::Transport(error.to_string())),
+            Ok(Ok(())) => {}
+        }
 
-        let response = timeout(REQUEST_TIMEOUT, self.framed.next())
-            .await
-            .map_err(|_| Error::Timeout)?
-            .ok_or(Error::ConnectionClosed)?
-            .map_err(|error| Error::Transport(error.to_string()))?;
+        let response = match timeout(REQUEST_TIMEOUT, self.framed.next()).await {
+            // The request was delivered; waiting longer cannot tell us whether
+            // it ran, and its late reply would desynchronize every further
+            // exchange by one response. Retire the connection.
+            Err(_) => {
+                self.unusable = true;
+                return Err(Error::Timeout);
+            }
+            Ok(None) => return Err(Error::ConnectionClosed),
+            Ok(Some(result)) => result.map_err(|error| Error::Transport(error.to_string()))?,
+        };
         if response.version != PROTOCOL_VERSION {
             return Err(Error::Protocol(
                 "server used an unsupported protocol version".into(),
@@ -770,31 +839,44 @@ impl Transaction<'_> {
         }
     }
 
+    /// Commits the transaction.
+    ///
+    /// Only a definite server answer — success or a server-reported error —
+    /// ends the transaction on the client. If the commit is lost in transit
+    /// (a timeout or a dropped connection), the server may still hold, or
+    /// later apply, the transaction, so the session stays marked
+    /// in-transaction: the next request on this client first attempts the
+    /// rollback, surfacing the broken state instead of silently running
+    /// inside an abandoned transaction.
     pub async fn commit(self) -> Result<(), Error> {
         let result = self.client.request_raw(Message::Commit).await;
-        self.client.transaction_active = false;
-        match result? {
+        match conclude_transaction(self.client, result)? {
             Message::Committed => Ok(()),
             message => Err(unexpected(message)),
         }
     }
 
+    /// Rolls the transaction back.
+    ///
+    /// Like [`Transaction::commit`], the transaction is only considered ended
+    /// when the server answers. A rollback lost in transit leaves the session
+    /// marked in-transaction so the next request still attempts the rollback.
     pub async fn rollback(self) -> Result<(), Error> {
         let result = self.client.request_raw(Message::Rollback).await;
-        self.client.transaction_active = false;
-        match result? {
+        match conclude_transaction(self.client, result)? {
             Message::RolledBack => Ok(()),
             message => Err(unexpected(message)),
         }
     }
 }
 
-fn load_ca(path: &Path) -> Result<RootCertStore, Error> {
-    let file = File::open(path).map_err(|error| Error::Tls(error.to_string()))?;
-    let certificates: Vec<CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut BufReader::new(file))
-            .collect::<Result<_, _>>()
-            .map_err(|error| Error::Tls(error.to_string()))?;
+async fn load_ca(path: &Path) -> Result<RootCertStore, Error> {
+    let pem = tokio::fs::read(path)
+        .await
+        .map_err(|error| Error::Tls(error.to_string()))?;
+    let certificates: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<_, _>>()
+        .map_err(|error| Error::Tls(error.to_string()))?;
     if certificates.is_empty() {
         return Err(Error::Tls("CA file contains no certificates".into()));
     }
@@ -805,6 +887,24 @@ fn load_ca(path: &Path) -> Result<RootCertStore, Error> {
             .map_err(|error| Error::Tls(error.to_string()))?;
     }
     Ok(roots)
+}
+
+/// Ends the client-side transaction marker once the server has ruled.
+///
+/// Only a decoded response addressed to this request — success or a
+/// server-reported error — proves the server released the transaction. Any
+/// earlier failure (timeout, dropped connection, undecodable reply) leaves
+/// the server's view unknown, so the marker stays set and the next top-level
+/// request still attempts the rollback rather than running inside an
+/// abandoned transaction.
+fn conclude_transaction(
+    client: &mut Client,
+    result: Result<Message, Error>,
+) -> Result<Message, Error> {
+    if matches!(&result, Ok(_) | Err(Error::Server { .. })) {
+        client.transaction_active = false;
+    }
+    result
 }
 
 fn unexpected(message: Message) -> Error {
@@ -857,5 +957,41 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(!error.contains("do-not-print-this"));
+    }
+
+    // A throwaway self-signed certificate, only used to exercise CA loading.
+    const TEST_CA_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBiTCCATGgAwIBAgIUF2yogD9n1xqsfDplRGIY2xnX8y8wCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQdnlybi1jbGllbnQtdGVzdDAeFw0yNjA4MjIwNzI0MTlaFw0z
+NjA4MTkwNzI0MTlaMBsxGTAXBgNVBAMMEHZ5cm4tY2xpZW50LXRlc3QwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAAR+Ov8/VUs0tTtI50m12vUjZo+uBTlGmuOHoLoq
+ECYeCBgr20pKxUmQbBib8ZIkKfGFYdBF5Whr4nbrHUifQrTSo1MwUTAdBgNVHQ4E
+FgQUaos/13Vqy/4/ygW2cVjp4LdgR54wHwYDVR0jBBgwFoAUaos/13Vqy/4/ygW2
+cVjp4LdgR54wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNGADBDAh903XGM
+RD6UCYnODszNdUsNkNTa2tNam6xesJkANjw3AiBurn1EHO4/E3kNqQ3Q+2CaeQ1Q
+KUCeypY1f0rLPW4/BQ==
+-----END CERTIFICATE-----
+";
+
+    #[tokio::test]
+    async fn load_ca_reads_certificates_asynchronously() {
+        let path = std::env::temp_dir().join(format!("vyrn-ca-{}.pem", std::process::id()));
+        std::fs::write(&path, TEST_CA_PEM).expect("write temporary CA");
+        let roots = load_ca(&path).await.expect("CA loads");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(roots.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn load_ca_rejects_a_file_without_certificates() {
+        let path = std::env::temp_dir().join(format!("vyrn-empty-{}.pem", std::process::id()));
+        std::fs::write(&path, b"not a certificate\n").expect("write temporary file");
+        let error = load_ca(&path).await.unwrap_err();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            matches!(&error, Error::Tls(text) if text.contains("contains no certificates")),
+            "{error:?}"
+        );
     }
 }

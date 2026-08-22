@@ -84,6 +84,10 @@ impl Cursor {
 
 pub(crate) const SUFFIX_LEN: usize = 12;
 
+/// Smallest possible encoded entry: the 9-byte header plus the non-empty key
+/// that the length checks require.
+const MIN_ENTRY_LEN: usize = 10;
+
 /// Encodes every mutation of one commit into a single change-log value.
 ///
 /// One record per commit rather than one per mutation keeps the change log to a
@@ -111,7 +115,12 @@ pub(crate) fn decode_batch(sequence: u64, encoded: &[u8]) -> Result<Vec<ChangeRe
     }
     let count = u32::from_be_bytes(encoded[0..4].try_into().unwrap()) as usize;
     let mut offset = 4;
-    let mut records = Vec::with_capacity(count);
+    // The count comes off disk unvalidated, so the reservation is clamped to
+    // what the remaining buffer could physically hold at MIN_ENTRY_LEN per
+    // entry. A corrupt count near u32::MAX would otherwise attempt a huge
+    // allocation before the per-entry checks below reject it; a valid batch
+    // always fits its buffer, so the clamp never binds for one.
+    let mut records = Vec::with_capacity(count.min((encoded.len() - offset) / MIN_ENTRY_LEN));
     for index in 0..count {
         if encoded.len() < offset + 9 {
             return Err(corrupt("change log entry header is truncated"));
@@ -129,7 +138,13 @@ pub(crate) fn decode_batch(sequence: u64, encoded: &[u8]) -> Result<Vec<ChangeRe
         if key_len == 0 || key_len > MAX_KEY_SIZE || (!present && value_len != 0) {
             return Err(corrupt("change log entry has invalid lengths"));
         }
-        if encoded.len() < offset + key_len + value_len {
+        // Checked adds: the lengths are attacker-controlled u32 widths read
+        // from the record, and on a 32-bit target a plain add can overflow into
+        // a bound that passes.
+        let end = offset
+            .checked_add(key_len)
+            .and_then(|end| end.checked_add(value_len));
+        if end.is_none_or(|end| end > encoded.len()) {
             return Err(corrupt("change log entry is truncated"));
         }
         let key = encoded[offset..offset + key_len].to_vec();
@@ -198,6 +213,35 @@ mod tests {
         let mut trailing = encode_batch(&[(b"a", None)]);
         trailing.push(0);
         assert!(decode_batch(1, &trailing).is_err(), "trailing data");
+    }
+
+    #[test]
+    fn a_corrupt_entry_count_does_not_drive_the_allocation() {
+        // Claims ~4.29 billion entries with no body at all. Reserving capacity
+        // for the claim aborts the process before the truncation check inside
+        // the loop can reject it.
+        let encoded = u32::MAX.to_be_bytes();
+        assert!(matches!(
+            decode_batch(1, &encoded),
+            Err(Error::CorruptManifest(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_lengths_are_rejected_without_overflowing_the_bound() {
+        // A value length of u32::MAX on top of a real offset and key length
+        // must read as truncated. The bound is computed with checked adds
+        // because a plain add wraps on a 32-bit target and can turn this
+        // rejection into a pass.
+        let mut encoded = 1_u32.to_be_bytes().to_vec();
+        encoded.push(1);
+        encoded.extend_from_slice(&1_u32.to_be_bytes());
+        encoded.extend_from_slice(&u32::MAX.to_be_bytes());
+        encoded.push(b'k');
+        assert!(matches!(
+            decode_batch(1, &encoded),
+            Err(Error::CorruptManifest(_))
+        ));
     }
 
     #[test]

@@ -11,6 +11,62 @@ use std::collections::BTreeMap;
 use tempfile::tempdir;
 use vyrn_core::{portable, Engine};
 
+/// The standard reflected CRC-32 the engine's checksums use, computed bitwise.
+///
+/// Reimplemented because `crc32fast` is not a dev-dependency and these tests
+/// must produce trailers byte-identical to an export's; the polynomial, the
+/// initial and final XOR are the zlib parameters every CRC-32 tool agrees on.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Builds a well-formed dump from raw pairs — magic, version, framing, trailer
+/// with a correct pair count and checksum — so tests can craft inputs no export
+/// would ever produce while keeping everything around them honest.
+fn build_dump(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"VYRNDUMP");
+    out.push(1);
+    let mut covered = Vec::new();
+    for (key, value) in pairs {
+        covered.extend_from_slice(key);
+        covered.extend_from_slice(value);
+        out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&(pairs.len() as u64).to_be_bytes());
+    out.extend_from_slice(&crc32(&covered).to_be_bytes());
+    out
+}
+
+/// Imports `bytes` as a dump into a fresh engine, asserting the import is
+/// refused and the target still holds nothing — a half-imported database is
+/// precisely what a refused import must never leave behind, because the CLI's
+/// fresh-directory requirement makes it unreachable for a retry.
+fn assert_refused_and_empty(dump: &std::path::Path, why: &str) {
+    let target_dir = tempdir().unwrap();
+    let mut target = Engine::open(target_dir.path()).unwrap();
+    let result = portable::import(&mut target, dump);
+    assert!(result.is_err(), "{why}: the damaged dump imported");
+    let scanned = target.scan(None, None, usize::MAX).unwrap();
+    assert!(
+        scanned.is_empty(),
+        "{why}: the failed import left {} pairs behind",
+        scanned.len()
+    );
+}
+
 fn populate(engine: &mut Engine, count: usize, value_size: usize) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut expected = BTreeMap::new();
     for index in 0..count {
@@ -256,20 +312,181 @@ fn a_damaged_dump_is_refused_rather_than_partially_imported() {
     let dump_dir = tempdir().unwrap();
     let dump = dump_dir.path().join("dump.vyrnl");
     portable::export(&engine, &dump).unwrap();
+    let original = std::fs::read(&dump).unwrap();
 
-    // Flip a byte in the middle of the record stream.
-    let mut bytes = std::fs::read(&dump).unwrap();
-    let middle = bytes.len() / 2;
-    bytes[middle] ^= 0xFF;
-    std::fs::write(&dump, &bytes).unwrap();
+    // A flipped byte in the middle of the record stream: the checksum damage
+    // the format's threat model assumes.
+    let mut flipped = original.clone();
+    let middle = flipped.len() / 2;
+    flipped[middle] ^= 0xFF;
+    std::fs::write(&dump, &flipped).unwrap();
+    assert_refused_and_empty(&dump, "a bit-flipped dump");
 
+    // A truncated tail — an interrupted copy. The trailer is what proves the
+    // whole file arrived, so losing any of it must refuse too.
+    std::fs::write(&dump, &original[..original.len() - 1]).unwrap();
+    assert_refused_and_empty(&dump, "a truncated dump");
+
+    // And the same truncation taken well into the body, where hundreds of
+    // pairs would have been applied before the old reader ever reached the
+    // trailer and noticed.
+    std::fs::write(&dump, &original[..original.len() / 2]).unwrap();
+    assert_refused_and_empty(&dump, "a half-truncated dump");
+}
+
+/// Lengths in a dump are untrusted input: a twelve-byte file declaring a
+/// four-gibibyte key used to be honoured with `vec![0; len]` and could abort
+/// the process inside the allocator. The caps are the engine's own write
+/// limits, so anything larger is damaged-dump error however intact the framing.
+#[test]
+fn an_untrustworthy_length_is_refused_rather_than_allocated() {
+    // A legal key at exactly the engine's limit still imports; one byte over is
+    // refused. This pins the boundary to MAX_KEY_SIZE rather than to some
+    // arbitrary local cap.
+    let boundary_key = vec![b'k'; 64 * 1024];
+    let legal = build_dump(&[(boundary_key.clone(), b"v".to_vec())]);
+    let dump_path = tempdir().unwrap();
+    let dump = dump_path.path().join("boundary.vyrnl");
+    std::fs::write(&dump, &legal).unwrap();
     let target_dir = tempdir().unwrap();
     let mut target = Engine::open(target_dir.path()).unwrap();
-    let result = portable::import(&mut target, &dump);
-    assert!(
-        result.is_err(),
-        "a corrupted dump imported as if it were complete"
-    );
+    assert_eq!(portable::import(&mut target, &dump).unwrap(), 1);
+
+    let oversized_key = build_dump(&[(vec![b'k'; 64 * 1024 + 1], b"v".to_vec())]);
+    std::fs::write(&dump, &oversized_key).unwrap();
+    assert_refused_and_empty(&dump, "an over-limit key length");
+
+    let oversized_value = build_dump(&[(b"k".to_vec(), vec![b'v'; 16 * 1024 * 1024 + 1])]);
+    std::fs::write(&dump, &oversized_value).unwrap();
+    assert_refused_and_empty(&dump, "an over-limit value length");
+
+    // The allocation abort itself: a declared length with no bytes behind it.
+    // This must die at the cap check, not in `vec![0; 0xFFFF_FFFF]`.
+    let mut lying = Vec::new();
+    lying.extend_from_slice(b"VYRNDUMP");
+    lying.push(1);
+    lying.extend_from_slice(&u32::MAX.to_be_bytes());
+    std::fs::write(&dump, &lying).unwrap();
+    assert_refused_and_empty(&dump, "a key length that lies about the file's size");
+}
+
+/// The physical backup reader refuses bytes after its footer; a logical dump is
+/// held to the same rule, because trailing data means a splice or a different
+/// file wearing this one's trailer.
+#[test]
+fn trailing_data_after_the_trailer_is_refused() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+    populate(&mut engine, 10, 32);
+
+    let dump_dir = tempdir().unwrap();
+    let dump = dump_dir.path().join("dump.vyrnl");
+    portable::export(&engine, &dump).unwrap();
+    let mut bytes = std::fs::read(&dump).unwrap();
+    bytes.extend_from_slice(b"a passenger after the trailer");
+    std::fs::write(&dump, &bytes).unwrap();
+
+    assert_refused_and_empty(&dump, "a dump with trailing data");
+}
+
+/// Import writes document pairs as raw bytes under the reserved prefix, so the
+/// document layer never validates them on the way in: without a check here a
+/// crafted dump plants documents that surface as errors on every later read.
+/// Import must enforce what the document layer enforces on write.
+#[test]
+fn a_document_that_would_fail_at_read_time_is_refused_at_import() {
+    // `document_change_key` builds keys exactly as the document layer does, so
+    // the crafted pairs below are indistinguishable from stored documents by
+    // shape alone.
+    let ada = vyrn_core::document::document_change_key("people", "ada").unwrap();
+
+    let cases = [
+        (b"{not json at all".to_vec(), "invalid JSON"),
+        (b"[1, 2, 3]".to_vec(), "JSON but not an object"),
+    ];
+    for (value, why) in cases {
+        let dump_path = tempdir().unwrap();
+        let dump = dump_path.path().join("forged.vyrnl");
+        std::fs::write(&dump, build_dump(&[(ada.clone(), value)])).unwrap();
+        assert_refused_and_empty(&dump, why);
+    }
+
+    // A malformed document key gets the same treatment: it can never be read
+    // back as a document, so accepting it would plant unreachable bytes.
+    let malformed = b"\0vyrn:doc:not-length-prefixed".to_vec();
+    let dump_path = tempdir().unwrap();
+    let dump = dump_path.path().join("malformed.vyrnl");
+    std::fs::write(
+        &dump,
+        build_dump(&[(malformed, b"{\"ok\": true}".to_vec())]),
+    )
+    .unwrap();
+    assert_refused_and_empty(&dump, "a malformed document key");
+
+    // And the mirror case: a hand-built dump carrying a perfectly ordinary
+    // document must still import, proving the validation tracks the document
+    // layer instead of merely rejecting everything.
+    let genuine = serde_json::to_vec(&serde_json::json!({"name": "Ada", "born": 1815})).unwrap();
+    let dump_path = tempdir().unwrap();
+    let dump = dump_path.path().join("genuine.vyrnl");
+    std::fs::write(&dump, build_dump(&[(ada.clone(), genuine)])).unwrap();
+    let target_dir = tempdir().unwrap();
+    let mut target = Engine::open(target_dir.path()).unwrap();
+    assert_eq!(portable::import(&mut target, &dump).unwrap(), 1);
+    let people = target.open_collection("people").unwrap();
+    let stored = people.get("ada").unwrap().expect("document was not planted");
+    assert_eq!(stored.value["born"], serde_json::json!(1815));
+}
+
+/// Batches flush on accumulated bytes as well as pair count. Values may legally
+/// reach 16 MiB each, so a count-only trigger of 512 pairs buffered up to eight
+/// gibibytes of importer memory at once; these twelve values cross the byte
+/// trigger mid-import, which the old rule never left the ground for.
+#[test]
+fn batches_flush_on_accumulated_bytes_not_only_on_count() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+    let mut expected = BTreeMap::new();
+    for index in 0..12u8 {
+        let key = format!("big/{index:03}").into_bytes();
+        let value = vec![index; 1024 * 1024];
+        engine.put(key.clone(), value.clone()).unwrap();
+        expected.insert(key, value);
+    }
+    round_trip(&expected, &mut engine);
+}
+
+/// An export truncates its output, so a path spelled like engine state — or
+/// anywhere under a wal directory — must be refused before `File::create`
+/// destroys something irreplaceable.
+#[test]
+fn export_refuses_to_truncate_a_file_vyrn_owns() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+    populate(&mut engine, 4, 8);
+
+    let scratch = tempdir().unwrap();
+    let manifest = scratch.path().join("CURRENT");
+    std::fs::write(&manifest, b"manifest bytes").unwrap();
+    let segment = scratch.path().join("00000000000000000001.vwal");
+    std::fs::write(&segment, b"segment bytes").unwrap();
+    let log = scratch.path().join("overflow.vlog");
+    std::fs::write(&log, b"log bytes").unwrap();
+
+    assert!(portable::export(&engine, &manifest).is_err());
+    assert!(portable::export(&engine, &segment).is_err());
+    assert!(portable::export(&engine, &log).is_err());
+    // Inside a wal/ directory counts even under an innocent name.
+    let wal_directory = scratch.path().join("wal");
+    std::fs::create_dir(&wal_directory).unwrap();
+    let hidden = wal_directory.join("dump.vyrnl");
+    assert!(portable::export(&engine, &hidden).is_err());
+
+    // Clean refusal: every victim byte-for-byte intact, nothing planted.
+    assert_eq!(std::fs::read(&manifest).unwrap(), b"manifest bytes");
+    assert_eq!(std::fs::read(&segment).unwrap(), b"segment bytes");
+    assert_eq!(std::fs::read(&log).unwrap(), b"log bytes");
+    assert!(!hidden.exists(), "the export created a file inside wal/");
 }
 
 #[test]
