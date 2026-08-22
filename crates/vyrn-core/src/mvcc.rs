@@ -29,7 +29,40 @@ pub(crate) struct Version {
 
 #[derive(Clone, Default)]
 pub(crate) struct State {
+    /// Highest revision collection has swept past. Persisted, and the anchor the
+    /// on-disk validation checks against.
     pub(crate) gc_floor: u64,
+    /// Lowest revision whose history is complete, so a snapshot read at or above
+    /// it is answerable and one below it is not.
+    ///
+    /// DISTINCT FROM `gc_floor`, and the distinction is the whole point. The
+    /// floor only ever moves when `collect` runs, and `collect` is driven by a
+    /// background task; history, meanwhile, is only recorded while a snapshot is
+    /// open (see `Engine::maintain_history`). A database that opens a
+    /// transaction, closes it, and then keeps writing therefore accumulates
+    /// revisions that no history covers while the floor still names the old
+    /// value — and every read against one of those revisions used to be answered
+    /// from whatever was left behind, silently. Three shapes came out of that:
+    ///
+    /// - vanishing keys: a key readable at a snapshot disappears from a later
+    ///   read at the same snapshot, because the write that displaced it did not
+    ///   retain the displaced version.
+    /// - present-as-past: `revision()` reports the stale history revision, the
+    ///   read decides the live tree is old enough, and a value written AFTER the
+    ///   snapshot is returned as if it had always been there.
+    /// - missed conflicts: the same stale revision makes `changed_since` answer
+    ///   "unchanged", so two transactions that overwrote each other both commit.
+    ///
+    /// This watermark is what makes those reads fail loudly instead. It is raised
+    /// by `collect` like the floor, and additionally by every commit that retains
+    /// no history at all, which is the case the floor cannot see.
+    ///
+    /// Not written to disk, and deliberately so: the format stays at version 3.
+    /// `Engine::open` drops every history it replayed and republishes coverage at
+    /// the committed LSN, so a value read back from a file could never be
+    /// anything but that — persisting it would add a format migration to store a
+    /// number that is recomputed before the first read.
+    pub(crate) covered_through: u64,
     pub(crate) histories: BTreeMap<Vec<u8>, Vec<Version>>,
 }
 
@@ -93,6 +126,14 @@ pub(crate) fn read(path: &Path, maximum_revision: u64, values: &mut ValueLog) ->
     }
     Ok(State {
         gc_floor,
+        // Nothing on disk says how far coverage reached, so the most this file
+        // can honestly claim is the floor it does carry. `Engine::open` replays
+        // the WAL into this history and then collects it away against no active
+        // snapshot, which republishes coverage at the committed LSN before the
+        // first read can happen — so this value is a placeholder in practice and
+        // a conservative one if a future caller ever reads a file without
+        // collecting.
+        covered_through: gc_floor,
         histories,
     })
 }
@@ -146,10 +187,16 @@ pub(crate) fn get_at(
     key: &[u8],
     revision: u64,
 ) -> Result<Option<Vec<u8>>> {
-    if revision < state.gc_floor {
+    // Checked against coverage, not the collection floor. The floor says what
+    // was swept; coverage says what is answerable, and a revision can be above
+    // the floor with no history behind it because history is only recorded while
+    // a snapshot is open. Answering such a read from whatever versions happen to
+    // remain is how a key readable at a snapshot silently vanished from the next
+    // read at that same snapshot.
+    if revision < state.covered_through {
         return Err(Error::SnapshotTooOld {
             requested: revision,
-            oldest: state.gc_floor,
+            oldest: state.covered_through,
         });
     }
     state
@@ -216,6 +263,12 @@ pub(crate) fn compact(
 ) -> Result<State> {
     let mut compacted = State {
         gc_floor: state.gc_floor,
+        // Compaction rewrites where the values live, not which revisions are
+        // answerable, so coverage carries over untouched. Dropping it to the
+        // default here would silently widen the answerable range after every
+        // checkpoint and re-admit exactly the reads this watermark exists to
+        // refuse.
+        covered_through: state.covered_through,
         histories: BTreeMap::new(),
     };
     for (key, versions) in &state.histories {
@@ -270,6 +323,12 @@ pub(crate) fn collect(state: &mut State, oldest_active: Option<u64>, latest: u64
         }
     });
     state.gc_floor = state.gc_floor.max(floor);
+    // Whatever was just dropped is unanswerable from here on, so coverage moves
+    // with the floor. It moves in the other direction too — a commit that
+    // retains nothing raises it without collecting anything (see
+    // `Engine::publish_coverage`) — which is why the two are separate fields
+    // rather than one.
+    state.covered_through = state.covered_through.max(floor);
     removed
 }
 

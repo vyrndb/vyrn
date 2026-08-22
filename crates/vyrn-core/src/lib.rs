@@ -703,17 +703,46 @@ impl Engine {
         self.tree.get(key)
     }
 
+    /// The revision that last wrote `key`, across the live tree and the retained
+    /// history.
+    ///
+    /// The MAXIMUM of the two, not the history's answer with the tree as a
+    /// fallback. History is only recorded while a snapshot is open — see
+    /// `maintain_history` — so a key's newest retained version is a LOWER BOUND
+    /// on its revision, never an authority: open a transaction, write the key,
+    /// close the transaction, write the key again, and the history still names
+    /// the first write while the tree has moved on. Preferring the history there
+    /// reported a revision the database had already left behind, and two callers
+    /// acted on it:
+    ///
+    /// - `get_at` compared it against the requested snapshot, concluded the live
+    ///   tree was old enough to answer, and returned a value written AFTER the
+    ///   snapshot as though it had always been there.
+    /// - `changed_since` answered "unchanged" for a key that had changed, so two
+    ///   transactions that overwrote each other both committed.
+    ///
+    /// Both tree lookups were already unconditional — `.or(x)` evaluates `x`
+    /// eagerly — so taking the maximum costs nothing that the old shape was not
+    /// already paying.
     pub fn revision(&self, key: &[u8]) -> Result<Option<u64>> {
         self.ensure_healthy()?;
         validate_key(key)?;
-        Ok(self
+        let retained = self
             .mvcc
             .histories
             .get(key)
             .and_then(|versions| versions.last())
-            .map(|version| version.revision)
-            .or(self.tree.revision(key)?)
-            .or(self.tree.revision(&tombstone_key(key))?))
+            .map(|version| version.revision);
+        // A live entry and a tombstone are mutually exclusive, so this is one
+        // answer rather than two competing ones.
+        let live = self
+            .tree
+            .revision(key)?
+            .or(self.tree.revision(&tombstone_key(key))?);
+        Ok(match (retained, live) {
+            (Some(retained), Some(live)) => Some(retained.max(live)),
+            (value, None) | (None, value) => value,
+        })
     }
 
     /// Whether any of `keys` changed after `revision`.
@@ -726,23 +755,25 @@ impl Engine {
         let mut pending: BTreeSet<Vec<u8>> = BTreeSet::new();
         for key in keys {
             validate_user_key(key)?;
-            // An in-memory history is authoritative and cheap, so a key with a
-            // recorded version never needs a tree lookup.
-            match self
+            // A retained version is a LOWER BOUND on the key's revision, not an
+            // authority — history is only recorded while a snapshot is open, so
+            // the newest retained version can name a write the tree has since
+            // moved past (see `Engine::revision`). The bound is enough to prove a
+            // change, so a history above `revision` short-circuits; it can never
+            // prove the absence of one, so anything else still costs a tree
+            // lookup. Treating the history as the whole answer here is what let
+            // two transactions that overwrote each other both pass validation and
+            // commit.
+            if self
                 .mvcc
                 .histories
                 .get(key)
                 .and_then(|versions| versions.last())
+                .is_some_and(|version| version.revision > revision)
             {
-                Some(version) => {
-                    if version.revision > revision {
-                        return Ok(true);
-                    }
-                }
-                None => {
-                    pending.insert(key.clone());
-                }
+                return Ok(true);
             }
+            pending.insert(key.clone());
         }
         if pending.is_empty() {
             return Ok(false);
@@ -799,60 +830,116 @@ impl Engine {
         revision
     }
 
+    /// Refuses a snapshot read whose history was never retained.
+    ///
+    /// The bound is the coverage watermark rather than the collection floor; see
+    /// [`mvcc::State::covered_through`] for why the two differ and what reading
+    /// below coverage used to return instead of an error. `oldest` reports the
+    /// watermark, so a caller learns the earliest revision it *could* have asked
+    /// for rather than only that its own was refused.
+    fn ensure_covered(&self, revision: u64) -> Result<()> {
+        if revision < self.mvcc.covered_through {
+            return Err(Error::SnapshotTooOld {
+                requested: revision,
+                oldest: self.mvcc.covered_through,
+            });
+        }
+        Ok(())
+    }
+
+    /// Declares every revision below `self.last_lsn` unanswerable, for a commit
+    /// that retained no history.
+    ///
+    /// Called on exactly the commits `maintain_history` does not run for — the
+    /// ones with no snapshot open. Those commits displace values without keeping
+    /// them, so afterwards the only revision the engine can answer for is the one
+    /// it just wrote. Leaving coverage where it was is what let a snapshot be
+    /// registered for a revision whose history had already been thrown away, and
+    /// the reads against it came back wrong rather than refused.
+    ///
+    /// Only ever raises the watermark. A snapshot open across this commit keeps
+    /// `oldest_snapshot` populated, so this is not reached and coverage stays
+    /// where that snapshot needs it.
+    fn publish_coverage(&mut self) {
+        self.mvcc.covered_through = self.mvcc.covered_through.max(self.last_lsn);
+    }
+
+    /// Locks the shared snapshot registry, reporting a poisoned mutex as an
+    /// error rather than panicking.
+    ///
+    /// The registry is only ever held for a `BTreeMap` refcount bump, so nothing
+    /// in here can panic and poison it on its own — but a panic anywhere else in
+    /// the process while the guard is held (a caller unwinding through a
+    /// `spawn_blocking` body, a test harness aborting a thread) poisons it all
+    /// the same, and `expect` then turned that into a second panic inside the
+    /// storage engine. The server already maps [`Error::Poisoned`] onto "reopen
+    /// the database", which is the correct answer for a registry whose contents
+    /// can no longer be trusted; panicking instead took down the write pipeline
+    /// for every client.
+    fn shared_snapshots(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<u64, usize>>> {
+        self.shared_snapshots.lock().map_err(|_| Error::Poisoned)
+    }
+
     /// Registers a snapshot at the newest committed revision without needing
     /// exclusive access.
     ///
     /// Beginning a transaction only reads the current sequence and bumps a
     /// refcount, so forcing it through the engine's write lock would make every
     /// transaction contend with the writer before it has done any work.
-    pub fn register_snapshot_shared(&self) -> u64 {
+    /// Fails with [`Error::Poisoned`] rather than panicking when the registry's
+    /// mutex is poisoned — see [`Engine::shared_snapshots`].
+    pub fn register_snapshot_shared(&self) -> Result<u64> {
         let revision = self.last_lsn;
-        *self
-            .shared_snapshots
-            .lock()
-            .expect("snapshot registry is never poisoned")
-            .entry(revision)
-            .or_default() += 1;
-        revision
+        *self.shared_snapshots()?.entry(revision).or_default() += 1;
+        Ok(revision)
     }
 
     /// Releases a snapshot taken by [`Engine::register_snapshot_shared`].
-    pub fn release_snapshot_shared(&self, revision: u64) {
-        let mut snapshots = self
-            .shared_snapshots
-            .lock()
-            .expect("snapshot registry is never poisoned");
+    ///
+    /// Fails with [`Error::Poisoned`] rather than panicking when the registry's
+    /// mutex is poisoned. A caller that cannot release its pin should say so:
+    /// the revision stays retained, which is the state an operator needs to see.
+    pub fn release_snapshot_shared(&self, revision: u64) -> Result<()> {
+        let mut snapshots = self.shared_snapshots()?;
         if let Some(count) = snapshots.get_mut(&revision) {
             *count -= 1;
             if *count == 0 {
                 snapshots.remove(&revision);
             }
         }
+        Ok(())
     }
 
     /// The oldest revision any active reader still needs, across both registries.
-    fn oldest_active_snapshot(&self) -> Option<u64> {
-        let shared = self
-            .shared_snapshots
-            .lock()
-            .expect("snapshot registry is never poisoned")
-            .keys()
-            .next()
-            .copied();
-        match (
-            self.active_snapshots.first_key_value().map(|(key, _)| *key),
-            shared,
-        ) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (value, None) | (None, value) => value,
-        }
+    fn oldest_active_snapshot(&self) -> Result<Option<u64>> {
+        let shared = self.shared_snapshots()?.keys().next().copied();
+        Ok(
+            match (
+                self.active_snapshots.first_key_value().map(|(key, _)| *key),
+                shared,
+            ) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (value, None) | (None, value) => value,
+            },
+        )
     }
 
+    /// Pins an explicit revision, refusing one whose history was never retained.
+    ///
+    /// The floor check here was the other half of the coverage bug: a revision
+    /// above `gc_floor` was accepted as pinnable even when no history covered it,
+    /// so a caller could register a snapshot, be told it succeeded, and then read
+    /// values that were never the state at that revision. Registering is where
+    /// that has to be refused — after this returns Ok the caller is entitled to
+    /// believe its reads mean something.
     pub fn register_snapshot_at(&mut self, revision: u64) -> Result<()> {
-        if revision < self.mvcc.gc_floor || revision > self.last_lsn {
+        self.ensure_covered(revision)?;
+        if revision > self.last_lsn {
             return Err(Error::SnapshotTooOld {
                 requested: revision,
-                oldest: self.mvcc.gc_floor,
+                oldest: self.mvcc.covered_through,
             });
         }
         *self.active_snapshots.entry(revision).or_default() += 1;
@@ -871,12 +958,7 @@ impl Engine {
     pub fn get_at(&self, key: &[u8], revision: u64) -> Result<Option<Vec<u8>>> {
         self.ensure_healthy()?;
         validate_user_key(key)?;
-        if revision < self.mvcc.gc_floor {
-            return Err(Error::SnapshotTooOld {
-                requested: revision,
-                oldest: self.mvcc.gc_floor,
-            });
-        }
+        self.ensure_covered(revision)?;
         if self
             .revision(key)?
             .is_none_or(|current| current <= revision)
@@ -904,11 +986,15 @@ impl Engine {
         if start.zip(end).is_some_and(|(start, end)| start > end) {
             return Err(Error::InvalidRange);
         }
-        if revision < self.mvcc.gc_floor {
-            return Err(Error::SnapshotTooOld {
-                requested: revision,
-                oldest: self.mvcc.gc_floor,
-            });
+        self.ensure_covered(revision)?;
+        // A zero limit is a request for nothing, and the loop below cannot serve
+        // it: it only stops on `rows.len() == limit`, which a length that starts
+        // at zero has already passed, so every candidate key in range was read at
+        // `revision` and returned. The tree's own scan already treats zero this
+        // way (`scan_with_revisions_excluding_prefix` skips the descent), so this
+        // is the history-overlay half of the same rule.
+        if limit == 0 {
+            return Ok(Vec::new());
         }
         let candidate_limit = limit.saturating_add(self.mvcc.histories.len());
         let mut keys: BTreeMap<Vec<u8>, ()> = self
@@ -999,11 +1085,14 @@ impl Engine {
             }))
     }
 
-    pub fn collect_versions(&mut self) -> usize {
+    /// Fails with [`Error::Poisoned`] rather than panicking when the shared
+    /// snapshot registry's mutex is poisoned; collecting without consulting it
+    /// would drop versions a live transaction still needs.
+    pub fn collect_versions(&mut self) -> Result<usize> {
         // Must consider both registries; collecting past a shared snapshot would
         // drop versions a live transaction still needs to read.
-        let oldest = self.oldest_active_snapshot();
-        mvcc::collect(&mut self.mvcc, oldest, self.last_lsn)
+        let oldest = self.oldest_active_snapshot()?;
+        Ok(mvcc::collect(&mut self.mvcc, oldest, self.last_lsn))
     }
 
     pub fn retained_versions(&self) -> usize {
@@ -1070,6 +1159,9 @@ impl Engine {
         operations: Vec<BatchOperation>,
         updates: Vec<IndexUpdate>,
     ) -> Result<Vec<BatchResult>> {
+        // The user-key and reserved-prefix checks below reject without reaching
+        // `write_indexed_batch`, so the buffer is emptied here too.
+        self.reset_published();
         for operation in &operations {
             validate_user_operation(operation)?;
         }
@@ -1099,6 +1191,9 @@ impl Engine {
         updates: Vec<IndexUpdate>,
         barrier: Barrier,
     ) -> Result<(Vec<BatchResult>, Option<u64>)> {
+        // Before the index validation below, which can reject the batch — with a
+        // unique violation most often — without ever reaching `apply_batch`.
+        self.reset_published();
         for update in &updates {
             validate_key(&update.primary_key)?;
             validate_index_value(update.old_value.as_deref())?;
@@ -1109,6 +1204,32 @@ impl Engine {
         }
         let mut index_operations = Vec::new();
         let mut unique_claims: BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>> = BTreeMap::new();
+        // Every unique-index entry this batch DELETES, collected before any claim
+        // is judged.
+        //
+        // The uniqueness check below asks the live tree who holds the value, and
+        // the live tree does not know what this batch is about to remove. So
+        // moving a value from one key to another — and swapping two keys' values,
+        // which is the same thing twice — was rejected as a duplicate against the
+        // very entry the batch deletes: the batch was refused for conflicting with
+        // itself, and there was no legal way to express either operation in one
+        // atomic batch. Keyed by (index, value, primary key) rather than
+        // (index, value), because one key releasing a value must not excuse a
+        // duplicate that some THIRD key still holds — that is a genuine violation
+        // and stays one.
+        let mut released: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+        for update in &updates {
+            if update.old_value == update.new_value {
+                continue;
+            }
+            if let Some(old) = &update.old_value {
+                released.insert((
+                    update.index.clone(),
+                    old.clone(),
+                    update.primary_key.clone(),
+                ));
+            }
+        }
         for update in &updates {
             if update.old_value == update.new_value {
                 continue;
@@ -1132,11 +1253,22 @@ impl Engine {
                             value: new.clone(),
                         });
                     }
-                    let existing = self.lookup_index(&update.index, new, 2)?;
-                    if existing
-                        .iter()
-                        .any(|primary| primary.as_slice() != update.primary_key)
-                    {
+                    // Read past the limit of 2 the check used to use: with
+                    // releases discounted, the holders that matter are the ones
+                    // this batch does NOT remove, and a bounded read cannot tell
+                    // whether the entries it happened to return are those. Two
+                    // keys swapping values would return exactly the two entries
+                    // being deleted and conclude, wrongly, that nothing else
+                    // holds the value.
+                    let existing = self.lookup_index(&update.index, new, usize::MAX)?;
+                    if existing.iter().any(|primary| {
+                        primary.as_slice() != update.primary_key
+                            && !released.contains(&(
+                                update.index.clone(),
+                                new.clone(),
+                                primary.clone(),
+                            ))
+                    }) {
                         return Err(Error::UniqueViolation {
                             index: update.index.clone(),
                             value: new.clone(),
@@ -1181,9 +1313,16 @@ impl Engine {
         self.ensure_healthy()?;
         validate_index_name(name)?;
         validate_index_value(Some(value))?;
+        self.ensure_covered(revision)?;
         let definition = index_definition_key(name);
         if self.value_at_internal(&definition, revision)?.is_none() {
             return Err(Error::IndexNotFound);
+        }
+        // Same rule as `scan_at`: the loop below only stops on
+        // `keys.len() == limit`, so a zero limit would walk every entry under the
+        // prefix and return all of them.
+        if limit == 0 {
+            return Ok(Vec::new());
         }
         let prefix = index_value_prefix(name, value);
         let end = prefix_end(&prefix);
@@ -1242,6 +1381,8 @@ impl Engine {
     }
 
     pub fn write_batch(&mut self, operations: Vec<BatchOperation>) -> Result<Vec<BatchResult>> {
+        // The reserved-prefix check below rejects without reaching `apply_batch`.
+        self.reset_published();
         for operation in &operations {
             validate_user_operation(operation)?;
         }
@@ -1262,6 +1403,8 @@ impl Engine {
         &mut self,
         operations: Vec<BatchOperation>,
     ) -> Result<(Vec<BatchResult>, Option<u64>)> {
+        // The reserved-prefix check below rejects without reaching `apply_batch`.
+        self.reset_published();
         for operation in &operations {
             validate_user_operation(operation)?;
         }
@@ -1274,6 +1417,9 @@ impl Engine {
         operations: Vec<BatchOperation>,
         updates: Vec<IndexUpdate>,
     ) -> Result<(Vec<BatchResult>, Option<u64>)> {
+        // The reserved-prefix check below rejects without reaching
+        // `write_indexed_batch`.
+        self.reset_published();
         for operation in &operations {
             validate_user_operation(operation)?;
         }
@@ -1295,6 +1441,9 @@ impl Engine {
         operations: Vec<BatchOperation>,
         barrier: Barrier,
     ) -> Result<(Vec<BatchResult>, Option<u64>)> {
+        // Cleared before anything can fail or return early — see
+        // `Engine::reset_published` for the leak this closes.
+        self.reset_published();
         self.ensure_healthy()?;
         if operations.is_empty() {
             return Ok((Vec::new(), None));
@@ -1319,7 +1468,7 @@ impl Engine {
         let original_user_len = self.user_len;
         // Includes shared snapshots, so a transaction that began without the
         // write lock still forces its prior versions to be retained.
-        let oldest_snapshot = self.oldest_active_snapshot();
+        let oldest_snapshot = self.oldest_active_snapshot()?;
         // Each key's pre-batch state, read once. This doubles as the presence
         // check below: reading the value and revision in a single descent avoids
         // paying three separate root-to-leaf lookups per key, which is what made
@@ -1544,20 +1693,26 @@ impl Engine {
         // write IS durable, and returning "retry" would invite a double apply.
         // Poisoning matches the WAL-stage convention, with an error that says
         // the data survived.
-        if let Some(oldest_snapshot) = oldest_snapshot {
-            if let Err(error) =
-                self.maintain_history(previous, prepared, oldest_snapshot)
-            {
-                self.poisoned = true;
-                eprintln!(
-                    "vyrn: commit {} is durable but history maintenance failed ({error}); \
-                     the engine refuses further work until it is reopened",
-                    self.last_lsn
-                );
-                return Err(Error::CommittedThenPoisoned {
-                    lsn: self.last_lsn,
-                });
+        match oldest_snapshot {
+            Some(oldest_snapshot) => {
+                if let Err(error) = self.maintain_history(previous, prepared, oldest_snapshot) {
+                    self.poisoned = true;
+                    eprintln!(
+                        "vyrn: commit {} is durable but history maintenance failed ({error}); \
+                         the engine refuses further work until it is reopened",
+                        self.last_lsn
+                    );
+                    return Err(Error::CommittedThenPoisoned {
+                        lsn: self.last_lsn,
+                    });
+                }
             }
+            // No snapshot was open, so this commit displaced its keys' previous
+            // values without keeping any of them. Say so, or the engine goes on
+            // claiming it can answer for revisions whose history it just threw
+            // away — and the reads that follow come back wrong rather than
+            // refused. Infallible, so it needs none of the poisoning above.
+            None => self.publish_coverage(),
         }
         // Hide results for the change records appended by with_change_log.
         results.truncate(requested);
@@ -1572,6 +1727,30 @@ impl Engine {
     /// they describe mutations that did not happen, and `last_published` is
     /// exactly what subscribers are told to broadcast.
     fn abandon_staged_changes(&mut self) {
+        self.reset_published();
+    }
+
+    /// Empties the published-records buffer so it can only ever describe the
+    /// call that is running now.
+    ///
+    /// `last_published` is ONE buffer on the engine, and the server reads it
+    /// after every write to decide what to broadcast. Nothing used to clear it on
+    /// the way IN — only `with_change_log` overwrote it, and only once a batch had
+    /// got as far as producing published entries. Every path that returned before
+    /// then left the previous batch's records sitting in it:
+    ///
+    /// - an empty batch, which returns early and never reaches `with_change_log`;
+    /// - a batch rejected by key or value validation;
+    /// - a `write_indexed` batch rejected for an unknown index or a unique
+    ///   violation, which happens before `apply_batch` is even called.
+    ///
+    /// In each case the caller's next read of `last_published()` returned records
+    /// belonging to a DIFFERENT batch, so subscribers were told about mutations a
+    /// second time — and for the rejected batches, told them under the impression
+    /// that the request they had just refused was what produced them. Clearing on
+    /// entry makes the buffer's contents unambiguous: whatever is in it was put
+    /// there by the call in progress, or the call published nothing.
+    fn reset_published(&mut self) {
         self.last_published = Vec::new();
     }
 
@@ -1759,7 +1938,17 @@ impl Engine {
         // would make every commit cost O(total changes).
         let end = prefix_end(CHANGE_LOG_PREFIX);
         let Some(key) = self.tree.last_key_in(CHANGE_LOG_PREFIX, end.as_deref())? else {
-            return Ok(change_log::Cursor::start());
+            // An empty log is not necessarily a log that never had records: a
+            // trim that consumed every retained commit leaves the prefix empty
+            // AND a retention floor above `Cursor::start()`. Returning the
+            // unclamped start there handed the caller a position below the
+            // retained range, and `read_changes` refuses exactly that with
+            // `CursorTooOld` — so "where should I resume from?" answered with a
+            // cursor that the very next call rejects as too old, on a database
+            // whose only fault was that its change log had been trimmed. The
+            // retained floor is the honest answer: nothing before it exists to
+            // deliver, and it is the oldest position a subscriber may hold.
+            return self.change_log_start();
         };
         let sequence = change_log_sequence(&key)?;
         // Point just past the last mutation of that commit.
@@ -2926,6 +3115,19 @@ fn validate_payload(
     Ok(())
 }
 
+/// Records a replayed record's mutations as historical versions.
+///
+/// Filtered by [`is_versioned_key`], which is the SAME filter the live commit
+/// path applies when it stages historical values (see the `prepared` loop in
+/// `apply_batch`). Replay used to record every key in the record, change-log
+/// entries included, so the two paths disagreed about which keys have a history
+/// at all — and a filter that exists in one direction only is a filter that will
+/// eventually be wrong in the other. The concrete cost today is measurable rather
+/// than visible: every replayed change-log value is copied into the revision
+/// value log, where nothing will ever read it, so a database's revision value log
+/// grew by the whole replayed change stream on every recovery and only a
+/// checkpoint compaction took it back. Point-in-time restore replays by design,
+/// which makes that the normal path rather than the disaster path.
 fn record_versions(
     payload: &[u8],
     operation_count: usize,
@@ -2933,9 +3135,11 @@ fn record_versions(
     state: &mut mvcc::State,
     values: &mut value_log::ValueLog,
 ) -> Result<()> {
-    for (op, key, value) in decode_operations(payload, operation_count) {
+    for (_, key, value) in decode_operations(payload, operation_count)
+        .into_iter()
+        .filter(|(_, key, _)| is_versioned_key(key))
+    {
         mvcc::append(state, values, key, revision, value)?;
-        let _ = op;
     }
     Ok(())
 }
@@ -3079,11 +3283,45 @@ fn validate_user_operation(operation: &BatchOperation) -> Result<()> {
     }
 }
 
+/// The one region of the reserved keyspace an index name may occupy.
+///
+/// Document collections name their indexes `\0vyrn:doc-index:<collection><field>`
+/// (`document::INDEX_PREFIX`), so the internal prefix cannot simply be refused
+/// outright — the document layer routes its own index names through the same
+/// `create_index` entry point a user calls. Duplicated here rather than shared
+/// because making the document constant reachable means editing that module; the
+/// two are pinned together by
+/// `a_document_collection_index_name_survives_validation`, which builds a real
+/// collection and fails the moment the spellings drift apart.
+const DOCUMENT_INDEX_PREFIX: &[u8] = b"\0vyrn:doc-index:";
+
+/// Checks that an index name is usable and stays inside the keyspace it is
+/// allowed to address.
+///
+/// An index name is not just a label: it is spliced into the internal keys that
+/// address the index's definition and entries (see [`index_definition_key`] and
+/// [`index_entry_prefix`]), and it is the only caller-supplied part of them. It
+/// cannot escape those keys — the name is appended after its own length prefix,
+/// so no spelling of it reaches a neighbouring key — but it CAN collide inside
+/// them, and one collision is reachable from the public API.
+///
+/// `document::stored_indexes` decides which fields a collection has by scanning
+/// the index map for names under `\0vyrn:doc-index:<collection>`. An index created
+/// through plain [`Engine::create_index`] with a name in that space is
+/// indistinguishable from one the document layer created, so it becomes a phantom
+/// field of a collection nobody indexed: opening the collection either fails with
+/// a corruption-shaped `InvalidDocument` (the trailing bytes are parsed as a
+/// length-prefixed field name) or succeeds and reports a field no document has
+/// ever written. Refusing the whole reserved prefix except the document layer's
+/// own space closes that, and needs no argument about which particular spellings
+/// collide under today's encoding.
 fn validate_index_name(name: &[u8]) -> Result<()> {
     if name.is_empty() {
         Err(Error::EmptyKey)
     } else if name.len() > u16::MAX as usize {
         Err(Error::KeyTooLarge)
+    } else if name.starts_with(INTERNAL_PREFIX) && !name.starts_with(DOCUMENT_INDEX_PREFIX) {
+        Err(Error::ReservedKey)
     } else {
         Ok(())
     }
@@ -3561,13 +3799,13 @@ mod tests {
             engine.get_at(b"key", snapshot).unwrap(),
             Some(b"one".to_vec())
         );
-        assert_eq!(engine.collect_versions(), 0);
+        assert_eq!(engine.collect_versions().unwrap(), 0);
         assert_eq!(
             engine.get_at(b"key", snapshot).unwrap(),
             Some(b"one".to_vec())
         );
         engine.release_snapshot(snapshot);
-        assert_eq!(engine.collect_versions(), 3);
+        assert_eq!(engine.collect_versions().unwrap(), 3);
         assert_eq!(engine.retained_versions(), 0);
         assert!(matches!(
             engine.get_at(b"key", snapshot),
@@ -3658,6 +3896,400 @@ mod tests {
         assert_eq!(fs::metadata(&wal).unwrap().len(), SEGMENT_HEADER_LEN as u64);
         engine.sync().unwrap();
         assert!(fs::metadata(&wal).unwrap().len() > SEGMENT_HEADER_LEN as u64);
+    }
+
+    /// Moving a unique-index value between keys, and swapping two keys' values,
+    /// must both be legal in one batch — while a genuine duplicate stays refused.
+    ///
+    /// The uniqueness check asks the LIVE tree who holds the value, and the live
+    /// tree does not know what the batch is about to delete. So a move was
+    /// rejected as a duplicate of the very entry the same batch removes: the
+    /// batch conflicted with itself, and neither operation could be expressed
+    /// atomically at all. A swap is the same fault twice, and worse for the old
+    /// bounded `lookup_index(.., 2)` — the two entries it returned were exactly
+    /// the two being deleted, so no limit could have told it otherwise.
+    #[test]
+    fn a_unique_index_value_can_move_or_swap_within_one_batch() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.create_index(b"email".to_vec(), true).unwrap();
+        let claim = |primary: &[u8], old: Option<&[u8]>, new: Option<&[u8]>| IndexUpdate {
+            index: b"email".to_vec(),
+            primary_key: primary.to_vec(),
+            old_value: old.map(<[u8]>::to_vec),
+            new_value: new.map(<[u8]>::to_vec),
+        };
+        engine
+            .write_indexed(
+                vec![
+                    BatchOperation::Put(b"user/1".to_vec(), b"one".to_vec()),
+                    BatchOperation::Put(b"user/2".to_vec(), b"two".to_vec()),
+                ],
+                vec![
+                    claim(b"user/1", None, Some(b"a@example.com")),
+                    claim(b"user/2", None, Some(b"b@example.com")),
+                ],
+            )
+            .unwrap();
+
+        // A move: user/1 releases the value in the same batch user/3 claims it.
+        engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/3".to_vec(), b"three".to_vec())],
+                vec![
+                    claim(b"user/1", Some(b"a@example.com"), None),
+                    claim(b"user/3", None, Some(b"a@example.com")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.lookup_index(b"email", b"a@example.com", 10).unwrap(),
+            vec![b"user/3".to_vec()]
+        );
+
+        // A swap: each key claims the value the other releases, so both claims
+        // collide with an entry the batch itself deletes.
+        engine
+            .write_indexed(
+                Vec::new(),
+                vec![
+                    claim(b"user/2", Some(b"b@example.com"), Some(b"a@example.com")),
+                    claim(b"user/3", Some(b"a@example.com"), Some(b"b@example.com")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.lookup_index(b"email", b"a@example.com", 10).unwrap(),
+            vec![b"user/2".to_vec()]
+        );
+        assert_eq!(
+            engine.lookup_index(b"email", b"b@example.com", 10).unwrap(),
+            vec![b"user/3".to_vec()]
+        );
+
+        // A third key claiming a value that nothing releases is still a genuine
+        // duplicate. Discounting releases must not become discounting holders.
+        let error = engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/4".to_vec(), b"four".to_vec())],
+                vec![claim(b"user/4", None, Some(b"a@example.com"))],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::UniqueViolation { .. }));
+        assert_eq!(engine.get(b"user/4").unwrap(), None);
+
+        // And a release by ONE key does not excuse a duplicate between two
+        // others: user/2 stepping aside leaves the value free for exactly one
+        // claimant, not both.
+        let error = engine
+            .write_indexed(
+                Vec::new(),
+                vec![
+                    claim(b"user/2", Some(b"a@example.com"), None),
+                    claim(b"user/5", None, Some(b"a@example.com")),
+                    claim(b"user/6", None, Some(b"a@example.com")),
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::UniqueViolation { .. }));
+    }
+
+    /// `last_published` is one buffer on the engine, read by the server after
+    /// every write. A batch that fails before publishing anything must not leave
+    /// the PREVIOUS batch's records in it.
+    ///
+    /// Nothing used to clear the buffer on the way in — only `with_change_log`
+    /// overwrote it, and only once a batch got as far as producing entries. Every
+    /// earlier return therefore left the last batch's records readable, so the
+    /// server broadcast them a second time, under a request it had just rejected.
+    #[test]
+    fn last_published_never_leaks_one_batch_into_another() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.create_index(b"email".to_vec(), true).unwrap();
+        engine.put(b"published".to_vec(), b"value".to_vec()).unwrap();
+        assert_eq!(engine.last_published().len(), 1);
+
+        // An empty batch returns before `with_change_log` runs.
+        engine.write_batch(Vec::new()).unwrap();
+        assert!(
+            engine.last_published().is_empty(),
+            "an empty batch published nothing, so the buffer must say so"
+        );
+
+        // A batch rejected for a reserved key never reaches `apply_batch`.
+        engine.put(b"published".to_vec(), b"again".to_vec()).unwrap();
+        assert_eq!(engine.last_published().len(), 1);
+        let error = engine
+            .write_batch(vec![BatchOperation::Put(
+                b"\0vyrn:forbidden".to_vec(),
+                b"x".to_vec(),
+            )])
+            .unwrap_err();
+        assert!(matches!(error, Error::ReservedKey));
+        assert!(
+            engine.last_published().is_empty(),
+            "a rejected batch must not answer with the previous batch's records"
+        );
+
+        // A unique violation is rejected inside `write_indexed_batch`, before
+        // `apply_batch` — the most common way a real client trips this.
+        engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/1".to_vec(), b"one".to_vec())],
+                vec![IndexUpdate {
+                    index: b"email".to_vec(),
+                    primary_key: b"user/1".to_vec(),
+                    old_value: None,
+                    new_value: Some(b"a@example.com".to_vec()),
+                }],
+            )
+            .unwrap();
+        assert_eq!(engine.last_published().len(), 1);
+        let error = engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/2".to_vec(), b"two".to_vec())],
+                vec![IndexUpdate {
+                    index: b"email".to_vec(),
+                    primary_key: b"user/2".to_vec(),
+                    old_value: None,
+                    new_value: Some(b"a@example.com".to_vec()),
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::UniqueViolation { .. }));
+        assert!(
+            engine.last_published().is_empty(),
+            "a batch refused for a unique violation published nothing"
+        );
+
+        // A batch whose only operation is a no-op delete publishes nothing
+        // either, and that too must clear what came before.
+        engine.put(b"published".to_vec(), b"third".to_vec()).unwrap();
+        assert_eq!(engine.last_published().len(), 1);
+        engine.delete(b"never-existed").unwrap();
+        assert!(engine.last_published().is_empty());
+    }
+
+    /// A zero limit means "no rows", on every scan entry point.
+    ///
+    /// The snapshot scans stop only on `rows.len() == limit`, which a length that
+    /// starts at zero has already passed — so a zero limit read every candidate
+    /// key in range at `revision` and returned all of them, which is the opposite
+    /// of what was asked for and unbounded work besides.
+    #[test]
+    fn a_zero_limit_scan_returns_nothing() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.create_index(b"tag".to_vec(), false).unwrap();
+        for key in [b"a", b"b", b"c"] {
+            engine.put(key.to_vec(), b"value".to_vec()).unwrap();
+        }
+        engine
+            .write_indexed(
+                vec![BatchOperation::Put(b"user/1".to_vec(), b"one".to_vec())],
+                vec![IndexUpdate {
+                    index: b"tag".to_vec(),
+                    primary_key: b"user/1".to_vec(),
+                    old_value: None,
+                    new_value: Some(b"admin".to_vec()),
+                }],
+            )
+            .unwrap();
+        let snapshot = engine.register_snapshot();
+        // A write under the pin, so history exists for the scans to overlay.
+        engine.put(b"b".to_vec(), b"second".to_vec()).unwrap();
+
+        assert!(engine.scan(None, None, 0).unwrap().is_empty());
+        assert!(engine.scan_at(None, None, 0, snapshot).unwrap().is_empty());
+        assert!(engine.lookup_index(b"tag", b"admin", 0).unwrap().is_empty());
+        assert!(engine
+            .lookup_index_at(b"tag", b"admin", 0, snapshot)
+            .unwrap()
+            .is_empty());
+        assert!(engine
+            .read_changes(change_log::Cursor::start(), 0)
+            .unwrap()
+            .is_empty());
+        // A non-zero limit still works, so the guard is a floor and not a wall.
+        assert_eq!(engine.scan_at(None, None, 2, snapshot).unwrap().len(), 2);
+        engine.release_snapshot(snapshot);
+    }
+
+    /// The cursor a caller is told to resume from must never sit below the
+    /// retained range.
+    ///
+    /// A trim that consumes every retained commit leaves the change-log prefix
+    /// empty AND a retention floor above `Cursor::start()`. Answering the empty
+    /// case with the unclamped start handed back a position `read_changes`
+    /// immediately refuses as `CursorTooOld` — so "where do I resume?" was
+    /// answered with a cursor that the next call rejects, on a database whose only
+    /// fault was a trimmed log.
+    #[test]
+    fn the_published_cursor_never_falls_below_the_retained_range() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"a".to_vec(), b"one".to_vec()).unwrap();
+        engine.put(b"b".to_vec(), b"two".to_vec()).unwrap();
+
+        // Trim past everything the log holds, leaving the prefix empty and the
+        // retention floor well above the start.
+        let latest = engine.latest_published_cursor().unwrap();
+        assert!(engine.trim_changes(latest).unwrap() > 0);
+        assert_eq!(engine.change_log_len().unwrap(), 0);
+        let retained = engine.change_log_start().unwrap();
+        assert_ne!(retained, change_log::Cursor::start());
+
+        let resume = engine.latest_published_cursor().unwrap();
+        assert!(
+            resume >= retained,
+            "the resume cursor {resume:?} is below the retained floor {retained:?}"
+        );
+        // The point of the clamp: the cursor it returns is actually usable.
+        engine.read_changes(resume, 10).unwrap();
+    }
+
+    /// An index name must not reach into Vyrn's internal keyspace.
+    ///
+    /// The name is the only caller-supplied part of an index's definition and
+    /// entry keys. It cannot escape them, but it CAN collide inside them: a name
+    /// under `\0vyrn:doc-index:<collection>` is indistinguishable from one the
+    /// document layer created, so it becomes a phantom field of a collection
+    /// nobody indexed.
+    #[test]
+    fn an_index_name_cannot_reach_into_the_internal_keyspace() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        for name in [
+            INTERNAL_PREFIX.to_vec(),
+            b"\0vyrn:index:def:".to_vec(),
+            b"\0vyrn:tombstone:x".to_vec(),
+            b"\0vyrn:changelog:x".to_vec(),
+        ] {
+            assert!(
+                matches!(engine.create_index(name.clone(), false), Err(Error::ReservedKey)),
+                "index name {name:?} reached the reserved keyspace"
+            );
+            assert!(matches!(
+                engine.lookup_index_at(&name, b"v", 10, engine.sequence()),
+                Err(Error::ReservedKey)
+            ));
+        }
+        // An ordinary name is unaffected.
+        engine.create_index(b"email".to_vec(), false).unwrap();
+    }
+
+    /// The document layer's own index names must keep working.
+    ///
+    /// They live under `\0vyrn:doc-index:`, inside the reserved prefix, and reach
+    /// `create_index` through the same entry point a user calls — so the namespace
+    /// check has to exempt exactly that space. This pins the two spellings
+    /// together: `DOCUMENT_INDEX_PREFIX` is duplicated from `document::INDEX_PREFIX`,
+    /// and this test fails the moment they drift apart.
+    #[test]
+    fn a_document_collection_index_name_survives_validation() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine
+            .collection("users", &[document::IndexDefinition::new("email", true)])
+            .unwrap();
+        assert_eq!(
+            engine.collection_indexes("users").unwrap(),
+            vec![("email".to_owned(), true)]
+        );
+    }
+
+    /// WAL replay must record history for exactly the keys the live commit path
+    /// records it for.
+    ///
+    /// The live path filters through [`is_versioned_key`] when it stages
+    /// historical values; replay recorded every key in the record, change-log
+    /// entries included. A filter that exists in one direction only is a filter
+    /// that will eventually be wrong in the other, and the cost is already
+    /// measurable: every replayed change-log value is copied into the revision
+    /// value log where nothing will ever read it, so the log grew by the whole
+    /// replayed change stream on each recovery. Point-in-time restore replays by
+    /// design, so that is the normal path.
+    ///
+    /// Asserted as a bound against the data the writes actually contain rather
+    /// than an exact byte count, so the test states the property (change-log
+    /// values are not retained) instead of pinning today's framing overhead.
+    #[test]
+    fn replay_records_history_for_the_same_keys_the_live_path_does() {
+        let directory = tempdir().unwrap();
+        const VALUE_LEN: usize = 500;
+        const WRITES: usize = 20;
+        {
+            let mut engine = Engine::open(directory.path()).unwrap();
+            for index in 0..WRITES {
+                engine
+                    .put(
+                        format!("k{index}").into_bytes(),
+                        vec![b'x'; VALUE_LEN],
+                    )
+                    .unwrap();
+            }
+        }
+        // A reopen replays every record above the (absent) checkpoint.
+        let engine = Engine::open(directory.path()).unwrap();
+        assert_eq!(engine.len(), WRITES);
+        let log = fs::metadata(directory.path().join(revision_value_file_name(0)))
+            .unwrap()
+            .len();
+        // Each user value is retained once. A change-log record wraps a copy of
+        // the same value, so recording those too roughly doubles the log — the
+        // bound sits between the two, generously above the framing overhead of
+        // the honest half and well below the other.
+        let user_bytes = (WRITES * VALUE_LEN) as u64;
+        assert!(
+            log < user_bytes + user_bytes / 2,
+            "the revision value log holds {log} bytes for {user_bytes} bytes of \
+             user values, so replay retained the change-log values the live \
+             commit path filters out"
+        );
+    }
+
+    /// A poisoned snapshot registry is reported, not panicked on.
+    ///
+    /// The registry is only ever held for a refcount bump, so nothing inside it
+    /// can panic on its own — but a panic anywhere else in the process while the
+    /// guard is held poisons the mutex all the same, and `expect` then turned that
+    /// into a second panic inside the storage engine. In the server that meant the
+    /// write pipeline going down for every client, where [`Error::Poisoned`]
+    /// already means the honest thing: reopen the database.
+    #[test]
+    fn a_poisoned_snapshot_registry_is_an_error_not_a_panic() {
+        let directory = tempdir().unwrap();
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"key".to_vec(), b"value".to_vec()).unwrap();
+
+        // Poison the mutex the way a real one gets poisoned: panic while its
+        // guard is held. The engine reference is passed as a pointer because a
+        // panicking closure must not borrow it across the unwind.
+        let registry: &std::sync::Mutex<BTreeMap<u64, usize>> = &engine.shared_snapshots;
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.lock().unwrap();
+            panic!("poisoning the registry");
+        }));
+        assert!(poisoned.is_err());
+        assert!(engine.shared_snapshots.is_poisoned());
+
+        // Every path through the registry now reports it instead of panicking.
+        assert!(matches!(
+            engine.register_snapshot_shared(),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(
+            engine.release_snapshot_shared(1),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(engine.collect_versions(), Err(Error::Poisoned)));
+        // Including the commit path, which consults the registry to decide what
+        // history to retain — and must not guess when it cannot read it.
+        assert!(matches!(
+            engine.put(b"key".to_vec(), b"again".to_vec()),
+            Err(Error::Poisoned)
+        ));
     }
 
     #[test]
