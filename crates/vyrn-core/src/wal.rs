@@ -66,6 +66,15 @@ struct Writer {
     /// Ceiling on how far a single extension reaches, so a segment smaller than
     /// the runway is not zero-filled far past its own size.
     runway: u64,
+    /// Zero bytes this writer has laid down, counted for the test that a large
+    /// record is not pre-filled.
+    ///
+    /// The waste that test guards against is bytes WRITTEN, not bytes left
+    /// behind: a fill sized to the record covers exactly the span the record then
+    /// overwrites, so the finished file is byte-for-byte identical either way and
+    /// its length cannot tell the two apart. This counter can.
+    #[cfg(test)]
+    zero_filled: u64,
 }
 
 impl Writer {
@@ -74,16 +83,37 @@ impl Writer {
     /// Synced here rather than left for the next record's barrier so that every
     /// record pays the same cheap flush and the expensive one is isolated to the
     /// extension that caused it.
+    ///
+    /// A record that does not fit inside one runway step is left to initialise its
+    /// own blocks. The fill used to be widened to `max(runway, wanted)`, which
+    /// meant a record larger than the runway had its whole span written twice:
+    /// once as zeros, with an `fdatasync` behind them, and once as the record that
+    /// overwrote every one of those zeros microseconds later. At 128 B that is
+    /// invisible; at 1 MiB it is the dominant cost of the commit, and it is why a
+    /// four-value 1 MiB workload left an 8 MiB WAL segment behind for 4 MiB of
+    /// data. The runway's whole purpose is to amortise one expensive
+    /// extent-extending barrier over many small records, and a record of a
+    /// megabyte amortises that barrier over its own payload perfectly well by
+    /// itself — there is nothing left for the pre-fill to buy.
     fn reserve(&mut self, wanted: u64) -> Result<()> {
         let required = self.offset.saturating_add(wanted);
         if required <= self.zeroed {
             return Ok(());
         }
-        let step = self.runway.max(wanted);
-        let target = self.zeroed.saturating_add(step).max(required);
+        let target = self.zeroed.saturating_add(self.runway);
+        if required > target {
+            // The record's own write extends and initialises the file here.
+            // `append` records how far that reached, so the bytes it covered are
+            // not zero-filled again afterwards.
+            return Ok(());
+        }
         let zeros = vec![0; (target - self.zeroed) as usize];
         write_all_at(&self.file, &zeros, self.zeroed)?;
         self.file.sync_data()?;
+        #[cfg(test)]
+        {
+            self.zero_filled += zeros.len() as u64;
+        }
         self.zeroed = target;
         Ok(())
     }
@@ -104,6 +134,8 @@ impl Wal {
                 // record re-establishes the runway from here.
                 zeroed: offset,
                 runway: runway.clamp(1, RUNWAY),
+                #[cfg(test)]
+                zero_filled: 0,
             }),
             syncer: Mutex::new(syncer),
             appended_lsn: AtomicU64::new(0),
@@ -121,6 +153,12 @@ impl Wal {
         let offset = writer.offset;
         write_all_at(&writer.file, record, offset)?;
         writer.offset = offset + record.len() as u64;
+        // A record that `reserve` declined to pre-fill has just initialised those
+        // blocks itself. The frontier MUST move with it: `reserve` writes its
+        // zeros starting at `zeroed`, so leaving `zeroed` behind the record end
+        // would make the next small record's pre-fill lay zeros straight over the
+        // record just written.
+        writer.zeroed = writer.zeroed.max(writer.offset);
         drop(writer);
         // Publish only after the bytes are in the kernel, so a concurrent flush
         // never reports an LSN durable whose write had not been issued yet.
@@ -189,6 +227,11 @@ impl Wal {
     #[cfg(test)]
     fn offset(&self) -> u64 {
         self.writer.lock().unwrap().offset
+    }
+
+    #[cfg(test)]
+    fn zero_filled(&self) -> u64 {
+        self.writer.lock().unwrap().zero_filled
     }
 }
 
@@ -300,6 +343,54 @@ mod tests {
             contents[16..].iter().all(|byte| *byte == 0),
             "the runway past the records must be zeros"
         );
+    }
+
+    /// A record too large for one runway step must not have its span written
+    /// twice.
+    ///
+    /// `reserve` used to widen its fill to `max(runway, wanted)`, so a 1 MiB
+    /// record was preceded by 1 MiB of zeros AND an `fdatasync` behind them,
+    /// every byte of which the record then overwrote. Both writes are counted
+    /// here through the file's own byte counter rather than by timing, because
+    /// the waste is deterministic and a timing on this host is not: a four-value
+    /// 1 MiB workload left an 8 MiB segment behind for 4 MiB of records.
+    #[test]
+    fn a_record_larger_than_the_runway_is_not_written_twice() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("segment");
+        // A runway far smaller than the record, which is the shape a large value
+        // takes against the 1 MiB default.
+        let wal = wal(&path, 4_096);
+        let record = vec![7; 512 * 1024];
+        wal.append(&record, 1).unwrap();
+        wal.sync_through(1).unwrap();
+        // Bytes written, not bytes left behind: a fill sized to the record covers
+        // exactly the span the record overwrites, so the finished file is
+        // identical either way and its length cannot tell the two apart. Before
+        // the fix this was 512 KiB of zeros — the record's whole span, written and
+        // fsynced immediately before the record itself landed on top of it.
+        assert_eq!(
+            wal.zero_filled(),
+            0,
+            "a record larger than the runway must not have its span pre-filled; \
+             those zeros are written and flushed only to be overwritten at once"
+        );
+
+        // The frontier has to follow the record, or the next small record's
+        // pre-fill lays zeros over the record just written.
+        wal.append(b"after", 2).unwrap();
+        wal.sync_through(2).unwrap();
+        let mut contents = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(
+            &contents[..record.len()],
+            &record[..],
+            "the large record was overwritten by a later runway fill"
+        );
+        assert_eq!(&contents[record.len()..record.len() + 5], b"after");
     }
 
     /// The runway has to grow past its step size for a record larger than it,

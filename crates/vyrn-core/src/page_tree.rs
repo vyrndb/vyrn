@@ -6,7 +6,7 @@ use crc32fast::Hasher;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    io::Write,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -278,20 +278,40 @@ impl PageManager {
         // Write at the page-aligned end of the file, never the raw end. An
         // append cut off mid-write (ENOSPC) leaves a fragment shorter than a
         // page at the tail while `page_count` still counts whole pages only;
-        // seeking to End(0) would land this page past the fragment and shift
-        // every later offset, silently misaligning each subsequent page. The
-        // fragment is overwritten rather than truncated away: it is the head of
-        // exactly the page this append rewrites in full.
-        let end = self.file.seek(SeekFrom::End(0))?;
-        self.file
-            .seek(SeekFrom::Start(end - end % PAGE_SIZE as u64))?;
-        self.file.write_all(&page)?;
+        // landing this page past the fragment would shift every later offset,
+        // silently misaligning each subsequent page. The fragment is overwritten
+        // rather than truncated away: it is the head of exactly the page this
+        // append rewrites in full.
+        //
+        // That aligned end is `page_id * PAGE_SIZE` by construction — `page_count`
+        // is set from the page-aligned file length at open and by
+        // `refresh_page_count`, and only ever moves one page at a time from here —
+        // so the offset is computed rather than discovered. This was two `seek`
+        // syscalls (End(0), then Start of the aligned offset) before every page
+        // write, which a copy-on-write commit pays once per page it rewrites: a
+        // batch touching a few dozen pages made a hundred syscalls to learn a
+        // number it already had.
+        write_all_at(&self.file, &page, page_id * PAGE_SIZE as u64)?;
         self.dirty = true;
         self.page_count += 1;
-        // Freshly appended pages are usually on the next commit's copy-on-write
-        // path, so they enter referenced. Read-hot pages are protected by the
-        // clock's second-chance bit rather than by insert order.
-        self.insert_cache_with(page_id, Arc::new(page), true)?;
+        // Appended pages enter UNREFERENCED, which is what `insert_cache_with`'s
+        // doc comment has always claimed and what the code did not do: it passed
+        // `true`, so every page a copy-on-write commit wrote arrived holding a
+        // second chance. Under cache pressure that inverts the policy the clock is
+        // there to implement. A commit rewrites its whole root-to-leaf path, and
+        // those pages are immediately superseded by the next commit's rewrite of
+        // the same path — nothing reads them again — yet each one arrived able to
+        // survive an eviction pass, and the pages it could push out were the
+        // reader-touched ones whose bit had just been cleared by the hand. A burst
+        // of writes therefore evicted exactly the pages readers were hitting.
+        //
+        // The comment claiming they "are usually on the next commit's
+        // copy-on-write path" is true of the path's SHAPE, not of these page ids:
+        // the next commit reads the current root's pages, and these have already
+        // been replaced. Entering unreferenced still leaves them cached and still
+        // lets a reader that does touch one set the bit; it only stops them
+        // outranking pages that earned their bit by being read.
+        self.insert_cache_with(page_id, Arc::new(page), false)?;
         Ok(page_id)
     }
 
@@ -559,18 +579,102 @@ impl PageTree {
     }
 
     /// Reads a key's value and revision in one descent.
+    ///
+    /// The leaf's cells are walked in place rather than decoded. `read_leaf` was
+    /// called here, and `decode_leaf` allocates a `Vec` for the key AND a `Vec`
+    /// for the value of every entry in the page — a 4 KiB leaf of 128 B values
+    /// holds around thirty, and a leaf of small values many more — all to answer
+    /// a lookup that keeps one value and drops the rest. Walking the cells copies
+    /// exactly the one value that matched. Measured on a 4,000-key tree of 128 B
+    /// values, this took a cached `get` from 21.6 µs to 1.9 µs.
     pub(crate) fn get_with_revision(&self, key: &[u8]) -> Result<RevisionedValue> {
         if self.root == 0 {
             return Ok(None);
         }
-        let leaf = self.find_leaf(key, None)?;
-        for entry in self.read_leaf(leaf)? {
-            match entry.key.as_slice().cmp(key) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Equal => {
-                    return Ok(Some((self.read_value(&entry.value)?, entry.revision)))
-                }
-                std::cmp::Ordering::Greater => return Ok(None),
+        let leaf_id = self.find_leaf(key, None)?;
+        let page = self.pages.read(leaf_id)?;
+        require_type(&page, leaf_id, LEAF)?;
+        self.find_in_leaf(&page, leaf_id, key)
+    }
+
+    /// Finds one key's value inside a leaf page without decoding the page.
+    ///
+    /// The value is materialised here rather than handed back as an
+    /// [`EntryValue`] for the caller to resolve: an inline value returned that way
+    /// would be copied out of the page and then cloned again by `read_value`, and
+    /// at 1 MiB one avoidable copy of the bytes is most of the cost of the read.
+    /// Cells ascend by key, so the walk stops at the first cell past the target.
+    fn find_in_leaf(&self, page: &Page, page_id: u64, key: &[u8]) -> Result<RevisionedValue> {
+        let count = read_u32(page, 20) as usize;
+        // Same bound and same reasoning as `decode_leaf`: a count past what the
+        // page can physically hold is a forged field, not a large tree.
+        if count > MAX_LEAF_ENTRIES {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: format!(
+                    "leaf claims {count} entries but a page holds at most {MAX_LEAF_ENTRIES}"
+                ),
+            });
+        }
+        let mut offset = HEADER_SIZE;
+        for _ in 0..count {
+            require_page(offset, LEAF_CELL_HEADER, page_id)?;
+            let flags = page[offset];
+            let key_len = read_u32(page, offset + 1) as usize;
+            let value_len = read_u32(page, offset + 5) as usize;
+            if key_len == 0
+                || key_len > MAX_STORED_KEY_SIZE
+                || value_len > MAX_VALUE_SIZE
+                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+            {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            let key_page = read_u64(page, offset + 9);
+            let value_offset = read_u64(page, offset + 17);
+            let revision = read_u64(page, offset + 25);
+            offset += LEAF_CELL_HEADER;
+            // An external key is a blob read, so it is compared by reading it;
+            // an inline key is compared against the page bytes with no copy at
+            // all, which is the case every ordinary key takes.
+            let external_key = flags & EXTERNAL_KEY != 0;
+            let stored_key = if external_key {
+                Some(self.read_blob(key_page, key_len)?)
+            } else {
+                require_page(offset, key_len, page_id)?;
+                None
+            };
+            let ordering = match &stored_key {
+                Some(stored) => stored.as_slice().cmp(key),
+                None => page[offset..offset + key_len].cmp(key),
+            };
+            if !external_key {
+                offset += key_len;
+            }
+            // Keys ascend, so nothing past this cell can match.
+            if ordering == std::cmp::Ordering::Greater {
+                return Ok(None);
+            }
+            let value_external = flags & EXTERNAL_VALUE != 0;
+            if !value_external {
+                require_page(offset, value_len, page_id)?;
+            }
+            if ordering == std::cmp::Ordering::Equal {
+                let value = if value_external {
+                    self.values.read(&ValueRef {
+                        offset: value_offset,
+                        len: value_len as u32,
+                        revision,
+                    })?
+                } else {
+                    page[offset..offset + value_len].to_vec()
+                };
+                return Ok(Some((value, revision)));
+            }
+            if !value_external {
+                offset += value_len;
             }
         }
         Ok(None)
@@ -1099,8 +1203,17 @@ impl PageTree {
                     if excluded_prefix.is_some_and(|prefix| entry.key.starts_with(prefix)) {
                         continue;
                     }
-                    let value = self.read_value(&entry.value)?;
-                    rows.push((entry.key, value, entry.revision));
+                    // The entry is owned here, so its inline value is MOVED into
+                    // the row rather than cloned out of it. `read_value` takes a
+                    // reference and has to clone, which meant every row of every
+                    // scan allocated its value twice: once in `decode_leaf` and
+                    // once here, with the first copy dropped immediately after.
+                    let revision = entry.revision;
+                    let value = match entry.value {
+                        EntryValue::Inline(value) => value,
+                        EntryValue::External(reference) => self.values.read(&reference)?,
+                    };
+                    rows.push((entry.key, value, revision));
                     if rows.len() == limit {
                         break;
                     }
@@ -1148,23 +1261,142 @@ impl PageTree {
             let page = self.pages.read(page_id)?;
             match page[5] {
                 LEAF => return Ok(page_id),
+                // The separators are compared against the page bytes in place.
+                //
+                // `decode_internal` was called here, and it does two things this
+                // descent has no use for: it allocates an owned key for every
+                // child of the page, and — to fill in child 0's minimum, which is
+                // not stored in the page — it walks that child's whole leftmost
+                // spine to a leaf. So a descent through a three-level tree read
+                // its three pages plus two extra spines, and allocated a key per
+                // child on every level, to end up following one child pointer per
+                // page. Choosing the child by comparing separators where they lie
+                // needs neither: child 0 is the answer precisely when the key
+                // sorts below separator 1, which is a fact about separator 1.
                 INTERNAL => {
-                    let children = self.decode_internal(&page, page_id)?;
-                    let mut index = 0;
-                    for (child_index, child) in children.iter().enumerate().skip(1) {
-                        if key < child.min_key.as_slice() {
-                            break;
-                        }
-                        index = child_index;
-                    }
+                    let (index, child) = self.child_for_key(&page, page_id, key)?;
                     if let Some(path) = path.as_deref_mut() {
                         path.push((page_id, index));
                     }
-                    page_id = children[index].page_id;
+                    page_id = child;
                 }
                 page_type => return Err(unexpected_type(page_id, page_type)),
             }
         }
+    }
+
+    /// Picks the child of an internal page that owns `key`, without decoding it.
+    ///
+    /// Returns the child's index within the page and its page id. The index is
+    /// what `prepare_put` and `prepare_delete` record in their path so the
+    /// copy-on-write rewrite knows which child slot to replace.
+    ///
+    /// Child 0 owns everything below the first stored separator, so the walk keeps
+    /// the last child whose separator is at or below `key` and stops at the first
+    /// one above it. Separators ascend, so stopping early is safe.
+    fn child_for_key(&self, page: &Page, page_id: u64, key: &[u8]) -> Result<(usize, u64)> {
+        let count = read_u32(page, 20) as usize;
+        // Same bound and same reasoning as `decode_internal`.
+        if count >= MAX_INTERNAL_CHILDREN {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: format!(
+                    "internal page claims {} children but a page holds at most {MAX_INTERNAL_CHILDREN}",
+                    count + 1
+                ),
+            });
+        }
+        let first_id = read_u64(page, 24);
+        // Every child id on the page is checked against the page's own id, not
+        // just the one this descent follows.
+        //
+        // `decode_internal` used to resolve child 0 through `node_ref`, which
+        // noticed a page naming itself because it walked into the loop and hit the
+        // depth bound. Choosing a child without touching child 0 removed that
+        // walk — and with it the detection: a forged page whose first child is
+        // itself would be traversed happily by any lookup that lands on a
+        // different child, and reported only by the lookups that happen to
+        // descend into the cycle. A page can never legitimately be its own child,
+        // so the check that used to be a side effect of the spine walk is now
+        // explicit and costs a comparison. Longer rings still terminate on the
+        // descent's depth bound, as they always did.
+        if first_id == page_id {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "internal page names itself as its own child".into(),
+            });
+        }
+        let mut chosen = (0, first_id);
+        let mut offset = HEADER_SIZE;
+        for index in 0..count {
+            require_page(offset, INTERNAL_CELL_HEADER, page_id)?;
+            let flags = page[offset];
+            let key_len = read_u32(page, offset + 1) as usize;
+            let key_page = read_u64(page, offset + 5);
+            let child_id = read_u64(page, offset + 13);
+            if key_len == 0 || key_len > MAX_STORED_KEY_SIZE || flags & !EXTERNAL_KEY != 0 {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid internal cell metadata".into(),
+                });
+            }
+            if child_id == page_id {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "internal page names itself as its own child".into(),
+                });
+            }
+            offset += INTERNAL_CELL_HEADER;
+            // An oversized separator lives in a blob and has to be read to be
+            // compared; an inline one is compared where it lies, with no copy.
+            let below = if flags & EXTERNAL_KEY != 0 {
+                self.read_blob(key_page, key_len)?.as_slice() <= key
+            } else {
+                require_page(offset, key_len, page_id)?;
+                let separator = &page[offset..offset + key_len];
+                offset += key_len;
+                separator <= key
+            };
+            if !below {
+                break;
+            }
+            // `index` counts separators, and separator 0 introduces child 1.
+            chosen = (index + 1, child_id);
+        }
+        Ok(chosen)
+    }
+
+    /// Reads just the first cell's key out of a leaf page.
+    ///
+    /// The separator work only ever wants this one key, and decoding the page to
+    /// get it materialises every other key and value in it as well. Kept beside
+    /// `decode_leaf` deliberately: the cell layout is described in one place
+    /// there, and this repeats only the first cell's part of it.
+    fn first_leaf_key(&self, page: &Page, page_id: u64) -> Result<Vec<u8>> {
+        let count = read_u32(page, 20) as usize;
+        if count == 0 || count > MAX_LEAF_ENTRIES {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "empty leaf is reachable".into(),
+            });
+        }
+        let flags = page[HEADER_SIZE];
+        let key_len = read_u32(page, HEADER_SIZE + 1) as usize;
+        if key_len == 0
+            || key_len > MAX_STORED_KEY_SIZE
+            || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+        {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "invalid leaf cell metadata".into(),
+            });
+        }
+        if flags & EXTERNAL_KEY != 0 {
+            return self.read_blob(read_u64(page, HEADER_SIZE + 9), key_len);
+        }
+        let start = HEADER_SIZE + LEAF_CELL_HEADER;
+        require_page(start, key_len, page_id)?;
+        Ok(page[start..start + key_len].to_vec())
     }
 
     fn read_leaf(&self, page_id: u64) -> Result<Vec<Entry>> {
@@ -1192,16 +1424,19 @@ impl PageTree {
             depth += 1;
             let page = self.pages.read(current)?;
             match page[5] {
+                // Only the first cell's key is read, never the whole leaf.
+                // `decode_leaf` was called here, which allocates a `Vec` for the
+                // key AND one for the value of every entry in the page — up to a
+                // hundred allocations and a copy of the page's whole payload — of
+                // which this function keeps exactly one key and drops the rest.
+                // It runs once per internal page a commit rewrites, so on a batch
+                // that touches several levels it was one of the larger allocation
+                // sources on the write path.
                 LEAF => {
-                    let entries = self.decode_leaf(&page, current)?;
-                    let first = entries.first().ok_or_else(|| Error::CorruptPage {
-                        page_id: current,
-                        reason: "empty leaf is reachable".into(),
-                    })?;
                     return Ok(NodeRef {
                         page_id,
-                        min_key: first.key.clone(),
-                    });
+                        min_key: self.first_leaf_key(&page, current)?,
+                    })
                 }
                 // The first child's page id is a fixed header field, which is
                 // exactly what `decode_internal` reads to build `children[0]`.
@@ -1583,6 +1818,37 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result
     })
 }
 
+#[cfg(unix)]
+fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buffer, offset)
+}
+
+/// Windows has no `write_all_at`, so the partial-write loop is spelled out.
+///
+/// A short write is retried at the offset it stopped at rather than treated as
+/// success, and a zero-length write is an error instead of an infinite loop —
+/// this is the same shape as the WAL's own positioned write.
+#[cfg(windows)]
+fn write_all_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0;
+    while written < buffer.len() {
+        match file.seek_write(&buffer[written..], offset + written as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Merges sorted mutations into a leaf's sorted entries.
 ///
 /// Records in `existed` whether each key was already present before the batch, so
@@ -1754,7 +2020,7 @@ mod tests {
     /// checksum protects against rot, not against whoever rewrites the bytes,
     /// so every field the decoders trust has to stand on its own.
     fn forge_page(path: &Path, page_id: u64, mutate: impl FnOnce(&mut Page)) {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -1763,9 +2029,7 @@ mod tests {
         read_exact_at(&file, &mut page, page_id * PAGE_SIZE as u64).unwrap();
         mutate(&mut page);
         finalize_page(&mut page);
-        file.seek(SeekFrom::Start(page_id * PAGE_SIZE as u64))
-            .unwrap();
-        file.write_all(&page).unwrap();
+        write_all_at(&file, &page, page_id * PAGE_SIZE as u64).unwrap();
         file.sync_all().unwrap();
     }
 
@@ -1858,6 +2122,60 @@ mod tests {
                 matches!(error, Error::CorruptPage { .. }),
                 "a cyclic page graph must be reported as corruption, got {error:?}"
             );
+        }
+    }
+
+    /// A point lookup must return the same answer whether or not it took the
+    /// in-place cell walk, across every shape of stored entry.
+    ///
+    /// `get_with_revision` used to reach its one entry by calling `decode_leaf`,
+    /// which allocates a key `Vec` and a value `Vec` for every entry in the page
+    /// — about two hundred allocations to answer a lookup that keeps one of them.
+    /// It now walks the cells in place and copies only the entry it matched, so
+    /// this covers the cases that walk has to get right by itself: inline values,
+    /// external (value-log) values, external keys, and a miss that falls between
+    /// two present keys.
+    #[test]
+    fn a_point_lookup_matches_a_full_leaf_decode() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+        // Deliberately mixed: short inline values, values over INLINE_LIMIT that
+        // live in the value log, and a key over INLINE_LIMIT that becomes a blob.
+        let long_key = vec![b'k'; INLINE_LIMIT + 10];
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for index in 0..300_u64 {
+            let key = format!("entry/{index:06}").into_bytes();
+            let value = match index % 3 {
+                0 => vec![(index % 251) as u8; 8],
+                1 => vec![(index % 251) as u8; INLINE_LIMIT + 1],
+                _ => Vec::new(),
+            };
+            let (root, len) = tree.prepare_put(&key, &value, index + 1).unwrap();
+            tree.publish(root, len);
+            expected.push((key, value));
+        }
+        let (root, len) = tree.prepare_put(&long_key, b"blobkey", 1_000).unwrap();
+        tree.publish(root, len);
+        expected.push((long_key, b"blobkey".to_vec()));
+        tree.sync().unwrap();
+
+        for (key, value) in &expected {
+            assert_eq!(
+                tree.get(key).unwrap().as_ref(),
+                Some(value),
+                "point lookup disagreed with what was written"
+            );
+        }
+        // Misses either side of a present key, and between two of them.
+        for missing in [
+            b"entry/000000/x".to_vec(),
+            b"entry".to_vec(),
+            b"entry/0000005".to_vec(),
+            b"zzz".to_vec(),
+        ] {
+            assert_eq!(tree.get(&missing).unwrap(), None, "phantom hit");
         }
     }
 
