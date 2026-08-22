@@ -21,7 +21,10 @@ use std::{
     future::Future,
     ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -31,6 +34,7 @@ use tokio::{
 };
 use url::Url;
 use vyrn_client::{Client, CollectionIndex, Error as ClientError};
+use vyrn_log::{self as log, log_debug, log_error, log_info, log_record, log_warn, redact_url};
 use vyrn_protocol::{MAX_DOCUMENT_INDEXES, MAX_SCAN_LIMIT};
 
 const JSON_LIMIT: usize = 24 * 1024 * 1024;
@@ -71,6 +75,15 @@ struct AppState {
     tls_ca_file: Option<PathBuf>,
     token: Arc<str>,
     clients: Arc<ClientPool>,
+    /// The readiness answer this process last logged.
+    ///
+    /// Load balancers probe readiness every few seconds, so logging each probe
+    /// would bury every other record in the stream and teach operators to filter
+    /// the log out. Only edges are logged, which is also the thing worth
+    /// alerting on: the moment the gateway started or stopped taking traffic.
+    /// Starts `true` because the startup connection succeeded — if the first
+    /// probe fails, that is an edge and gets a record.
+    reporting_ready: Arc<AtomicBool>,
 }
 
 struct ClientPool {
@@ -114,6 +127,18 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// The upstream detail that `message` deliberately does not carry.
+    ///
+    /// Storage and transport failures name WAL segments, page ids, TLS
+    /// handshake states and OS errno text. API clients get a generic line
+    /// because none of that is theirs to see and some of it describes the
+    /// deployment's internals. It still has to reach the operator, or a 503 is
+    /// unattributable: the gateway would be reporting that the database is
+    /// unavailable without recording what it actually saw. The detail rides
+    /// here to [`log_upstream_detail`], which logs it alongside the request
+    /// method and route — neither of which is in scope at the point the error
+    /// is converted.
+    upstream: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -298,10 +323,30 @@ async fn main() -> Result<()> {
                     .max(1),
             )),
         }),
+        // Startup proves the backend reachable below, so the process begins in
+        // the ready state; the first failing probe is then an edge and is logged.
+        reporting_ready: Arc::new(AtomicBool::new(true)),
     };
-    connect(&state)
-        .await
-        .context("failed to connect to Vyrn during gateway startup")?;
+    // Captured before `state` is moved into the router, and used in the startup
+    // record below.
+    let upstream = redact_url(&state.connection_url);
+    let upstream_tls = state.tls_ca_file.is_some();
+    let idle_connections = state.clients.maximum;
+    let max_connections = state.clients.active.available_permits();
+    if let Err(error) = connect(&state).await {
+        // The gateway is about to exit non-zero and anyhow will print the
+        // context, but that goes out unlevelled and untimestamped. An operator
+        // correlating a failed rollout wants this record in the same stream and
+        // the same format as everything else the process emits.
+        log_error!(
+            "vyrn-http",
+            "startup connection to the database failed",
+            upstream = upstream,
+            upstream_tls = upstream_tls,
+            detail = error,
+        );
+        return Err(error).context("failed to connect to Vyrn during gateway startup");
+    }
 
     let protected = Router::new()
         .route("/v1/get", post(get_value))
@@ -324,14 +369,34 @@ async fn main() -> Result<()> {
         .route("/health/live", get(|| async { "ok\n" }))
         .route("/health/ready", get(ready))
         .merge(protected)
+        // Outermost, so it observes the responses the authentication layer and
+        // the body-limit layer produce as well as the handlers' own. An error
+        // that never reaches a handler is exactly the kind that is otherwise
+        // invisible.
+        .layer(middleware::from_fn(log_upstream_detail))
         .with_state(state);
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("failed to bind {}", args.bind))?;
-    println!("vyrn-http listening on {}", args.bind);
+    // The effective configuration, once, at startup — the values the process is
+    // actually running with rather than the ones a deployment believes it
+    // passed. `upstream` is redacted: a Vyrn URL carries the database password
+    // in its userinfo, and this is the record most likely to be pasted into a
+    // ticket.
+    log_info!(
+        "vyrn-http",
+        "gateway listening",
+        version = env!("CARGO_PKG_VERSION"),
+        bind = args.bind,
+        upstream = upstream,
+        upstream_tls = upstream_tls,
+        idle_connections = idle_connections,
+        max_connections = max_connections,
+    );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    log_info!("vyrn-http", "gateway shutdown complete");
     Ok(())
 }
 
@@ -354,6 +419,25 @@ async fn authenticate(
     if supplied
         .is_none_or(|supplied| !constant_time_eq(supplied.as_bytes(), state.token.as_bytes()))
     {
+        // Warn, not error: a rejected token is the gateway working. It is logged
+        // because a burst of these is how an operator sees credential stuffing,
+        // a rotated token that half the fleet did not pick up, or a probe. The
+        // supplied token is never recorded, not even truncated or hashed — a
+        // near-miss is still a live credential, and one logged token is one
+        // token that has to be rotated. Which of the two cases it was is
+        // reported instead, since "sent nothing" and "sent the wrong thing"
+        // point at different problems.
+        log_warn!(
+            "vyrn-http.auth",
+            "bearer token rejected",
+            method = request.method(),
+            path = request.uri().path(),
+            reason = if supplied.is_none() {
+                "missing or malformed authorization header"
+            } else {
+                "token mismatch"
+            },
+        );
         return ApiError::new(
             StatusCode::UNAUTHORIZED,
             "authentication_failed",
@@ -370,9 +454,8 @@ async fn ready(State(state): State<AppState>) -> Response {
     // is taken, answer overloaded rather than queueing for a new connection:
     // this endpoint is unauthenticated, so a scriptable probe must not be able
     // to amplify connections past the budget.
-    if state.clients.idle.lock().await.is_empty()
-        && state.clients.active.available_permits() == 0
-    {
+    if state.clients.idle.lock().await.is_empty() && state.clients.active.available_permits() == 0 {
+        report_readiness(&state, false, "backend connection budget exhausted");
         return (StatusCode::SERVICE_UNAVAILABLE, "overloaded\n").into_response();
     }
     let probe = pooled(&state, |mut client| async {
@@ -381,8 +464,40 @@ async fn ready(State(state): State<AppState>) -> Response {
     })
     .await;
     match probe {
-        Ok(_) => (StatusCode::OK, "ready\n").into_response(),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response(),
+        Ok(_) => {
+            report_readiness(&state, true, "backend probe succeeded");
+            (StatusCode::OK, "ready\n").into_response()
+        }
+        Err(error) => {
+            // `pooled` already logged the upstream cause; this records the
+            // traffic-affecting consequence, which is the line an operator
+            // correlates an outage against. `probe` is dropped rather than
+            // converted, so the probe never attaches upstream detail to a
+            // response — a readiness endpoint must not describe the database's
+            // internals to an unauthenticated caller.
+            report_readiness(&state, false, "backend probe failed");
+            let _ = error;
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+        }
+    }
+}
+
+/// Logs a readiness transition, and only a transition.
+///
+/// Probes arrive every few seconds; a record per probe would drown the log and
+/// get it switched off. The edges are what matters operationally, because
+/// `docs/production.md` tells operators to stop routing traffic on a 503 —
+/// so the log has to say when that started and when it stopped.
+fn report_readiness(state: &AppState, ready: bool, reason: &str) {
+    // Relaxed: two probes racing here can only both report the same new value,
+    // and `swap` means exactly one of them logs it.
+    if state.reporting_ready.swap(ready, Ordering::Relaxed) == ready {
+        return;
+    }
+    if ready {
+        log_info!("vyrn-http.health", "readiness restored", reason = reason);
+    } else {
+        log_warn!("vyrn-http.health", "readiness lost", reason = reason);
     }
 }
 
@@ -504,7 +619,16 @@ async fn transaction(
     let mut begun = client.transaction().await;
     if matches!(&begun, Err(error) if is_dead_connection(error)) {
         let error = begun.err().unwrap();
-        eprintln!("vyrn-http discarding stale pooled connection: {error}");
+        // Debug, not warn: the database closing an idle pooled connection is
+        // expected steady-state behaviour that the retry handles, and at info or
+        // above it would produce a record per idle-timeout cycle for a condition
+        // nobody needs to act on.
+        log_debug!(
+            "vyrn-http.pool",
+            "discarding stale pooled connection",
+            stage = "begin",
+            detail = error,
+        );
         client = connect_api(&state).await?;
         begun = client.transaction().await;
     }
@@ -553,7 +677,19 @@ async fn subscribe(
                         }
                         Ok(None) => break,
                         Err(error) => {
-                            eprintln!("vyrn-http subscription failed: {error}");
+                            // The subscriber gets "subscription terminated" and
+                            // nothing more; the cause names backend internals.
+                            // A stream that dies mid-flight is a lost-changes
+                            // event for the application, so the reason has to be
+                            // recoverable from the log — this is not reachable
+                            // through the request middleware, because the
+                            // response headers were sent long before the failure.
+                            log_error!(
+                                "vyrn-http.subscribe",
+                                "subscription stream failed",
+                                kind = "key",
+                                detail = error,
+                            );
                             let payload = serde_json::json!({
                                 "error": { "code": "subscription_closed", "message": "subscription terminated" }
                             });
@@ -597,7 +733,9 @@ async fn create_collection(
         .map(|index| CollectionIndex::new(index.field, index.unique))
         .collect();
     pooled(&state, |mut client| async {
-        let created = client.create_collection(&request.collection, &indexes).await;
+        let created = client
+            .create_collection(&request.collection, &indexes)
+            .await;
         (client, created)
     })
     .await?;
@@ -651,7 +789,9 @@ async fn list_documents(
 ) -> Result<Json<DocumentsResponse>, ApiError> {
     let limit = document_limit(request.limit)?;
     let documents = pooled(&state, |mut client| async {
-        let listed = client.list_documents(&request.collection, Some(limit)).await;
+        let listed = client
+            .list_documents(&request.collection, Some(limit))
+            .await;
         (client, listed)
     })
     .await?;
@@ -703,7 +843,15 @@ async fn subscribe_collection(
                         }
                         Ok(None) => break,
                         Err(error) => {
-                            eprintln!("vyrn-http subscription failed: {error}");
+                            // See `subscribe`: the client is told only that the
+                            // stream ended, so the cause must survive here.
+                            log_error!(
+                                "vyrn-http.subscribe",
+                                "subscription stream failed",
+                                kind = "collection",
+                                collection = query.collection,
+                                detail = error,
+                            );
                             let payload = serde_json::json!({
                                 "error": { "code": "subscription_closed", "message": "subscription terminated" }
                             });
@@ -818,7 +966,15 @@ where
             Ok(value)
         }
         Err(error) if is_dead_connection(&error) => {
-            eprintln!("vyrn-http discarding stale pooled connection: {error}");
+            // See the note in `transaction`: an idle connection closed by the
+            // database is routine and the retry below absorbs it, so this stays
+            // at debug rather than logging once per idle-timeout cycle.
+            log_debug!(
+                "vyrn-http.pool",
+                "discarding stale pooled connection",
+                stage = "request",
+                detail = error,
+            );
             let (client, result) = operation(connect_api(state).await?).await;
             if result.is_ok() {
                 checkin(state, client).await;
@@ -911,11 +1067,21 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            upstream: None,
         }
     }
 
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+    }
+
+    /// Records what the gateway saw upstream, for the log only.
+    ///
+    /// The client-facing `message` is left exactly as it was: this adds a second
+    /// channel rather than widening the first.
+    fn with_upstream(mut self, upstream: impl Into<String>) -> Self {
+        self.upstream = Some(upstream.into());
+        self
     }
 }
 
@@ -934,32 +1100,30 @@ impl From<ClientError> for ApiError {
                         (StatusCode::CONFLICT, "transaction_conflict")
                     }
                     // Storage and internal failures name WAL segments, page ids
-                    // and OS I/O errors; the full detail goes to stderr and API
+                    // and OS I/O errors; the full detail goes to the log and API
                     // clients get a generic line. UnsupportedVersion likewise
                     // describes a gateway/server pairing the caller cannot act on.
                     vyrn_protocol::ErrorCode::Storage
                     | vyrn_protocol::ErrorCode::Internal
                     | vyrn_protocol::ErrorCode::UnsupportedVersion => {
-                        eprintln!("vyrn-http database storage error: {message}");
                         return Self::new(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "database_storage_error",
                             "database storage error",
-                        );
+                        )
+                        .with_upstream(format!("database reported {code:?}: {message}"));
                     }
                 };
                 Self::new(status, code, message)
             }
             // Transport-class text includes TLS handshake details and OS I/O
             // messages; log it, return something generic.
-            error => {
-                eprintln!("vyrn-http backend connection failed: {error}");
-                Self::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "database_unavailable",
-                    "database unavailable",
-                )
-            }
+            error => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                "database unavailable",
+            )
+            .with_upstream(format!("backend connection failed: {error}")),
         }
     }
 }
@@ -972,8 +1136,88 @@ impl IntoResponse for ApiError {
                 message: &self.message,
             },
         });
-        (self.status, body).into_response()
+        let mut response = (self.status, body).into_response();
+        // The scrubbed body is already built; the detail travels on the
+        // response so `log_upstream_detail` can pair it with the method and
+        // route it failed on. Errors are converted deep inside a handler where
+        // neither is reachable, and a log line saying only "storage error" does
+        // not tell an operator which endpoint stopped working.
+        if let Some(upstream) = self.upstream {
+            response
+                .extensions_mut()
+                .insert(UpstreamDetail { detail: upstream });
+        }
+        response
     }
+}
+
+/// Upstream failure text attached to a response for the logging middleware.
+///
+/// Never serialized and never reachable from a response body — the type exists
+/// only to move the detail from the conversion site to the one place that knows
+/// which request it belongs to.
+#[derive(Clone)]
+struct UpstreamDetail {
+    detail: String,
+}
+
+/// Logs what actually failed upstream, with the request it failed on.
+///
+/// Clients get a scrubbed error body, which is correct: storage messages name
+/// WAL segments and OS errors, and a gateway that echoes them describes its
+/// deployment's internals to anyone who can reach it. But the gateway used to
+/// scrub and then discard, so a 503 recorded nothing anywhere and an operator
+/// investigating one had no upstream cause to work from.
+///
+/// Only failures are logged, and only once each. Successful requests produce no
+/// record at info level — a gateway that logs a line per request is a gateway
+/// whose logs get turned off. Set `VYRN_LOG=debug` for those.
+async fn log_upstream_detail(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    // The path only. A query string carries the subscription prefix and, for
+    // any future endpoint, whatever a caller chooses to put there; it is not
+    // worth the risk of logging client data.
+    let path = request.uri().path().to_owned();
+    let response = next.run(request).await;
+    let status = response.status();
+    if let Some(upstream) = response.extensions().get::<UpstreamDetail>() {
+        // Server-side failures are actionable; a 4xx is the client's problem
+        // and is reported at debug so a scripted caller cannot flood the log.
+        let level = if status.is_server_error() {
+            log::Level::Error
+        } else {
+            log::Level::Debug
+        };
+        log_record!(
+            level,
+            "vyrn-http.request",
+            "request failed upstream",
+            method = method,
+            path = path,
+            status = status.as_u16(),
+            detail = upstream.detail,
+        );
+    } else if status.is_server_error() {
+        // A 5xx with no attached detail did not come from `ApiError`: axum's own
+        // layers produced it. Worth a record precisely because nothing else
+        // explains it.
+        log_error!(
+            "vyrn-http.request",
+            "request failed without upstream detail",
+            method = method,
+            path = path,
+            status = status.as_u16(),
+        );
+    } else {
+        log_debug!(
+            "vyrn-http.request",
+            "request served",
+            method = method,
+            path = path,
+            status = status.as_u16(),
+        );
+    }
+    response
 }
 
 fn read_secret_file(path: &PathBuf) -> Result<String> {
@@ -1020,6 +1264,11 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+    // Logged before the sleep, so the record marks when the gateway stopped
+    // accepting rather than when it finished draining. An operator reading a
+    // deploy timeline needs the boundary between "still serving" and "shutting
+    // down" to sit in the right place.
+    log_info!("vyrn-http", "signal received, draining connections");
     sleep(Duration::from_millis(10)).await;
 }
 
@@ -1047,7 +1296,10 @@ mod tests {
         // a form decoder rewrites that '+' into a space before we see it.
         let bytes = vec![0xFA, 0xBF, 0x66, 0x11];
         let encoded = STANDARD.encode(&bytes);
-        assert!(encoded.contains('+'), "sample must contain a plus: {encoded}");
+        assert!(
+            encoded.contains('+'),
+            "sample must contain a plus: {encoded}"
+        );
         let corrupted = encoded.replace('+', " ");
         let decoded = decode_query("prefix", &corrupted).unwrap();
         assert_eq!(decoded, bytes);
@@ -1075,15 +1327,19 @@ mod tests {
 
     #[test]
     fn body_decode_stays_strictly_standard() {
-        assert!(decode("key", "-_-_-_-_" ).is_err());
-        assert!(decode("key", "aGVsbG8=" ).is_ok());
+        assert!(decode("key", "-_-_-_-_").is_err());
+        assert!(decode("key", "aGVsbG8=").is_ok());
     }
 
     #[test]
     fn only_transport_failures_count_as_dead_connections() {
         assert!(is_dead_connection(&ClientError::ConnectionClosed));
-        assert!(is_dead_connection(&ClientError::Tls("tls close notify".into())));
-        assert!(is_dead_connection(&ClientError::Transport("reset by peer".into())));
+        assert!(is_dead_connection(&ClientError::Tls(
+            "tls close notify".into()
+        )));
+        assert!(is_dead_connection(&ClientError::Transport(
+            "reset by peer".into()
+        )));
         // A timeout may mean the request is still executing server-side.
         assert!(!is_dead_connection(&ClientError::Timeout));
         assert!(!is_dead_connection(&ClientError::Server {
@@ -1108,6 +1364,106 @@ mod tests {
             "read tcp 127.0.0.1:54321: connection reset by peer".into(),
         ));
         assert_eq!(error.message, "database unavailable");
+    }
+
+    /// Scrubbing the client's copy is only half the requirement: the gateway
+    /// used to discard the cause as well, which left a 503 with no explanation
+    /// anywhere in the system. The detail must survive on the error even though
+    /// it never reaches the response body.
+    #[test]
+    fn scrubbed_errors_still_carry_the_upstream_cause() {
+        let upstream = "corrupt WAL segment 5 at byte 1234: Access is denied. (os error 5)";
+        let error = ApiError::from(ClientError::Server {
+            code: vyrn_protocol::ErrorCode::Storage,
+            message: upstream.into(),
+        });
+        let detail = error.upstream.as_deref().expect("upstream detail recorded");
+        assert!(detail.contains(upstream), "{detail}");
+        assert!(detail.contains("Storage"), "{detail}");
+        // And the client-facing half is still generic.
+        assert_eq!(error.message, "database storage error");
+
+        let error = ApiError::from(ClientError::Tls("peer sent a bad certificate".into()));
+        assert!(
+            error
+                .upstream
+                .as_deref()
+                .is_some_and(|detail| detail.contains("bad certificate")),
+            "{:?}",
+            error.upstream
+        );
+        assert_eq!(error.message, "database unavailable");
+    }
+
+    /// The upstream detail must travel on the response for the middleware to
+    /// find, and must never appear in the body an API client receives.
+    #[tokio::test]
+    async fn upstream_detail_reaches_the_middleware_but_not_the_client() {
+        use axum::body::to_bytes;
+
+        let upstream = "corrupt WAL segment 5 at byte 1234";
+        let response = ApiError::from(ClientError::Server {
+            code: vyrn_protocol::ErrorCode::Storage,
+            message: upstream.into(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let recorded = response
+            .extensions()
+            .get::<UpstreamDetail>()
+            .expect("detail attached for the logging middleware");
+        assert!(recorded.detail.contains(upstream));
+
+        let body = to_bytes(response.into_body(), JSON_LIMIT).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body.contains("WAL"),
+            "upstream text leaked to a client: {body}"
+        );
+        assert!(!body.contains("1234"), "{body}");
+        assert!(body.contains("database storage error"), "{body}");
+    }
+
+    /// A validation error is the client's own fault and carries no internals, so
+    /// it gets no upstream record — otherwise a scripted caller sending bad
+    /// input could fill the log at will.
+    #[test]
+    fn client_errors_attach_no_upstream_detail() {
+        let error = ApiError::from(ClientError::Server {
+            code: vyrn_protocol::ErrorCode::InvalidRequest,
+            message: "limit must be between 1 and 10000".into(),
+        });
+        assert!(error.upstream.is_none());
+        assert!(ApiError::bad_request("nope").upstream.is_none());
+    }
+
+    /// Readiness edges are logged, plateaus are not: a probe every few seconds
+    /// must not produce a record every few seconds.
+    #[test]
+    fn readiness_logging_only_fires_on_transitions() {
+        let flag = Arc::new(AtomicBool::new(true));
+        // Same value: nothing to report.
+        assert!(flag.swap(true, Ordering::Relaxed));
+        // Falling edge reports once, and the second failing probe does not.
+        assert!(flag.swap(false, Ordering::Relaxed));
+        assert!(!flag.swap(false, Ordering::Relaxed));
+        // Recovery is an edge again.
+        assert!(!flag.swap(true, Ordering::Relaxed));
+    }
+
+    /// The gateway's startup record includes the upstream URL, which carries the
+    /// database password in its userinfo. It has to go through redaction.
+    #[test]
+    fn the_upstream_url_is_redacted_before_it_can_be_logged() {
+        let url = insert_password("vyrn://gateway@db.internal:7432/app", "s3cr3t").unwrap();
+        assert!(
+            url.contains("s3cr3t"),
+            "fixture must hold a password: {url}"
+        );
+        let redacted = redact_url(&url);
+        assert!(!redacted.contains("s3cr3t"), "{redacted}");
+        assert!(redacted.contains("db.internal"), "{redacted}");
+        assert!(redacted.contains("gateway"), "{redacted}");
     }
 
     #[test]

@@ -1,0 +1,11 @@
+[package]
+name = "vyrn-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Deliberately empty. This is a leaf crate so that every Vyrn binary can log
+# without inheriting anything: the moment it grows a dependency, that dependency
+# is in the graph of the storage server, the gateway and the CLI at once.
+[dependencies]

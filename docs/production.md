@@ -80,9 +80,43 @@ Offline backups bound loss to the backup interval. Add continuous archiving to s
 
 **Windows caveat:** `sync_directory` is a no-op on non-Unix platforms, so archive-directory durability (the rename publishing a copied segment or the index) is not certified on Windows. Windows remains a development-only platform; run archiving in production on Linux ext4/XFS only.
 
+## Logs
+
+Every Vyrn binary writes structured single-line records to **stderr**. Each record is a timestamp, a level, a target, a message, and `key=value` fields:
+
+```text
+2026-08-22T19:40:49.722Z ERROR vyrn-http.request request failed upstream method=POST path=/v1/put status=503 detail="database reported Storage: corrupt WAL segment 5 at byte 1234"
+```
+
+The timestamp is RFC 3339 UTC with millisecond precision. Values containing a space, an `=`, or a quote are quoted, and control characters are escaped, so a record is always exactly one line and cannot be forged by client-supplied text. Each record is written in a single call, so concurrent writers cannot interleave halves of a line.
+
+Set `VYRN_LOG` to `off`, `error`, `warn`, `info` (the default), `debug`, or `trace`. An unrecognised value falls back to `info` rather than muting the log, so a typo in a deployment's environment cannot be the reason an incident has no diagnostics.
+
+What each level is for:
+
+- **error** — the process cannot do what it was asked and you must act: storage failures, a background worker that will not come back, a failed startup connection.
+- **warn** — something was refused or degraded and the process carried on: rejected credentials, a readiness loss, a failed probe.
+- **info** — lifecycle only: startup with the effective configuration, bind addresses, whether TLS is on, readiness transitions, drain and shutdown, and checkpoint/backup/recovery outcomes with durations. Safe to run in production; there is no per-request record at this level.
+- **debug** — per-request and per-connection detail for chasing a specific failure. Expect one or more records per request; do not leave this on for a busy deployment.
+
+Run at `info` in production. `debug` is what you raise to when you are investigating.
+
+Two properties are deliberate:
+
+- **Secrets are never logged.** No passwords, no bearer tokens, no Argon2 verifiers. Connection URLs are redacted before they reach a record (`vyrn://user:[REDACTED]@host:7432/app`) because a Vyrn URL carries the database password in its userinfo — and the startup record is the one most likely to be pasted into a ticket. A rejected bearer token is never recorded, not even truncated: a near-miss is still a live credential.
+- **The HTTP gateway scrubs for the client and logs in full.** API clients get `database storage error` with no internals, while the log keeps the upstream cause together with the method and route it failed on. A 503 from the gateway is always attributable to something in the log.
+
+Logs complement the metrics on the admin listener; they do not replace them. Alert on the metrics, then read the logs to find out why. Note that `vyrn_checkpoints_total` counts checkpoints *scheduled* by the write pipeline, not completed by the maintenance task.
+
+**Coverage is currently uneven, and this is the honest state of it.** The `vyrn-http` gateway and the `vyrn` CLI emit the format above throughout. The `vyrnd` server does not yet: its diagnostics are still unlevelled, untimestamped plain lines, and several conditions an operator would want are not reported at all — a storage error answered to a client, a rejected authentication, a maintenance task that stopped, a drain that hit its timeout. Until that conversion lands, treat `vyrnd`'s own output as human-readable text rather than something to filter or ship, and rely on the admin listener's metrics plus readiness for `vyrnd` alerting. The failure-handling procedure below is written against readiness and metrics for exactly this reason.
+
+There is no log rotation and no file sink. Vyrn writes to stderr and expects the supervisor to handle the stream — systemd's journal, Docker's logging driver (`docker-compose.yml` configures rotation), or a collector of your choosing.
+
 ## Failure handling
 
-If readiness becomes false or a storage error is logged:
+The trigger is `/health/ready` returning 503, since `vyrnd` sets readiness false on every storage failure that poisons the engine. Do not wait for a logged storage error: `vyrnd` does not yet log those (see the coverage note above), so readiness and the admin listener's metrics are the signals that actually fire. The gateway does log its upstream cause, so a `database_storage_error` in the gateway's log names what the database reported.
+
+When readiness becomes false:
 
 1. Stop routing traffic.
 2. Stop the process; do not repeatedly retry writes against a poisoned engine.
@@ -94,6 +128,44 @@ If readiness becomes false or a storage error is logged:
    `not found` for an acknowledged write after a crash until the next commit.
 6. If corruption prevents startup, restore the latest verified backup.
 7. Do not delete or edit WAL/page files manually.
+
+## Known limitations
+
+These are reviewed, understood, and deliberately not fixed in `0.1.0-dev`. Each one can affect a production deployment, so plan around them rather than discovering them during an incident.
+
+### One shared credential, and no audit trail
+
+The server authenticates a single username and password against one Argon2id verifier. There are no per-principal accounts, no per-key or per-collection authorization, no revocation short of rotating the one credential and restarting, and no record of which client did what — the log records that authentication failed and from which address, never who succeeded at what.
+
+Consequences to plan for: every application sharing a database shares one identity, so a leak anywhere is a leak everywhere and rotation is a coordinated restart of every client. Repeated authentication failures from one address are rate-limited (`vyrn_auth_failures_total`, plus a lockout), but the gateway's own bearer token has no equivalent throttle. Treat network reachability as the real access control: keep port 7432 on application networks only and the admin listener on loopback or a private monitoring network.
+
+### Windows directory durability is unproven
+
+`sync_directory` is a no-op on non-Unix platforms. On Windows, the directory entry created by a rename — publishing a checkpoint manifest, a copied WAL segment, or an archive index — is not forced to disk, so a power loss can leave a file whose contents are durable but whose name is not. Vyrn's recovery is built to survive a missing rename, but that path is not certified on Windows.
+
+Windows is a development platform only. Run production on Linux ext4/XFS.
+
+### A WAL record header carries no checksum of its own
+
+Record payloads are CRC32-checked, but the header holding `payload_len` is not. A single flipped bit in that field makes the record decode at the wrong length: the record and **everything after it in that segment** are silently discarded as an incomplete tail. Recovery reports success and the database comes up short of acknowledged writes without ever reporting an error.
+
+This needs a storage-format version bump to fix, so it is deferred. It is why the runbook's failure-handling procedure has you read back a key known to have been acknowledged shortly before the failure (step 5) instead of trusting a clean startup, and why verified off-host backups plus WAL archiving matter more than they would otherwise: a base backup plus an archive gives you a second copy of the history. `crates/vyrn-core/tests/corruption.rs` documents the behaviour.
+
+### B-tree deletes never rebalance
+
+Deleting keys frees space inside pages but never merges underfull pages back together. A delete-heavy or delete-then-reinsert workload therefore grows the page file monotonically and inflates tree height, which shows up as slower point reads as depth increases. Space and depth are only reclaimed by checkpoint compaction, which writes a fresh generation.
+
+Plan for it: size disk for the high-water mark of live data plus churn, not for the current live set, and do not leave `VYRN_CHECKPOINT_WRITES` raised high enough to suppress compaction — a soak run at this repository's own expense grew a data directory to 41 GB that way. Watch data-directory size against the key count you expect.
+
+### Integers above 2^53 lose precision in the TypeScript SDK
+
+The TypeScript SDK decodes document JSON with `JSON.parse`, so every number becomes an IEEE-754 double. An integer written by a Rust client above 2^53 comes back rounded, silently and without error — and a document read, modified, and written back through the SDK persists the rounded value, corrupting data that was previously correct.
+
+Affected values include 64-bit ids, nanosecond timestamps, and monetary amounts in minor units past ~9 quadrillion. Until the protocol carries a decimal or BigInt type, store such values as strings if any TypeScript client touches them. Rust clients are unaffected. The Rust and TypeScript SDKs also disagree on an over-limit scan `limit`: the Rust client clamps silently, the TypeScript SDK throws.
+
+### No automatic failover
+
+Replication is synchronous and acknowledges a commit only once N replicas hold it durably, but there is no automatic failover, leader election, or fencing. Promotion is a manual, documented procedure — see `docs/replication.md`. A primary failure is downtime until an operator acts.
 
 ## Upgrade policy
 

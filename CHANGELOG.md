@@ -35,6 +35,41 @@ test. Highlights:
   transactions roll back on session release (Rust + TypeScript); the gateway
   retries once when the database closed an idle pooled connection.
 
+### Added
+
+- **Structured logging.** Every binary writes single-line records to stderr with
+  an RFC 3339 UTC timestamp, a level, a target, and `key=value` fields, so logs
+  can be filtered, correlated, and shipped. `VYRN_LOG` selects the level
+  (`off`/`error`/`warn`/`info`/`debug`/`trace`, default `info`); an unrecognised
+  value falls back to `info` rather than muting the log. No dependency was
+  added — the facility is ~250 lines in `vyrn-client`, the one crate every
+  binary already links.
+- Secrets never reach a record: connection URLs are redacted before logging
+  (a `vyrn://` URL carries the password in its userinfo), and a rejected bearer
+  token is not logged even in part. Field values are escaped and quoted, so
+  client-supplied text cannot forge a second record.
+- **gateway**: a scrubbed 500/503 is now attributable. Clients still receive a
+  generic error, while the log keeps the upstream cause together with the
+  request method and route; previously the detail was discarded and the failure
+  was undiagnosable. Readiness transitions, drain, and startup with the
+  effective configuration are logged; readiness edges only, not every probe.
+- **cli**: backup, restore, verify, export/import, WAL prune, and point-in-time
+  recovery report their outcome with a duration, and archive size where a file
+  can be measured. A recovery failure is recorded before the runbook has the
+  operator delete the target directory.
+
+### Known limitations
+
+- `docs/production.md` now states the limitations an operator can hit: the
+  single shared credential and absent audit trail, unproven Windows
+  directory-entry durability (`sync_directory` is a no-op off Unix), the
+  unchecksummed WAL record header (a flipped `payload_len` bit silently
+  discards the rest of a segment), monotonic space growth from non-rebalancing
+  B-tree deletes, `>2^53` integer precision loss in the TypeScript SDK, and the
+  absence of automatic failover.
+- `vyrnd` itself is not yet converted to the structured format; the runbook says
+  so plainly rather than promising coverage that does not exist.
+
 ### Changed
 
 - Release builds enable overflow checks, thin LTO, and one codegen unit.

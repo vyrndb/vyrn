@@ -43,6 +43,12 @@ p50 column: a mean on a host that intermittently stalls a flush tells you about 
 stall, not the path. `vyrn_commit_*` on the metrics endpoint exposes the same
 counters for a running server, quantiles over the process lifetime.
 
+## Keep the log out of the measurement
+
+Benchmark at the default `VYRN_LOG=info`, or with `VYRN_LOG=off`. Do not benchmark at `debug`: that level emits a record per request, which puts a synchronous stderr write on the request path and measures your terminal or log collector rather than the database.
+
+`info` is safe to measure at because nothing on a request path formats anything there. Every record is guarded by a level test that runs before its message and field expressions are evaluated, so a disabled record costs one relaxed atomic load and no allocation. If a comparison between two builds shows an unexplained gap, confirm both runs used the same `VYRN_LOG` before looking anywhere else.
+
 ## Comparing two builds on a noisy host
 
 `scripts/compare-builds-linux.sh` alternates two sets of binaries within one

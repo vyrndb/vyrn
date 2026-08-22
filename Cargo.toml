@@ -3,6 +3,7 @@ members = [
     "crates/vyrn-client",
     "crates/vyrn-cli",
     "crates/vyrn-core",
+    "crates/vyrn-log",
     "crates/vyrn-protocol",
     "crates/vyrn-server",
     "crates/vyrn-http",

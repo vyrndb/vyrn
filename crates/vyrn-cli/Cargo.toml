@@ -16,3 +16,4 @@ tokio-postgres = "0.7"
 url.workspace = true
 vyrn-client = { path = "../vyrn-client" }
 vyrn-core = { path = "../vyrn-core" }
+vyrn-log = { path = "../vyrn-log" }

@@ -17,3 +17,4 @@ tokio.workspace = true
 url.workspace = true
 vyrn-client = { path = "../vyrn-client" }
 vyrn-protocol = { path = "../vyrn-protocol" }
+vyrn-log = { path = "../vyrn-log" }
