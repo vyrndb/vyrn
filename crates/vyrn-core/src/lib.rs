@@ -3,7 +3,9 @@ pub mod change_log;
 pub mod document;
 mod mvcc;
 mod page_tree;
+pub mod portable;
 pub mod recover;
+pub mod replication;
 mod value_log;
 mod wal;
 pub mod wal_archive;
@@ -156,6 +158,25 @@ pub enum Error {
     AlreadyOpen,
     #[error("database uses an unsupported earlier development format")]
     LegacyFormat,
+    /// An on-disk structure carried a format version this build does not speak.
+    ///
+    /// Distinct from the corruption errors on purpose. A version mismatch means
+    /// intact data written by a different build; reporting it as corruption
+    /// invites an operator to discard or "repair" a healthy database. Storage
+    /// formats may change until 1.0, so this is the expected outcome of moving a
+    /// data directory across versions, and the way across is a logical export
+    /// taken with the build that wrote it.
+    #[error(
+        "{structure} was written in format version {found}, but this build speaks version \
+         {expected}. The data is not damaged. Export it with the Vyrn version that wrote it \
+         (`vyrn export --data <dir> --output dump.vyrnl`) and load it into a fresh directory \
+         with this version (`vyrn import dump.vyrnl --target <dir>`)."
+    )]
+    FormatVersion {
+        structure: &'static str,
+        found: u8,
+        expected: u8,
+    },
     #[error("storage is poisoned after a failed commit; reopen to recover")]
     Poisoned,
     #[error("corrupt WAL segment {segment} at byte {offset}: {reason}")]
@@ -164,6 +185,15 @@ pub enum Error {
         offset: u64,
         reason: String,
     },
+    /// A record arriving from a primary failed validation before it was appended.
+    ///
+    /// Its own variant rather than [`Error::CorruptWal`] because nothing is wrong
+    /// with this node's storage: the bytes never reached a segment, so a segment
+    /// id and byte offset would be fabricated. An operator reading
+    /// "corrupt WAL segment 0" would go looking for local damage that does not
+    /// exist, when the fault is in the stream or in the peer.
+    #[error("invalid replicated record: {reason}")]
+    InvalidReplicatedRecord { reason: String },
     #[error("corrupt page {page_id}: {reason}")]
     CorruptPage { page_id: u64, reason: String },
     #[error("corrupt value log at byte {offset}: {reason}")]
@@ -226,6 +256,38 @@ pub struct EngineOptions {
     /// `None` disables the retention barrier entirely: checkpoints delete
     /// sealed segments exactly as they did before archiving existed.
     pub archived_through: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Observes every WAL record as it is appended, for replication.
+    ///
+    /// `None` — the default — leaves the commit path exactly as it was before
+    /// replication existed: no extra clone, no extra call, nothing to fail.
+    pub record_sink: Option<Arc<dyn RecordSink>>,
+}
+
+/// Receives WAL records as the engine appends them.
+///
+/// The bytes handed over are the record itself, already framed and checksummed
+/// by [`encode_record`] — the same bytes recovery reads back. A replica can
+/// therefore append them verbatim, and there is no second encoding of a mutation
+/// that could drift from the first.
+///
+/// CALLED WITH THE ENGINE'S WRITE LOCK HELD, so an implementation must not block:
+/// hand the bytes to a queue and return. Blocking here stalls every writer.
+///
+/// A record reaching the sink is NOT yet durable, locally or anywhere else. The
+/// engine calls this at append time; the caller is responsible for pairing it
+/// with [`Wal::sync_through`] before treating the LSN as committed.
+/// `Debug` is a supertrait so `EngineOptions` can keep its `derive(Debug)`. An
+/// implementation should print its identity, never buffered record contents:
+/// those are user data.
+pub trait RecordSink: Send + Sync + std::fmt::Debug {
+    /// Offers `record` at `lsn`.
+    ///
+    /// Infallible on purpose. A replication transport that has fallen over must
+    /// not be able to fail a local commit — the primary's own durability does not
+    /// depend on it, and turning a transport error into a write error here would
+    /// make replication strictly worse than not having it. Report the failure out
+    /// of band (metrics, readiness) and let the quorum wait decide.
+    fn record(&self, lsn: u64, record: &[u8]);
 }
 
 impl Default for EngineOptions {
@@ -234,6 +296,7 @@ impl Default for EngineOptions {
             segment_size: DEFAULT_SEGMENT_SIZE,
             durability: DurabilityMode::Durable,
             archived_through: None,
+            record_sink: None,
         }
     }
 }
@@ -437,6 +500,8 @@ pub struct Engine {
     /// above this survive checkpoints because they are the only copy of their
     /// LSN range once the pages behind them are checkpointed.
     archived_through: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Replication tap, `None` when replication is off.
+    record_sink: Option<Arc<dyn RecordSink>>,
 }
 
 impl Engine {
@@ -581,6 +646,7 @@ impl Engine {
             shared_snapshots: std::sync::Mutex::new(BTreeMap::new()),
             wal_len,
             archived_through: options.archived_through,
+            record_sink: options.record_sink,
         })
     }
 
@@ -930,6 +996,30 @@ impl Engine {
         operations.push(BatchOperation::Delete(index_definition_key(name)));
         self.write_batch_internal(operations)?;
         self.indexes.remove(name);
+        Ok(())
+    }
+
+    /// Deletes every entry of an index while keeping its definition.
+    ///
+    /// Unlike [`Engine::drop_index`], the index still exists afterwards and is
+    /// simply empty, which is what a rebuild needs: the definition has to stay so
+    /// writes keep maintaining it, and the stale entries have to go so a rebuild
+    /// cannot leave behind ones pointing at values a document no longer holds.
+    pub(crate) fn clear_index_entries(&mut self, name: &[u8]) -> Result<()> {
+        if !self.indexes.contains_key(name) {
+            return Err(Error::IndexNotFound);
+        }
+        let start = index_entry_prefix(name);
+        let end = prefix_end(&start);
+        let operations: Vec<_> = self
+            .tree
+            .scan(Some(&start), end.as_deref(), usize::MAX)?
+            .into_iter()
+            .map(|(key, _)| BatchOperation::Delete(key))
+            .collect();
+        if !operations.is_empty() {
+            self.write_batch_internal(operations)?;
+        }
         Ok(())
     }
 
@@ -1425,18 +1515,33 @@ impl Engine {
             .last_lsn
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
-        let entries: Vec<(&[u8], Option<&[u8]>)> = operations
-            .iter()
-            .filter_map(|operation| match operation {
-                BatchOperation::Put(key, value) if is_published_key(key) => {
-                    Some((key.as_slice(), Some(value.as_slice())))
+        // A delete of a key that is not there mutates nothing: `apply_batch` drops
+        // it and reports `existed: false`. Publishing it anyway would tell every
+        // subscriber a key was deleted that never existed, so presence is checked
+        // here too. A later operation in the same batch may have created the key,
+        // so the scan below tracks the batch's own effect rather than only disk.
+        let mut live: BTreeMap<&[u8], bool> = BTreeMap::new();
+        let mut entries: Vec<(&[u8], Option<&[u8]>)> = Vec::new();
+        for operation in &operations {
+            match operation {
+                BatchOperation::Put(key, value) => {
+                    if is_published_key(key) {
+                        entries.push((key.as_slice(), Some(value.as_slice())));
+                    }
+                    live.insert(key.as_slice(), true);
                 }
-                BatchOperation::Delete(key) if is_published_key(key) => {
-                    Some((key.as_slice(), None))
+                BatchOperation::Delete(key) => {
+                    let present = match live.get(key.as_slice()) {
+                        Some(present) => *present,
+                        None => self.tree.get(key)?.is_some(),
+                    };
+                    if present && is_published_key(key) {
+                        entries.push((key.as_slice(), None));
+                    }
+                    live.insert(key.as_slice(), false);
                 }
-                _ => None,
-            })
-            .collect();
+            }
+        }
         if entries.is_empty() {
             self.last_published = Vec::new();
             return Ok(operations);
@@ -1492,7 +1597,12 @@ impl Engine {
         let start = change_log_key(cursor.sequence);
         let end = prefix_end(CHANGE_LOG_PREFIX);
         let mut records = Vec::new();
-        for (key, value) in self.tree.scan(Some(&start), end.as_deref(), limit + 1)? {
+        // One commit past the limit, because the cursor's own commit may contribute
+        // no records once its delivered mutations are filtered out. Saturating:
+        // `usize::MAX` is a legitimate "give me everything" limit, and adding to
+        // it panicked in debug and silently scanned nothing in release.
+        let scan_limit = limit.saturating_add(1);
+        for (key, value) in self.tree.scan(Some(&start), end.as_deref(), scan_limit)? {
             let sequence = change_log_sequence(&key)?;
             for record in change_log::decode_batch(sequence, &value)? {
                 if cursor != change_log::Cursor::start() && record.cursor() <= cursor {
@@ -1778,6 +1888,126 @@ impl Engine {
         )
     }
 
+    /// The highest LSN this engine has appended.
+    ///
+    /// A field read rather than [`Engine::stats`], which walks the WAL directory
+    /// to count segments. A replica handshake only needs the LSN, and doing
+    /// directory I/O on the connection-accept path would make the cost of
+    /// accepting a replica depend on how many segments are retained.
+    pub fn last_lsn(&self) -> u64 {
+        self.last_lsn
+    }
+
+    /// Applies a WAL record received from a primary, preserving its LSN.
+    ///
+    /// Returns the LSN that must be passed to [`Wal::sync_through`] before the
+    /// record may be acknowledged to the primary. **Acknowledging before that
+    /// call returns would make the primary's promise to its client false**, which
+    /// is the one mistake this whole feature exists to avoid.
+    ///
+    /// WHY THIS IS NOT `write_batch`. A normal write allocates the next local LSN;
+    /// a replica must adopt the LSN the primary assigned, or the two logs diverge
+    /// immediately and neither `check_contiguous` nor a later promotion can line
+    /// them up. So this takes the record's own LSN and asserts continuity rather
+    /// than generating one.
+    ///
+    /// The record must already have been checked by
+    /// [`replication::verify_record`], which is what guarantees the framing, the
+    /// CRC and the payload structure. This method re-reads the header fields it
+    /// needs but does not re-validate them.
+    pub fn apply_replicated_record(&mut self, record: &[u8]) -> Result<u64> {
+        self.ensure_healthy()?;
+
+        let lsn = read_u64(record, 5);
+        let operation_count = read_u32(record, 13) as usize;
+        let payload_len = read_u32(record, 17) as usize;
+
+        // Continuity is enforced here as well as in the caller: this is the last
+        // point before bytes reach the log, and a gap would produce a WAL whose
+        // own recovery rejects it (replay checks that a segment's first record
+        // matches its header, and that segments are contiguous).
+        let expected = self.last_lsn.saturating_add(1);
+        if lsn != expected {
+            return Err(Error::InvalidReplicatedRecord {
+                reason: format!(
+                    "record LSN {lsn} does not follow this replica's last LSN {}; \
+                     expected {expected}",
+                    self.last_lsn
+                ),
+            });
+        }
+
+        let payload = &record[RECORD_HEADER_LEN..RECORD_HEADER_LEN + payload_len];
+        let operations = decode_operations(payload, operation_count);
+
+        // Rotate on the same size trigger a primary uses, so a replica's segment
+        // boundaries track its own configuration rather than the primary's. The
+        // records themselves are identical either way; only the file they land in
+        // differs, and recovery does not care which segment a record is in as
+        // long as the headers stay contiguous.
+        let current_len = self.wal_len;
+        if current_len > SEGMENT_HEADER_LEN as u64
+            && current_len + record.len() as u64 > self.segment_size
+        {
+            self.rotate_segment()?;
+        }
+
+        // The record is written verbatim — NOT re-encoded from the decoded
+        // operations. Re-encoding would produce equivalent bytes today and would
+        // silently stop doing so the moment the encoder changed, leaving the two
+        // logs byte-different for the same LSN. Shipping and storing the identical
+        // bytes is what makes a replica's WAL interchangeable with its primary's.
+        self.wal_len += record.len() as u64;
+        self.wal.append(record, lsn)?;
+
+        /* Applied with EXACTLY the redo path's rules, including the tombstone
+         * bookkeeping — see the long comment above the redo loop in
+         * `rebuild_tree`. Tombstones are what carry a deleted key's revision, and
+         * they cannot be derived later: a max-size key's tombstone would exceed
+         * MAX_KEY_SIZE and fail validation. Getting this subtly wrong would give
+         * the replica a tree that answers `revision()` differently from its
+         * primary for every deleted key, which is precisely the kind of drift
+         * that stays invisible until a promotion.
+         *
+         * `prepare_*` then `publish` rather than a single mutate call: the tree is
+         * copy-on-write, so a mutation produces a new root that must be published
+         * to become visible.
+         */
+        for (op, key, value) in operations {
+            if op == OP_PUT {
+                let value = value.unwrap_or_default();
+                let (root, len) = self.tree.prepare_put(&key, &value, lsn)?;
+                self.tree.publish(root, len);
+                // A put clears any tombstone an earlier delete left, so the key's
+                // revision comes from the live entry again.
+                if !key.starts_with(INTERNAL_PREFIX) {
+                    if let Some((root, len)) = self.tree.prepare_delete(&tombstone_key(&key))? {
+                        self.tree.publish(root, len);
+                    }
+                }
+            } else if op == OP_DELETE {
+                if let Some((root, len)) = self.tree.prepare_delete(&key)? {
+                    self.tree.publish(root, len);
+                    // A delete of an existing user key records its revision on a
+                    // tombstone at the deleting record's LSN.
+                    if !key.starts_with(INTERNAL_PREFIX) {
+                        let (root, len) = self.tree.prepare_put(&tombstone_key(&key), &[], lsn)?;
+                        self.tree.publish(root, len);
+                    }
+                }
+            } else {
+                return Err(Error::InvalidReplicatedRecord {
+                    reason: format!("unknown operation code {op}"),
+                });
+            }
+        }
+
+        self.last_lsn = lsn;
+        // Excludes internal keys and tombstones, matching what a primary reports.
+        self.user_len = self.tree.count_excluding_prefix(INTERNAL_PREFIX)?;
+        Ok(lsn)
+    }
+
     pub fn len(&self) -> usize {
         self.user_len
     }
@@ -1820,6 +2050,24 @@ impl Engine {
             && current_len + record.len() as u64 > self.segment_size
         {
             self.rotate_segment()?;
+        }
+        // Offered BEFORE the local append, and to both durability modes.
+        //
+        // Before, because the two are independent: the replica's copy and the
+        // primary's copy each become durable on their own storage, and whichever
+        // finishes second is the one the acknowledgement waits for. Offering
+        // first lets the network round trip overlap the local `fdatasync`
+        // instead of starting after it.
+        //
+        // Both modes, because a replica must receive every record the primary
+        // logged regardless of when the primary chooses to flush. Async
+        // durability is a statement about the primary's own barrier, not about
+        // what it replicates.
+        //
+        // Borrowed rather than moved, so the async branch below can still take
+        // ownership of `record` without a clone.
+        if let Some(sink) = &self.record_sink {
+            sink.record(lsn, &record);
         }
         if self.durability == DurabilityMode::Durable {
             // Only the WAL is written here. Pages and historical values are left
@@ -2040,8 +2288,17 @@ fn replay_segment(
     }
     let mut header = [0; SEGMENT_HEADER_LEN];
     file.read_exact(&mut header)?;
+    // Checked before the rest of the header: a segment written by another build
+    // is intact data this build cannot read, which is a different situation from
+    // damage and must not be reported as corruption.
+    if &header[0..4] == SEGMENT_MAGIC && header[4] != VERSION {
+        return Err(Error::FormatVersion {
+            structure: "WAL segment",
+            found: header[4],
+            expected: VERSION,
+        });
+    }
     if &header[0..4] != SEGMENT_MAGIC
-        || header[4] != VERSION
         || read_u64(&header, 8) != segment_id
         || checksum(&header[0..24]) != read_u32(&header, 24)
     {
@@ -2217,8 +2474,17 @@ pub(crate) fn scan_to_lsn(path: &Path, segment_id: u64, bound: u64) -> Result<Op
     }
     let mut header = [0; SEGMENT_HEADER_LEN];
     file.read_exact(&mut header)?;
+    // Checked before the rest of the header: a segment written by another build
+    // is intact data this build cannot read, which is a different situation from
+    // damage and must not be reported as corruption.
+    if &header[0..4] == SEGMENT_MAGIC && header[4] != VERSION {
+        return Err(Error::FormatVersion {
+            structure: "WAL segment",
+            found: header[4],
+            expected: VERSION,
+        });
+    }
     if &header[0..4] != SEGMENT_MAGIC
-        || header[4] != VERSION
         || read_u64(&header, 8) != segment_id
         || checksum(&header[0..24]) != read_u32(&header, 24)
     {
@@ -2409,9 +2675,15 @@ fn read_manifest(path: &Path) -> Result<Option<TreeState>> {
         return Ok(None);
     }
     let bytes = fs::read(manifest_path)?;
+    if bytes.len() == MANIFEST_LEN && &bytes[0..4] == MANIFEST_MAGIC && bytes[4] != VERSION {
+        return Err(Error::FormatVersion {
+            structure: "checkpoint manifest",
+            found: bytes[4],
+            expected: VERSION,
+        });
+    }
     if bytes.len() != MANIFEST_LEN
         || &bytes[0..4] != MANIFEST_MAGIC
-        || bytes[4] != VERSION
         || checksum(&bytes[0..40]) != read_u32(&bytes, 40)
     {
         return Err(Error::LegacyFormat);

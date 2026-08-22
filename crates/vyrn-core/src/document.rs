@@ -347,6 +347,66 @@ fn all_documents(engine: &Engine, collection: &str, limit: usize) -> Result<Vec<
         .collect()
 }
 
+/// Rebuilds every declared index for `collection` from the documents on disk.
+///
+/// Index entries are derived state, and two paths produce documents without
+/// them: a logical import, which carries only keys and values, and a collection
+/// whose definitions were declared after the fact. Without a rebuild those
+/// documents are readable by ID and invisible to `find`, which is a silent wrong
+/// answer rather than an error.
+///
+/// Existing entries for the collection are dropped first, so this repairs a
+/// stale index as well as building a missing one, and calling it twice is the
+/// same as calling it once.
+pub fn rebuild_indexes(engine: &mut Engine, collection: &str) -> Result<u64> {
+    let definitions = stored_indexes(engine, collection)?;
+    if definitions.is_empty() {
+        return Ok(0);
+    }
+
+    // Clear first: a rebuild that only adds entries would leave behind ones
+    // pointing at documents that no longer hold that value.
+    for field in definitions.keys() {
+        let name = index_name(collection, field)?;
+        engine.clear_index_entries(&name)?;
+    }
+
+    let prefix = collection_prefix(collection)?;
+    let end = prefix_end(&prefix);
+    let mut rebuilt = 0;
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let batch =
+            engine.scan_internal(cursor.as_deref().or(Some(&prefix)), end.as_deref(), 1_024)?;
+        // The scan's start bound is inclusive, so the resume key repeats at the
+        // head of each page; a page holding only that key means the scan is done.
+        let fresh: Vec<_> = batch
+            .into_iter()
+            .filter(|(key, _)| cursor.as_deref() != Some(key.as_slice()))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        cursor = fresh.last().map(|(key, _)| key.clone());
+
+        let mut updates = Vec::new();
+        for (key, value) in &fresh {
+            let object = decode_object(value)?;
+            for field in definitions.keys() {
+                updates.push(IndexUpdate {
+                    index: index_name(collection, field)?,
+                    primary_key: key.clone(),
+                    old_value: None,
+                    new_value: object.get(field).map(encode_index_value).transpose()?,
+                });
+            }
+            rebuilt += 1;
+        }
+        engine.write_indexed_internal(Vec::new(), updates)?;
+    }
+    Ok(rebuilt)
+}
+
 fn validate_segment(kind: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(invalid_document(format!("{kind} cannot be empty")));

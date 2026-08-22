@@ -1,6 +1,6 @@
 # Vyrn
 
-Vyrn is a correctness-first database built in Rust from its storage format upward. `0.1.0-dev` is a single-node byte key/value database with Vyrn-owned storage, a native `vyrn://` protocol, TLS 1.3, Argon2id authentication, segmented transaction-WAL recovery, and an online persistent B+ tree.
+Vyrn is a correctness-first database built in Rust from its storage format upward. `0.1.0-dev` is a byte key/value database with Vyrn-owned storage, a native `vyrn://` protocol, TLS 1.3, Argon2id authentication, segmented transaction-WAL recovery, an online persistent B+ tree, and optional synchronous replication.
 
 > **Maturity:** development preview. The core features now exist and are tested, but production certification still requires sustained Linux crash loops, fuzzing, performance characterization, backups, monitoring, and external review.
 
@@ -31,6 +31,7 @@ Vyrn is a correctness-first database built in Rust from its storage format upwar
 - Native Linux/Windows CI, Linux durability smoke, dependency audit, and a production runbook
 - Non-root, read-only-root Docker deployment
 - Authenticated HTTP/SSE gateway and dependency-free TypeScript SDK for Node.js and modern browsers
+- Optional synchronous replication: a commit is acknowledged only once N replicas hold it durably, so losing a node cannot lose an acknowledged write. Off by default; promotion is manual. See `docs/replication.md`
 
 ## Create credentials
 
@@ -324,4 +325,4 @@ cargo bench -p vyrn-core --bench storage
 
 The operational checklist and failure/upgrade procedures are in [`docs/production.md`](docs/production.md).
 
-The supported production-candidate target is Linux x86-64 on local persistent ext4/XFS storage. It remains single-node and has no automatic failover. Windows is a development platform until equivalent durability behavior is certified.
+The supported production-candidate target is Linux x86-64 on local persistent ext4/XFS storage. Synchronous replication is available (see `docs/replication.md`), so an acknowledged write can survive losing a node — but promotion is a manual operator action: there is no automatic failover and no fencing. Windows is a development platform until equivalent durability behavior is certified.

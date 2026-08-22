@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 56f98aaf43e0a4eacc8a7418cacceb8eb73aed6365c04d67c1d68eecd7e02140 # shrinks to ops = [Delete([0]), Put([0], []), Put([0], []), Put([0], [63, 210, 65, 166, 140, 105, 151, 49, 58, 205, 99, 145, 52, 248, 187, 160, 218, 235, 28])], checkpoint_selector = Index(4988069400069885091), bound_selector = Index(11857959956869967216)

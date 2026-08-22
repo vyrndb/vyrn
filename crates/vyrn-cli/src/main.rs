@@ -53,6 +53,27 @@ enum Command {
     VerifyArchive {
         archive: PathBuf,
     },
+    /// Write a logical dump that does not depend on the on-disk format.
+    ///
+    /// Take this with the build that wrote the database. Unlike a backup, which
+    /// copies pages and can only be restored by a build speaking the same storage
+    /// format, a dump carries only keys and values and so survives format changes.
+    Export {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Load a logical dump into a fresh data directory.
+    ///
+    /// Refuses a directory that already holds data, so an import cannot merge
+    /// into an existing database by accident. Secondary indexes are not carried
+    /// by a dump and must be recreated afterwards.
+    Import {
+        dump: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+    },
     WalPrune {
         #[arg(long)]
         data: PathBuf,
@@ -115,6 +136,40 @@ async fn main() -> Result<()> {
         Command::Restore { archive, target } => {
             vyrn_core::backup::restore_backup(archive, &target)?;
             println!("restored {}", target.display());
+            return Ok(());
+        }
+        Command::Export { data, output } => {
+            let engine = vyrn_core::Engine::open(&data)?;
+            let pairs = vyrn_core::portable::export(&engine, &output)?;
+            println!("exported {pairs} pairs to {}", output.display());
+            return Ok(());
+        }
+        Command::Import { dump, target } => {
+            // A fresh directory only. Importing into a populated database would
+            // silently merge two datasets, and the caller asked to migrate one.
+            if target.exists()
+                && std::fs::read_dir(&target)
+                    .with_context(|| format!("failed to read {}", target.display()))?
+                    .next()
+                    .is_some()
+            {
+                anyhow::bail!(
+                    "{} is not empty; import requires a fresh directory",
+                    target.display()
+                );
+            }
+            std::fs::create_dir_all(&target)
+                .with_context(|| format!("failed to create {}", target.display()))?;
+            let mut engine = vyrn_core::Engine::open(&target)?;
+            let pairs = vyrn_core::portable::import(&mut engine, &dump)?;
+            println!("imported {pairs} pairs into {}", target.display());
+            // Documents arrive without the index entries derived from them, so
+            // `find` returns nothing for them until they are rebuilt. That is a
+            // wrong answer rather than an error, so it is worth spelling out.
+            println!(
+                "a dump carries no derived state: declare each collection's indexes, then call \
+                 document::rebuild_indexes for it, or indexed lookups will find nothing"
+            );
             return Ok(());
         }
         Command::Recover {
@@ -208,7 +263,9 @@ async fn main() -> Result<()> {
         | Command::Restore { .. }
         | Command::Recover { .. }
         | Command::VerifyArchive { .. }
-        | Command::WalPrune { .. } => {
+        | Command::WalPrune { .. }
+        | Command::Export { .. }
+        | Command::Import { .. } => {
             unreachable!("offline commands return before connecting")
         }
     }

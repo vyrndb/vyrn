@@ -1,3 +1,6 @@
+mod replica;
+mod replication;
+
 use anyhow::{bail, Context, Result};
 use argon2::{password_hash::PasswordHashString, Argon2, PasswordVerifier};
 use clap::Parser;
@@ -98,6 +101,48 @@ struct Args {
     wal_archive_dir: Option<PathBuf>,
     #[arg(long, env = "VYRN_WAL_ARCHIVE_INTERVAL_MS", default_value_t = 5_000)]
     wal_archive_interval_ms: u64,
+    /// Replica acknowledgements required before a commit is answered.
+    ///
+    /// 0 (the default) disables replication and leaves the single-node write path
+    /// exactly as it was. 1 or more makes writes synchronous: a commit is
+    /// acknowledged only once that many replicas hold it durably, so losing this
+    /// node cannot lose an acknowledged write.
+    ///
+    /// This is a REQUIREMENT, not a target. Setting it above the number of
+    /// replicas actually running makes every write block until the timeout.
+    #[arg(long, env = "VYRN_REPLICATION_MIN_ACKS", default_value_t = 0)]
+    replication_min_acks: usize,
+    /// How long a commit waits for replica acknowledgements before failing.
+    ///
+    /// Bounded on purpose: an unbounded wait turns one unreachable replica into a
+    /// hung database. On timeout the write fails with an error saying it is
+    /// durable locally but not replicated, which is the honest outcome — the
+    /// alternative, acknowledging it anyway, silently voids the guarantee the
+    /// operator asked for.
+    #[arg(long, env = "VYRN_REPLICATION_ACK_TIMEOUT_MS", default_value_t = 5_000)]
+    replication_ack_timeout_ms: u64,
+    /// Run as a replica of this primary, e.g. `vyrn://repl@primary:7432/default`.
+    ///
+    /// One binary serves both roles deliberately: promotion then needs no
+    /// different image, only a restart without this flag.
+    ///
+    /// A replica still serves reads on `--bind`, but writes from clients are
+    /// refused — its log must contain only what the primary sent, or the two
+    /// histories diverge and it can never be promoted.
+    #[arg(long, env = "VYRN_REPLICA_OF")]
+    replica_of: Option<String>,
+    /// File holding the password used to authenticate to the primary.
+    ///
+    /// A file rather than a flag so the secret does not appear in `ps` output or
+    /// shell history.
+    #[arg(long, env = "VYRN_REPLICA_PASSWORD_FILE", requires = "replica_of")]
+    replica_password_file: Option<PathBuf>,
+    /// CA certificate used to verify the primary's TLS certificate.
+    #[arg(long, env = "VYRN_REPLICA_CA_FILE", requires = "replica_of")]
+    replica_ca_file: Option<PathBuf>,
+    /// Name for this replica in the primary's logs and metrics.
+    #[arg(long, env = "VYRN_REPLICA_ID", requires = "replica_of")]
+    replica_id: Option<String>,
 }
 
 struct Metrics {
@@ -462,6 +507,11 @@ struct FlushWorkerConfig {
     /// barrier actually in flight rather than against a fixed timer.
     in_flight: Arc<AtomicU64>,
     flush_completed: watch::Sender<u64>,
+    /// Replica acknowledgement barrier, awaited alongside the local `fdatasync`.
+    ///
+    /// Always present; a `min_acks` of 0 makes `await_quorum` return immediately,
+    /// so the disabled path needs no branch here.
+    replication: Arc<replication::Replication>,
 }
 
 /// An applied batch waiting for its WAL flush before it can be acknowledged.
@@ -523,6 +573,19 @@ struct ServerState {
     engine: Arc<RwLock<Engine>>,
     transaction_timeout: Duration,
     metrics: Arc<Metrics>,
+    /// Shared with the flush worker: connection handlers register replicas here,
+    /// and the flush worker waits on the watermarks they publish.
+    replication: Arc<replication::Replication>,
+    /// True when this node is following a primary (`--replica-of`).
+    ///
+    /// CLIENT WRITES MUST BE REFUSED while this is set. A replica's log has to
+    /// contain only what its primary sent: a local write would allocate the next
+    /// LSN from this node's own counter, so the same LSN would then exist with
+    /// different contents on the two nodes. Nothing detects that afterwards —
+    /// `apply_replicated_record` would reject the primary's next record as
+    /// non-contiguous, and the replica could never be promoted without silently
+    /// serving a history that never existed on the primary.
+    read_only: bool,
 }
 
 #[tokio::main]
@@ -591,11 +654,38 @@ async fn main() -> Result<()> {
         .wal_archive_dir
         .as_ref()
         .map(|_| Arc::new(AtomicU64::new(0)));
+
+    /* Replication state is built before the engine so the record sink exists for
+     * the very first commit. A record that slipped through before the sink was
+     * attached would be a silent hole in the replica's log. */
+    let replication = replication::Replication::new(
+        args.replication_min_acks,
+        Duration::from_millis(args.replication_ack_timeout_ms),
+    );
+    if replication.enabled() {
+        eprintln!(
+            "synchronous replication enabled: {} acknowledgement(s) required, {}ms timeout",
+            args.replication_min_acks, args.replication_ack_timeout_ms
+        );
+    }
+    /* The sink is attached ONLY when replication is on. With it absent the
+     * engine's commit path is byte-for-byte what it was before this feature
+     * existed — no clone of the record, no call, nothing to go wrong for the
+     * overwhelming majority of deployments that run a single node. */
+    let record_sink: Option<Arc<dyn vyrn_core::RecordSink>> = if replication.enabled() {
+        Some(Arc::new(replication::ReplicationSink::new(Arc::clone(
+            &replication,
+        ))))
+    } else {
+        None
+    };
+
     let engine = Engine::open_with_options(
         &args.data,
         EngineOptions {
             durability,
             archived_through: archived_through.clone(),
+            record_sink,
             ..EngineOptions::default()
         },
     )
@@ -688,6 +778,7 @@ async fn main() -> Result<()> {
             engine: Arc::clone(&engine),
             in_flight: Arc::clone(&in_flight),
             flush_completed: flush_completed.clone(),
+            replication: Arc::clone(&replication),
         },
     );
     start_write_worker(
@@ -718,9 +809,57 @@ async fn main() -> Result<()> {
         engine: Arc::clone(&engine),
         transaction_timeout: Duration::from_secs(args.transaction_timeout_seconds),
         metrics: Arc::clone(&metrics),
+        replication: Arc::clone(&replication),
+        read_only: args.replica_of.is_some(),
     });
+    /* REPLICA MODE. Started after the engine and the write pipeline exist,
+     * because the replica task appends through the same engine handle. Reads are
+     * served normally; client writes are refused (see the guard in the write
+     * path), since a replica's log must contain only what its primary sent. */
+    if let Some(primary_url) = args.replica_of.clone() {
+        let password_file = args
+            .replica_password_file
+            .clone()
+            .context("--replica-of requires --replica-password-file")?;
+        let password = std::fs::read_to_string(&password_file)
+            .with_context(|| format!("failed to read {password_file:?}"))?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned();
+        if password.is_empty() {
+            bail!("replica password file {password_file:?} is empty");
+        }
+        // Defaults to the bind address so two replicas are distinguishable in the
+        // primary's logs without extra configuration.
+        let replica_id = args.replica_id.clone().unwrap_or_else(|| args.bind.clone());
+        let replica_engine = Arc::clone(&engine);
+        let config = replica::ReplicaConfig {
+            primary_url,
+            password,
+            ca_file: args.replica_ca_file.clone(),
+            replica_id,
+            allow_plaintext: args.allow_plaintext,
+            readers: Arc::clone(&readers),
+        };
+        tokio::spawn(async move {
+            if let Err(error) = replica::run(replica_engine, config).await {
+                // Fatal replica errors are divergence, which retrying cannot fix.
+                eprintln!("replication stopped: {error:#}");
+            }
+        });
+    }
+
     let admin_metrics = Arc::clone(&metrics);
-    tokio::spawn(async move { serve_admin(admin_listener, admin_metrics).await });
+    let admin_replication = Arc::clone(&replication);
+    let admin_engine = Arc::clone(&engine);
+    tokio::spawn(async move {
+        serve_admin(
+            admin_listener,
+            admin_metrics,
+            admin_replication,
+            admin_engine,
+        )
+        .await
+    });
     metrics.ready.store(true, Ordering::Release);
     let connection_limit = Arc::new(Semaphore::new(args.max_connections));
 
@@ -888,6 +1027,77 @@ async fn handle_connection(
             continue;
         }
         let response = match request.message {
+            /* A replica converts its authenticated connection into a replication
+             * stream. Placed before the ordinary request arms because from here
+             * on the connection is a one-way record feed plus acknowledgements,
+             * not a request/response channel.
+             *
+             * `transaction.is_none()` guard: a connection mid-transaction has
+             * pinned engine state, and turning it into a stream would leak that.
+             */
+            Message::ReplicaHello {
+                database,
+                last_lsn,
+                replica_id,
+            } if transaction.is_none() => {
+                if database != state.database {
+                    server_error(
+                        ErrorCode::InvalidRequest,
+                        "replica requested a different database",
+                    )
+                } else if !state.replication.enabled() {
+                    /* Refusing rather than streaming to a primary configured with
+                     * min-acks 0 is deliberate: such a primary never waits for
+                     * acknowledgements, so a replica would receive records while
+                     * the operator believed nothing was replicated. Better to
+                     * fail loudly at connect time. */
+                    server_error(
+                        ErrorCode::InvalidRequest,
+                        "this node is not configured for replication \
+                         (set --replication-min-acks to 1 or more)",
+                    )
+                } else {
+                    let primary_lsn = state
+                        .engine
+                        .read()
+                        .map(|engine| engine.last_lsn())
+                        .unwrap_or(0);
+                    match replication::decide_join(last_lsn, primary_lsn) {
+                        replication::JoinDecision::Refuse(reason) => {
+                            eprintln!(
+                                "refused replica {replica_id:?} at LSN {last_lsn}: {reason}"
+                            );
+                            framed
+                                .send(Envelope::new(
+                                    request_id,
+                                    Message::ReplicaDiverged { reason },
+                                ))
+                                .await?;
+                            return Ok(());
+                        }
+                        replication::JoinDecision::Stream { first_lsn } => {
+                            eprintln!(
+                                "replica {replica_id:?} joined at LSN {first_lsn} \
+                                 (primary at {primary_lsn})"
+                            );
+                            framed
+                                .send(Envelope::new(
+                                    request_id,
+                                    Message::ReplicaStream { first_lsn },
+                                ))
+                                .await?;
+                            stream_records(
+                                &mut framed,
+                                &state.replication,
+                                first_lsn,
+                                &replica_id,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
             Message::Subscribe { prefix } if transaction.is_none() => {
                 if prefix.len() > vyrn_core::MAX_KEY_SIZE {
                     server_error(
@@ -1052,6 +1262,109 @@ async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
         }
     })
     .await;
+}
+
+/// Feeds WAL records to a replica and collects its acknowledgements.
+///
+/// Both directions on one connection, driven by `select!`: records go out as the
+/// engine produces them, acknowledgements come back as the replica syncs. They
+/// cannot be sequenced — waiting for an acknowledgement before sending the next
+/// record would serialise replication to one record per round trip, and waiting
+/// for a record before reading an acknowledgement would deadlock a quorum the
+/// moment the stream went briefly idle.
+///
+/// The replica is registered for the duration and deregistered on exit, so a
+/// dropped connection stops counting toward quorum immediately rather than
+/// holding writes until a timeout.
+async fn stream_records(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    replication: &Arc<replication::Replication>,
+    first_lsn: u64,
+    replica_id: &str,
+) -> Result<()> {
+    let (id, mut records) = replication.register();
+    let result = stream_records_inner(framed, replication, &mut records, first_lsn, id).await;
+    // Always, on every exit path.
+    replication.deregister(id);
+    match &result {
+        Ok(()) => eprintln!("replica {replica_id:?} stream ended"),
+        Err(error) => eprintln!("replica {replica_id:?} stream failed: {error}"),
+    }
+    result
+}
+
+async fn stream_records_inner(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    replication: &Arc<replication::Replication>,
+    records: &mut broadcast::Receiver<replication::Shipment>,
+    first_lsn: u64,
+    id: u64,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            shipment = records.recv() => match shipment {
+                Ok(shipment) => {
+                    // Records below the join point are skipped rather than sent:
+                    // the subscription starts at whatever the broadcast held when
+                    // this replica connected, which can predate `first_lsn`, and
+                    // the replica would reject them as duplicates anyway.
+                    if shipment.lsn < first_lsn {
+                        continue;
+                    }
+                    framed
+                        .send(Envelope::new(
+                            0,
+                            Message::ReplicaRecords {
+                                records: vec![shipment.bytes.as_ref().clone()],
+                            },
+                        ))
+                        .await?;
+                }
+                Err(broadcast::error::RecvError::Lagged(missed)) => {
+                    /* This replica fell far enough behind that records it never
+                     * received have been dropped from the buffer. Continuing
+                     * would send a non-contiguous stream, which the replica must
+                     * refuse — so end the stream here with an explanation and let
+                     * it reconnect and close the gap from the archive. */
+                    let reason = format!(
+                        "replica fell behind by {missed} records (buffer holds {}); \
+                         reconnect to resume from the WAL archive",
+                        replication::Replication::backlog()
+                    );
+                    eprintln!("dropping replica stream: {reason}");
+                    framed
+                        .send(Envelope::new(0, Message::ReplicaDiverged { reason }))
+                        .await?;
+                    return Ok(());
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            },
+            incoming = framed.next() => match incoming {
+                Some(Ok(envelope)) => match envelope.message {
+                    Message::ReplicaAck { durable_lsn } => {
+                        replication.acknowledge(id, durable_lsn);
+                    }
+                    Message::ReplicaDiverged { reason } => {
+                        // The replica is refusing what it was sent. Its own log is
+                        // the authority on that, so stop rather than keep pushing.
+                        eprintln!("replica reported divergence: {reason}");
+                        return Ok(());
+                    }
+                    _ => {
+                        send_error(
+                            framed,
+                            envelope.request_id,
+                            ErrorCode::InvalidRequest,
+                            "only acknowledgements are accepted on a replication stream",
+                        )
+                        .await?;
+                    }
+                },
+                Some(Err(error)) => return Err(error.into()),
+                None => return Ok(()),
+            },
+        }
+    }
 }
 
 async fn stream_changes(
@@ -1292,8 +1605,51 @@ fn cursor_error_code(error: &StorageError) -> ErrorCode {
     }
 }
 
+/// Whether a message mutates storage, and so must be refused on a replica.
+///
+/// Listed explicitly rather than by a catch-all, so a NEW write message defaults
+/// to being caught here: if someone adds a mutation and forgets this list, the
+/// compiler's exhaustiveness check on the `match` in `execute` is what reminds
+/// them, and until then the message simply is not classified as a read.
+///
+/// `Begin` counts: a transaction on a replica can only end in a commit that must
+/// be refused, so refusing it at the start gives a clearer error than letting it
+/// accumulate writes and fail later.
+fn mutates_storage(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Put { .. }
+            | Message::Delete { .. }
+            | Message::CreateIndex { .. }
+            | Message::DropIndex { .. }
+            | Message::IndexUpdate { .. }
+            | Message::CreateCollection { .. }
+            | Message::PutDocument { .. }
+            | Message::DeleteDocument { .. }
+            | Message::Begin
+            | Message::Commit
+    )
+}
+
 async fn execute(state: Arc<ServerState>, request: Message) -> Message {
     state.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+    /* A REPLICA REFUSES CLIENT WRITES. Its log must contain only what its primary
+     * sent — a local write would take the next LSN from this node's own counter,
+     * leaving the same LSN holding different bytes on the two nodes. The primary's
+     * next record would then be rejected as non-contiguous, and the replica could
+     * never be promoted without serving a history the primary never had.
+     *
+     * Checked here because `execute` is the single funnel every client request
+     * passes through, so one guard covers every mutation path rather than six. */
+    if state.read_only && mutates_storage(&request) {
+        state.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        return server_error(
+            ErrorCode::InvalidRequest,
+            "this node is a replica and does not accept writes; \
+             send writes to the primary, or promote this node by restarting it \
+             without --replica-of",
+        );
+    }
     match request {
         Message::Put { key, value } => {
             state.metrics.writes.fetch_add(1, Ordering::Relaxed);
@@ -2609,7 +2965,29 @@ fn start_flush_worker(
             // because all of their records were appended before this call.
             if let Some(lsn) = batch.iter().filter_map(|flush| flush.lsn).max() {
                 let wal_handle = Arc::clone(&wal);
-                let synced = task::spawn_blocking(move || wal_handle.sync_through(lsn)).await;
+                /* TWO BARRIERS, AWAITED TOGETHER.
+                 *
+                 * The local `fdatasync` and the replicas' acknowledgements are
+                 * independent: each side is making the same record durable on its
+                 * own storage. Awaiting them concurrently means a commit costs
+                 * `max(fsync, rtt)` rather than `fsync + rtt`, which is the
+                 * difference between synchronous replication being usable and
+                 * being a tax nobody accepts.
+                 *
+                 * `join!` rather than `select!` — BOTH must complete. Taking the
+                 * first to finish is exactly the bug this feature exists to
+                 * prevent: it would acknowledge a write whose replica copy had
+                 * not landed.
+                 *
+                 * When replication is disabled `await_quorum` returns
+                 * immediately, so this is the previous single-node path with one
+                 * extra ready future.
+                 */
+                let replication = Arc::clone(&config.replication);
+                let (synced, quorum) = tokio::join!(
+                    task::spawn_blocking(move || wal_handle.sync_through(lsn)),
+                    replication.await_quorum(lsn),
+                );
                 let error = match synced {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => {
@@ -2622,6 +3000,34 @@ fn start_flush_worker(
                         Some("WAL flush task failed".into())
                     }
                 };
+                /* A local sync failure outranks a quorum failure: if this node's
+                 * own storage is broken, that is the more urgent fact and the
+                 * more specific message. Only report the quorum problem when the
+                 * local write actually succeeded.
+                 *
+                 * WHAT A QUORUM FAILURE MEANS FOR THE DATA — measured, not
+                 * assumed. On timeout the client gets an error, but the record is
+                 * already in the WAL and already applied to the tree, so:
+                 *
+                 *   - it SURVIVES a restart. Verified: a write rejected with
+                 *     "quorum not reached" was readable after reopening the
+                 *     directory.
+                 *   - it is NOT visible to readers until some later commit
+                 *     succeeds, because `publish_commit` below is skipped on the
+                 *     error path and the read engines never refresh onto this
+                 *     batch's generation.
+                 *
+                 * That combination is deliberate but genuinely surprising, so the
+                 * error message says exactly it: durable here, not replicated.
+                 * Rolling the record back instead would mean un-writing a
+                 * committed WAL entry, which is a far more dangerous operation
+                 * than reporting the truth. The client can retry; a re-put of the
+                 * same key is idempotent.
+                 *
+                 * docs/replication.md must state this, or an operator will read
+                 * "write failed" as "write did not happen".
+                 */
+                let error = error.or_else(|| quorum.err().map(|failure| failure.to_string()));
                 if let Some(message) = error {
                     let covered = batch.len() as u64;
                     for flush in batch {
@@ -2919,12 +3325,19 @@ fn record_storage_error(metrics: &Metrics, error: &StorageError) {
     }
 }
 
-async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
+async fn serve_admin(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    replication: Arc<replication::Replication>,
+    engine: Arc<RwLock<Engine>>,
+) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
             return;
         };
         let metrics = Arc::clone(&metrics);
+        let replication = Arc::clone(&replication);
+        let engine = Arc::clone(&engine);
         tokio::spawn(async move {
             let mut request = [0; 2048];
             let Ok(count) = timeout(Duration::from_secs(5), stream.read(&mut request)).await else {
@@ -2933,8 +3346,16 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
             let Ok(count) = count else { return };
             let line = String::from_utf8_lossy(&request[..count]);
             let path = line.split_whitespace().nth(1).unwrap_or("/");
+            /* READINESS INCLUDES REPLICATION. A primary that cannot reach its
+             * configured quorum is up but cannot honour the durability it
+             * promises, so it must not be sent traffic — that is exactly what a
+             * readiness probe is for. Liveness is deliberately left alone: the
+             * process is healthy and must not be restarted, since restarting it
+             * cannot bring a replica back. */
+            let quorum_ok = !replication.quorum_failing();
             let ready = metrics.ready.load(Ordering::Acquire)
-                && !metrics.storage_failed.load(Ordering::Acquire);
+                && !metrics.storage_failed.load(Ordering::Acquire)
+                && quorum_ok;
             let (status, content_type, body) = match path {
                 "/health/live" => ("200 OK", "text/plain", "ok\n".to_owned()),
                 "/health/ready" if ready => ("200 OK", "text/plain", "ready\n".to_owned()),
@@ -2964,7 +3385,7 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
                         metrics.write_profile.batches.load(Ordering::Relaxed),
                         metrics.write_profile.requests.load(Ordering::Relaxed),
                         metrics.write_profile.render(),
-                    ),
+                    ) + &render_replication(&replication, &engine),
                 ),
                 _ => ("404 Not Found", "text/plain", "not found\n".to_owned()),
             };
@@ -2975,6 +3396,46 @@ async fn serve_admin(listener: TcpListener, metrics: Arc<Metrics>) {
             let _ = stream.write_all(response.as_bytes()).await;
         });
     }
+}
+
+/// Replication gauges and counters, in Prometheus text format.
+///
+/// Lag is reported in LSNs rather than bytes: an LSN is one commit, which is the
+/// unit an operator reasons about ("we are 40 commits behind"), and byte lag
+/// would vary with value size for identical replication health.
+///
+/// `vyrn_replication_max_lag_lsn` is the number to alert on — with several
+/// replicas, the worst one is what determines whether a quorum can be met.
+fn render_replication(
+    replication: &Arc<replication::Replication>,
+    engine: &Arc<RwLock<Engine>>,
+) -> String {
+    let last_lsn = engine.read().map(|engine| engine.last_lsn()).unwrap_or(0);
+    let lag = replication.lag(last_lsn);
+    let max_lag = lag.iter().map(|(_, lag)| *lag).max().unwrap_or(0);
+    let metrics = &replication.metrics;
+    format!(
+        "vyrn_replication_enabled {}\n\
+         vyrn_replication_min_acks {}\n\
+         vyrn_replicas_connected {}\n\
+         vyrn_replication_quorum_failing {}\n\
+         vyrn_replication_max_lag_lsn {}\n\
+         vyrn_replication_last_lsn {}\n\
+         vyrn_replication_ack_waits_total {}\n\
+         vyrn_replication_ack_timeouts_total {}\n\
+         vyrn_replication_records_shipped_total {}\n\
+         vyrn_replication_dropped_replicas_total {}\n",
+        u8::from(replication.enabled()),
+        replication.min_acks(),
+        replication.connected(),
+        u8::from(replication.quorum_failing()),
+        max_lag,
+        last_lsn,
+        metrics.ack_waits.load(Ordering::Relaxed),
+        metrics.ack_timeouts.load(Ordering::Relaxed),
+        metrics.records_shipped.load(Ordering::Relaxed),
+        metrics.dropped_replicas.load(Ordering::Relaxed),
+    )
 }
 
 fn server_error(code: ErrorCode, message: &str) -> Message {

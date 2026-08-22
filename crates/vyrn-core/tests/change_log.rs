@@ -172,6 +172,63 @@ fn internal_keys_and_index_entries_are_not_published() {
     assert!(changes[0].value.is_some());
 }
 
+/// A delete that hits nothing mutates nothing, so it must not be published. The
+/// change log is built before the engine knows which keys exist, which is how a
+/// phantom deletion for a key that never existed reached subscribers: the write
+/// itself correctly reported `existed: false` while the log said otherwise.
+#[test]
+fn a_delete_that_hits_nothing_is_not_published() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+
+    assert!(!engine.delete(b"absent").unwrap());
+    assert!(
+        engine
+            .read_changes(Cursor::start(), 100)
+            .unwrap()
+            .is_empty(),
+        "a delete that hit nothing published a change"
+    );
+
+    // A batch mixes hits and misses, and only the hits may publish.
+    engine.put(b"live".to_vec(), b"1".to_vec()).unwrap();
+    let from_now = engine.latest_cursor().unwrap();
+    engine
+        .write_batch(vec![
+            BatchOperation::Delete(b"live".to_vec()),
+            BatchOperation::Delete(b"absent".to_vec()),
+        ])
+        .unwrap();
+    let changes = engine.read_changes(from_now, 100).unwrap();
+    assert_eq!(changes.len(), 1, "a missing key published a deletion");
+    assert_eq!(changes[0].key, b"live");
+    assert_eq!(changes[0].value, None);
+
+    // A key created earlier in the same batch is present by the time the delete
+    // runs, so that deletion is real and must publish.
+    let from_now = engine.latest_cursor().unwrap();
+    engine
+        .write_batch(vec![
+            BatchOperation::Put(b"fresh".to_vec(), b"1".to_vec()),
+            BatchOperation::Delete(b"fresh".to_vec()),
+        ])
+        .unwrap();
+    let keys: Vec<_> = engine
+        .read_changes(from_now, 100)
+        .unwrap()
+        .into_iter()
+        .map(|change| (change.key, change.value))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            (b"fresh".to_vec(), Some(b"1".to_vec())),
+            (b"fresh".to_vec(), None),
+        ],
+        "a delete of a key created in the same batch was not published"
+    );
+}
+
 #[test]
 fn latest_cursor_subscribes_to_future_changes_only() {
     let directory = tempdir().unwrap();

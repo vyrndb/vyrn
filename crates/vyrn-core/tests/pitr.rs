@@ -356,30 +356,57 @@ proptest! {
     ) {
         let source = tempdir().unwrap();
         let auxiliary = tempdir().unwrap();
-        let total = ops.len() as u64;
+
+        // Not every operation is a commit: deleting a key that is not there
+        // mutates nothing, writes no record, and so consumes no LSN. The bounds
+        // below are LSNs, so the count of real commits has to be known first.
+        // Simulating it here rather than counting during the writes keeps the
+        // model's idea of an LSN independent of the engine's.
+        let commits = {
+            let mut live: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
+            ops.iter()
+                .filter(|operation| match operation {
+                    Op::Put(key, _) => {
+                        live.insert(key.clone(), ());
+                        true
+                    }
+                    Op::Delete(key) => live.remove(key).is_some(),
+                })
+                .count() as u64
+        };
+        // A history of nothing but deletes of absent keys has no commit to
+        // recover to, which is not what this property is about.
+        prop_assume!(commits > 0);
+        let total = commits;
         // Checkpoint after some commit in 1..=total; the bound must lie at or
         // above it because redo only rolls forward from the checkpoint root.
-        let checkpoint_at = 1 + checkpoint_selector.index(ops.len()) as u64;
+        let checkpoint_at = 1 + checkpoint_selector.index(total as usize) as u64;
         let bound = checkpoint_at + bound_selector.index((total - checkpoint_at + 1) as usize) as u64;
 
         let mut model = BTreeMap::new();
-        // snapshots[lsn - 1] is the exact expected state after commit `lsn`.
-        let mut snapshots = Vec::with_capacity(ops.len());
+        // snapshots[lsn - 1] is the exact expected state after commit `lsn`, so
+        // only a commit may append to it.
+        let mut snapshots = Vec::with_capacity(total as usize);
         {
             let mut engine = Engine::open_with_segment_size(source.path(), 128).unwrap();
-            for (index, operation) in ops.iter().enumerate() {
-                match operation {
+            for operation in ops.iter() {
+                let committed = match operation {
                     Op::Put(key, value) => {
                         engine.put(key.clone(), value.clone()).unwrap();
                         model.insert(key.clone(), value.clone());
+                        true
                     }
                     Op::Delete(key) => {
-                        engine.delete(key).unwrap();
+                        let existed = engine.delete(key).unwrap();
                         model.remove(key);
+                        existed
                     }
+                };
+                if !committed {
+                    continue;
                 }
                 snapshots.push(model.clone());
-                if index as u64 + 1 == checkpoint_at {
+                if snapshots.len() as u64 == checkpoint_at {
                     engine.checkpoint().unwrap();
                 }
             }

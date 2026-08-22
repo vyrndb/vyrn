@@ -12,6 +12,21 @@ const MAX_AUTH_FIELD: usize = 4 * 1024;
 const MAX_DOCUMENT_NAME: usize = 4 * 1024;
 const MAX_CURSOR: usize = 64;
 const MAX_ERROR_MESSAGE: usize = 64 * 1024;
+/// Replica identifier length. Short on purpose: it names a node in logs and
+/// metrics, so it is a label, not a channel for arbitrary data.
+const MAX_REPLICA_ID: usize = 256;
+/// Records carried in one `ReplicaRecords` frame.
+///
+/// The primary's flush stage coalesces commits, so a batch is normally a handful.
+/// This is the ceiling that stops a wire-supplied count from driving a large
+/// allocation before any record has been read.
+const MAX_REPLICA_RECORDS: usize = 4_096;
+/// Largest single WAL record accepted from the wire.
+///
+/// Vyrn permits values up to 16 MiB, and a record holds a whole batch of
+/// operations, so this has to be generous — but it must still be bounded well
+/// under `MAX_FRAME_SIZE` so one oversized record cannot fill a frame by itself.
+const MAX_REPLICA_RECORD: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentIndex {
@@ -188,6 +203,55 @@ pub enum Message {
     Caught {
         cursor: String,
     },
+
+    // ---- Replication -----------------------------------------------------
+    //
+    // A replica authenticates exactly like a client, then sends `ReplicaHello`
+    // to convert the connection into a replication stream. There is no separate
+    // credential system and no unauthenticated replication path.
+    //
+    // The records on the wire are the WAL's own encoded records, byte for byte,
+    // so there is no second serialisation of a mutation to keep in step with the
+    // first. The receiving side validates them with the same magic, version and
+    // CRC32 checks that recovery uses.
+    /// Sent by a replica after authenticating: where its log ends, and who it
+    /// is. `last_lsn` is 0 for a replica with no records at all.
+    ReplicaHello {
+        database: String,
+        last_lsn: u64,
+        replica_id: String,
+    },
+    /// The primary accepting the stream, naming the first LSN it will send.
+    ///
+    /// `first_lsn` greater than the replica's `last_lsn + 1` means the primary
+    /// no longer holds the records in between; the replica must close the gap
+    /// from the WAL archive before it can stream.
+    ReplicaStream {
+        first_lsn: u64,
+    },
+    /// WAL records to append, in ascending LSN order.
+    ///
+    /// Batched because the primary's flush stage already coalesces commits, so a
+    /// single barrier there usually covers several records.
+    ReplicaRecords {
+        records: Vec<Vec<u8>>,
+    },
+    /// The replica confirming records are durable on its own storage.
+    ///
+    /// Sent only after `sync_through` has returned for `durable_lsn`. Sending it
+    /// any earlier would make the primary's acknowledgement to its client a lie.
+    ReplicaAck {
+        durable_lsn: u64,
+    },
+    /// The stream is refused because the two histories disagree.
+    ///
+    /// A replica ahead of the primary, or holding a different record at the join
+    /// point, cannot be reconciled by streaming. Halting is the only safe answer:
+    /// appending over a divergent history silently corrupts the replica.
+    ReplicaDiverged {
+        reason: String,
+    },
+
     Error {
         code: ErrorCode,
         message: String,
@@ -408,6 +472,36 @@ impl std::fmt::Debug for Message {
                 .field("key_len", &key.len())
                 .field("value_len", &value.as_ref().map(Vec::len))
                 .finish(),
+            Self::ReplicaHello {
+                database,
+                last_lsn,
+                replica_id,
+            } => formatter
+                .debug_struct("ReplicaHello")
+                .field("database", database)
+                .field("last_lsn", last_lsn)
+                .field("replica_id", replica_id)
+                .finish(),
+            Self::ReplicaStream { first_lsn } => formatter
+                .debug_struct("ReplicaStream")
+                .field("first_lsn", first_lsn)
+                .finish(),
+            // Counts and sizes, never contents: these records carry every value
+            // written to the database, so logging them verbatim would put user
+            // data in the log.
+            Self::ReplicaRecords { records } => formatter
+                .debug_struct("ReplicaRecords")
+                .field("record_count", &records.len())
+                .field("bytes", &records.iter().map(Vec::len).sum::<usize>())
+                .finish(),
+            Self::ReplicaAck { durable_lsn } => formatter
+                .debug_struct("ReplicaAck")
+                .field("durable_lsn", durable_lsn)
+                .finish(),
+            Self::ReplicaDiverged { reason } => formatter
+                .debug_struct("ReplicaDiverged")
+                .field("reason", reason)
+                .finish(),
             Self::Error { code, message } => formatter
                 .debug_struct("Error")
                 .field("code", code)
@@ -565,6 +659,40 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
         Message::Caught { cursor } => {
             output.put_u8(49);
             put_string(output, &cursor)?;
+        }
+        Message::ReplicaHello {
+            database,
+            last_lsn,
+            replica_id,
+        } => {
+            output.put_u8(50);
+            put_string(output, &database)?;
+            output.put_u64(last_lsn);
+            put_string(output, &replica_id)?;
+        }
+        Message::ReplicaStream { first_lsn } => {
+            output.put_u8(51);
+            output.put_u64(first_lsn);
+        }
+        Message::ReplicaRecords { records } => {
+            output.put_u8(52);
+            output.put_u32(
+                records
+                    .len()
+                    .try_into()
+                    .map_err(|_| CodecError::Malformed("too many replication records"))?,
+            );
+            for record in records {
+                put_bytes(output, &record)?;
+            }
+        }
+        Message::ReplicaAck { durable_lsn } => {
+            output.put_u8(53);
+            output.put_u64(durable_lsn);
+        }
+        Message::ReplicaDiverged { reason } => {
+            output.put_u8(54);
+            put_string(output, &reason)?;
         }
         Message::Begin => output.put_u8(15),
         Message::Commit => output.put_u8(16),
@@ -977,6 +1105,44 @@ fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
         },
         49 => Message::Caught {
             cursor: get_string(input, MAX_CURSOR)?,
+        },
+        50 => Message::ReplicaHello {
+            database: get_string(input, MAX_AUTH_FIELD)?,
+            last_lsn: get_u64(input)?,
+            replica_id: get_string(input, MAX_REPLICA_ID)?,
+        },
+        51 => Message::ReplicaStream {
+            first_lsn: get_u64(input)?,
+        },
+        52 => {
+            // Count is checked against its ceiling BEFORE reserving, so a
+            // wire-supplied length cannot drive the allocation. `with_capacity`
+            // on an unvalidated u32 is remotely triggerable memory exhaustion,
+            // which is the exact class of bug tests/decode_fuzz.rs exists for.
+            let count = get_u32(input)? as usize;
+            if count == 0 || count > MAX_REPLICA_RECORDS {
+                return Err(CodecError::Malformed(
+                    "replication record count is out of range",
+                ));
+            }
+            let mut records = Vec::with_capacity(count);
+            for _ in 0..count {
+                let record = get_bytes(input, MAX_REPLICA_RECORD)?;
+                // An empty record cannot be a WAL record: the framing alone is
+                // 45 header + 8 footer bytes. Rejecting it here means the apply
+                // path never has to treat emptiness as a special case.
+                if record.is_empty() {
+                    return Err(CodecError::Malformed("empty replication record"));
+                }
+                records.push(record);
+            }
+            Message::ReplicaRecords { records }
+        }
+        53 => Message::ReplicaAck {
+            durable_lsn: get_u64(input)?,
+        },
+        54 => Message::ReplicaDiverged {
+            reason: get_string(input, MAX_ERROR_MESSAGE)?,
         },
         _ => return Err(CodecError::Malformed("unknown message type")),
     };

@@ -18,6 +18,49 @@ services:
       - vyrn_tls_key
     read_only: true
 
+  # A synchronous replica of `vyrn`. Commented out because enabling it is a
+  # two-part change: the primary must also get
+  #   VYRN_REPLICATION_MIN_ACKS: "1"
+  # and until it does, this replica streams while the primary never waits for it,
+  # which is not the guarantee the flag implies.
+  #
+  # Enabling both is what makes an acknowledged write survive losing `vyrn`.
+  # Note the primary then BLOCKS writes whenever this replica is down — that is
+  # the trade, and `docs/replication.md` covers the failure modes.
+  #
+  # vyrn-replica:
+  #   build: .
+  #   restart: unless-stopped
+  #   environment:
+  #     VYRN_BIND: 0.0.0.0:7432
+  #     VYRN_ADMIN_BIND: 0.0.0.0:7433
+  #     VYRN_DATA: /var/lib/vyrn
+  #     VYRN_PASSWORD_HASH_FILE: /run/secrets/vyrn_password_hash
+  #     VYRN_TLS_CERT_FILE: /run/secrets/vyrn_tls_cert
+  #     VYRN_TLS_KEY_FILE: /run/secrets/vyrn_tls_key
+  #     VYRN_REPLICA_OF: vyrn://vyrn@vyrn:7432/default
+  #     VYRN_REPLICA_PASSWORD_FILE: /run/secrets/vyrn_password
+  #     VYRN_REPLICA_CA_FILE: /run/secrets/vyrn_tls_ca
+  #     VYRN_REPLICA_ID: replica-a
+  #   ports:
+  #     - "127.0.0.1:7442:7432"
+  #     - "127.0.0.1:7443:7433"
+  #   depends_on:
+  #     vyrn:
+  #       condition: service_healthy
+  #   volumes:
+  #     # ITS OWN VOLUME. Sharing `vyrn-data` would point two engines at one
+  #     # directory; the second would fail to take the lock, and if it somehow
+  #     # succeeded it would corrupt the first.
+  #     - vyrn-replica-data:/var/lib/vyrn
+  #   secrets:
+  #     - vyrn_password_hash   # for ITS clients
+  #     - vyrn_password        # to authenticate to the primary
+  #     - vyrn_tls_ca          # to verify the primary
+  #     - vyrn_tls_cert
+  #     - vyrn_tls_key
+  #   read_only: true
+
   vyrn-http:
     build: .
     restart: unless-stopped
@@ -55,3 +98,6 @@ secrets:
 
 volumes:
   vyrn-data:
+  # Declared even though `vyrn-replica` is commented out: an unused volume
+  # declaration costs nothing, and uncommenting the service without it fails.
+  vyrn-replica-data:

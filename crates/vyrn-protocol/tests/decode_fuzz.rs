@@ -145,6 +145,23 @@ fn seed_messages() -> Vec<Message> {
         Message::Caught {
             cursor: "000000000000000000000009".into(),
         },
+        // Replication frames. `ReplicaHello` and `ReplicaRecords` are the two
+        // that read wire-supplied sizes, and a replica connection reaches the
+        // decoder before its role is established, so they are attacker-reachable
+        // on the same terms as everything above.
+        Message::ReplicaHello {
+            database: "app".into(),
+            last_lsn: 42,
+            replica_id: "replica-1".into(),
+        },
+        Message::ReplicaStream { first_lsn: 43 },
+        Message::ReplicaRecords {
+            records: vec![vec![7; 64], vec![8; 128]],
+        },
+        Message::ReplicaAck { durable_lsn: 43 },
+        Message::ReplicaDiverged {
+            reason: "replica is ahead of the primary".into(),
+        },
         Message::Error {
             code: ErrorCode::Conflict,
             message: "conflict".into(),
@@ -170,7 +187,10 @@ proptest! {
     /// an unknown-kind check.
     #[test]
     fn arbitrary_message_bodies_are_rejected_without_panicking(
-        kind in 1_u8..=49,
+        // 54 is the highest dispatched kind: 50-54 are the replication frames.
+        // This bound must rise with every tag added, or new branches silently
+        // stop being fuzzed.
+        kind in 1_u8..=54,
         body in prop::collection::vec(any::<u8>(), 0..512),
     ) {
         let mut input = BytesMut::new();
@@ -244,6 +264,54 @@ proptest! {
         prop_assert!(
             codec.decode(&mut bytes).is_err(),
             "kind {kind} accepted a count of {count} with no elements present"
+        );
+    }
+
+    /// The replication record count has its own ceiling, so it needs its own case.
+    ///
+    /// Kind 52 is bounded by `MAX_REPLICA_RECORDS` rather than `MAX_SCAN_LIMIT`,
+    /// which is why it is not in the list above. Zero is included deliberately:
+    /// an empty batch is meaningless and accepting it would let a peer drive the
+    /// primary's ack bookkeeping with frames carrying no work.
+    #[test]
+    fn an_oversized_replication_count_is_rejected_before_allocating(
+        count in prop::sample::select(vec![0_u32, 4_097, 100_000, u32::MAX]),
+    ) {
+        let mut input = BytesMut::new();
+        input.put_u16(6);
+        input.put_u64(1);
+        input.put_u8(52);
+        input.put_u32(count);
+
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&input);
+        prop_assert!(
+            codec.decode(&mut bytes).is_err(),
+            "kind 52 accepted a record count of {count} with no records present"
+        );
+    }
+
+    /// An oversized single record must be rejected on its length, not buffered.
+    ///
+    /// The count can be legal while one record claims to be enormous. That length
+    /// reaches `get_bytes` directly, so it is the second place a wire-supplied
+    /// size could drive an allocation.
+    #[test]
+    fn an_oversized_replication_record_is_rejected(
+        length in (32_u32 * 1024 * 1024 + 1)..=u32::MAX,
+    ) {
+        let mut input = BytesMut::new();
+        input.put_u16(6);
+        input.put_u64(1);
+        input.put_u8(52);
+        input.put_u32(1);
+        input.put_u32(length);
+
+        let mut codec = VyrnCodec::default();
+        let mut bytes = frame(&input);
+        prop_assert!(
+            codec.decode(&mut bytes).is_err(),
+            "kind 52 accepted a record claiming {length} bytes"
         );
     }
 

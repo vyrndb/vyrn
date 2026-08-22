@@ -22,3 +22,10 @@ vyrn-protocol = { path = "../vyrn-protocol" }
 [dev-dependencies]
 proptest = "1.7"
 tempfile = "3.20"
+# The replication integration test writes its own Argon2id verifier rather than
+# depending on the `vyrn` CLI binary being built first.
+argon2.workspace = true
+# Drives clients through the native protocol in-process. Using the client crate
+# avoids depending on another crate's binary, which `CARGO_BIN_EXE_*` cannot
+# provide across packages.
+vyrn-client = { path = "../vyrn-client" }
