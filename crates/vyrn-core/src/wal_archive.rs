@@ -232,15 +232,28 @@ fn archived_copy_matches(archive_directory: &Path, name: &str, entry: &IndexEntr
 pub fn verify_archive(archive_directory: &Path) -> Result<ArchiveSummary> {
     let entries = read_index(archive_directory)?;
     for pair in entries.windows(2) {
-        if pair[1].segment_id != pair[0].segment_id + 1 {
+        // Saturating, not plain adds. Every field here comes straight off disk:
+        // the index's checksum proves only that the bytes are the bytes that were
+        // written, not that they describe a real archive, and an operator can
+        // hand this function any directory. `last_lsn = u64::MAX` in one entry
+        // made `last_lsn + 1` panic — release keeps overflow-checks on, so it
+        // panics there too — turning a forged index into an abort inside the very
+        // routine an operator runs to find out whether their archive is sound.
+        // Saturating leaves the comparison correct for every real chain (a
+        // genuine `last_lsn` is nowhere near u64::MAX) and reports a forged one
+        // as the broken chain it is. The segment-id add cannot overflow — the
+        // reader has already rejected an index whose ids are not strictly
+        // increasing, so a u64::MAX id can only ever be the last entry — but it
+        // is written the same way rather than relying on that from a distance.
+        if pair[1].segment_id != pair[0].segment_id.saturating_add(1) {
             return Err(Error::CorruptBackup(format!(
                 "archive is missing segment {} between {} and {}",
-                pair[0].segment_id + 1,
+                pair[0].segment_id.saturating_add(1),
                 pair[0].segment_id,
                 pair[1].segment_id
             )));
         }
-        if pair[1].first_lsn != pair[0].last_lsn + 1 {
+        if pair[1].first_lsn != pair[0].last_lsn.saturating_add(1) {
             return Err(Error::CorruptBackup(format!(
                 "archive LSN chain breaks between segment {} (ends at {}) and segment {} (starts at {})",
                 pair[0].segment_id, pair[0].last_lsn, pair[1].segment_id, pair[1].first_lsn

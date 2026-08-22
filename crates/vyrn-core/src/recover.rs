@@ -61,16 +61,40 @@ pub fn recover_to(
             "recovery target has no WAL segments after merging".into(),
         ));
     }
-    let mut missing = Vec::new();
+    // Segment ids come from filenames, which are untrusted: a recovery target is
+    // a directory an operator assembled by hand from a restored backup and an
+    // archive, and anything matching `{digits}.vwal` lands in `ids`. Enumerating
+    // every id in a gap would materialize the whole span, so a directory holding
+    // segments 1 and u64::MAX — a typo, a truncated copy, a hostile tarball —
+    // pushed 1.8×10^19 strings and hung the process instead of reporting the
+    // gap. The names of the gap's edges say everything an operator needs, so the
+    // report is bounded: the first few missing ids and, when the span exceeds
+    // them, how many there are in total.
+    const NAMED_MISSING: usize = 8;
+    let mut missing: Vec<String> = Vec::new();
+    let mut missing_count: u64 = 0;
     for pair in ids.windows(2) {
-        for id in pair[0] + 1..pair[1] {
-            missing.push(id.to_string());
-        }
+        // Saturating throughout: `pair[0] + 1` overflows on a segment literally
+        // named u64::MAX, and release keeps overflow-checks on, so that is a
+        // panic rather than a wrap.
+        missing_count =
+            missing_count.saturating_add(pair[1].saturating_sub(pair[0]).saturating_sub(1));
+        missing.extend(
+            (pair[0].saturating_add(1)..pair[1])
+                .take(NAMED_MISSING.saturating_sub(missing.len()))
+                .map(|id| id.to_string()),
+        );
     }
-    if !missing.is_empty() {
+    if missing_count != 0 {
+        let unnamed = missing_count - missing.len() as u64;
+        let named = missing.join(", ");
+        let detail = if unnamed == 0 {
+            named
+        } else {
+            format!("{named} and {unnamed} more")
+        };
         return Err(failed(format!(
-            "merged WAL is missing segment(s) {}; the archive and base backup do not connect",
-            missing.join(", ")
+            "merged WAL is missing segment(s) {detail}; the archive and base backup do not connect"
         )));
     }
     let mut headers = Vec::with_capacity(ids.len());
