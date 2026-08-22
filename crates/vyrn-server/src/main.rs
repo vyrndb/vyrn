@@ -33,6 +33,7 @@ use vyrn_core::{
     change_log, document::IndexDefinition, BatchOperation, BatchResult, DurabilityMode, Engine,
     EngineOptions, Error as StorageError, IndexUpdate, ReadEngine,
 };
+use vyrn_log::{log_debug, log_error, log_info, log_warn};
 use vyrn_protocol::{
     Envelope, ErrorCode, Message, VyrnCodec, MAX_DOCUMENT_INDEXES, MAX_SCAN_LIMIT, PROTOCOL_VERSION,
 };
@@ -59,6 +60,9 @@ const PREAUTH_MAX_FRAME_SIZE: usize = 64 * 1024;
 /// disconnected mid-scan, so this bounds pathological wedges rather than
 /// policing throughput. See `send_frame` for why every response path is bounded.
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default for `--statement-deadline-ms`; see that argument for the reasoning.
+const DEFAULT_STATEMENT_DEADLINE_MS: u64 = 30_000;
 
 trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
@@ -109,6 +113,32 @@ struct Args {
     transaction_timeout_seconds: u64,
     #[arg(long, env = "VYRN_READ_HANDLES", default_value_t = 16)]
     read_handles: usize,
+    /// How long one read statement may occupy a read worker before it is
+    /// abandoned and its client told to narrow the request.
+    ///
+    /// WHY THIS EXISTS: a read handle is served by ONE thread reading ONE queue,
+    /// so a request that runs long is not merely slow for the client that sent it
+    /// — it is a queue every client on that handle waits behind. A `limit` bounds
+    /// how many ROWS a scan returns, which is not a bound on its cost:
+    /// `MAX_SCAN_LIMIT` rows of `MAX_VALUE_SIZE` values is a value-log read
+    /// measured in gigabytes, and nothing in the protocol lets a client promise
+    /// its statement is cheap. So the server is what stops.
+    ///
+    /// Enforced BETWEEN chunks of a scan (see `advance_scan`), which is what makes
+    /// it a bound on worker occupancy rather than merely on how long one client
+    /// waits: the worker abandons the statement and serves the next one.
+    ///
+    /// DELIBERATELY NOT APPLIED TO WRITES. A write that has entered the pipeline
+    /// may already be in the WAL, so answering "deadline exceeded" would report an
+    /// unknown outcome as a failure and invite a retry that applies it twice — the
+    /// same reasoning as the flush stage's "durable but not published". Write
+    /// occupancy is bounded by the pipeline's stages and its supervision instead.
+    #[arg(
+        long,
+        env = "VYRN_STATEMENT_DEADLINE_MS",
+        default_value_t = DEFAULT_STATEMENT_DEADLINE_MS
+    )]
+    statement_deadline_ms: u64,
     #[arg(long, env = "VYRN_MVCC_GC_MS", default_value_t = 1_000)]
     mvcc_gc_ms: u64,
     #[arg(
@@ -163,6 +193,23 @@ struct Args {
     /// Name for this replica in the primary's logs and metrics.
     #[arg(long, env = "VYRN_REPLICA_ID", requires = "replica_of")]
     replica_id: Option<String>,
+    /// WAL archive this replica recovers pruned records from when it has fallen
+    /// too far behind to be streamed to.
+    ///
+    /// WHY A REPLICA NEEDS ONE. A primary's checkpoints delete sealed WAL
+    /// segments, so a replica offline across a few of them comes back needing
+    /// records the primary no longer holds. Without this, that is fatal and
+    /// permanent: the join is refused on every reconnect, and a primary running
+    /// `--replication-min-acks 1` blocks writes for want of the very replica that
+    /// cannot rejoin. With it, the replica reads exactly those pruned records from
+    /// the archive — they are the primary's own WAL segments, byte for byte — and
+    /// then streams on from where the archive ends.
+    ///
+    /// Point it at the same directory the primary's `--wal-archive-dir` writes to,
+    /// by whatever means that directory is shared. Read-only here: a replica never
+    /// writes to the archive.
+    #[arg(long, env = "VYRN_REPLICA_WAL_ARCHIVE_DIR", requires = "replica_of")]
+    replica_wal_archive_dir: Option<PathBuf>,
 }
 
 struct Metrics {
@@ -694,6 +741,70 @@ impl ChangeRing {
     }
 }
 
+/// Rows one scan reads before it yields its worker to other queued requests.
+///
+/// WHY A SCAN IS CHUNKED AT ALL: a read handle is served by ONE thread reading
+/// ONE queue, and requests are handed to handles round-robin. A request that
+/// runs long is therefore not merely slow for the client that sent it — every
+/// client that lands on the same handle waits behind it. `limit` bounds the ROWS
+/// a scan returns, which is not a bound on its cost: `MAX_SCAN_LIMIT` rows of
+/// `MAX_VALUE_SIZE` values is a value-log read measured in gigabytes, and one
+/// client asking for that used to stall every `Get` queued behind it for the
+/// whole time, on a server whose other fifteen handles sat idle.
+///
+/// 256 rows keeps the wait a queued point read can inherit down to one chunk,
+/// while leaving the per-chunk overhead — one extra root-to-leaf descent, plus
+/// one row re-read to resume — noise against the rows the chunk returns.
+const SCAN_CHUNK_ROWS: usize = 256;
+
+/// Requests admitted between two chunks of the scans in flight.
+///
+/// Bounded in both directions on purpose. Draining the queue without a cap would
+/// let a steady stream of point reads hold a scan at its first chunk forever;
+/// admitting nothing would put those point reads back behind the whole scan.
+const SCAN_YIELD_REQUESTS: usize = 32;
+
+/// Why a read produced no rows.
+///
+/// Wider than [`StorageError`] because a deadline is not a storage fault: the
+/// engine did not fail and the database is not damaged, the server simply
+/// refused to spend more of a shared worker on one statement. Reporting it as
+/// [`StorageError::Io`] would be worse than imprecise — `record_storage_error`
+/// treats an I/O error as a reason to fail readiness, so one client's oversized
+/// scan would take the whole node out of service.
+enum ReadFailure {
+    Storage(StorageError),
+    /// Abandoned at the statement deadline, with the rows read so far discarded.
+    DeadlineExceeded,
+}
+
+impl From<StorageError> for ReadFailure {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+/// A scan part-way through its chunks.
+struct ScanJob {
+    /// Lower bound for the next chunk. Starts as the client's `start`, and after
+    /// each chunk becomes the last key collected.
+    ///
+    /// Resuming from the last key INCLUSIVE and dropping it (`skip_resume`) is
+    /// deliberate, rather than computing the key that follows it: appending a
+    /// zero byte to a `MAX_KEY_SIZE` key would exceed the limit and turn a legal
+    /// scan into a validation error, and incrementing the last byte with carry
+    /// has the same edge at the other end of the key space. One re-read row per
+    /// chunk costs less than either edge case being wrong.
+    from: Option<Vec<u8>>,
+    skip_resume: bool,
+    end: Option<Vec<u8>>,
+    limit: usize,
+    rows: Rows,
+    response: oneshot::Sender<std::result::Result<Rows, ReadFailure>>,
+    /// When this scan reached the worker, for the statement deadline.
+    started: Instant,
+}
+
 enum ReadRequest {
     Get {
         key: Vec<u8>,
@@ -701,13 +812,13 @@ enum ReadRequest {
     },
     MultiGet {
         keys: Vec<Vec<u8>>,
-        response: oneshot::Sender<vyrn_core::Result<Vec<Option<Vec<u8>>>>>,
+        response: oneshot::Sender<std::result::Result<Vec<Option<Vec<u8>>>, ReadFailure>>,
     },
     Scan {
         start: Option<Vec<u8>>,
         end: Option<Vec<u8>>,
         limit: usize,
-        response: oneshot::Sender<vyrn_core::Result<Rows>>,
+        response: oneshot::Sender<std::result::Result<Rows, ReadFailure>>,
     },
     IndexLookup {
         index: Vec<u8>,
@@ -748,7 +859,11 @@ enum WriteRequest {
     },
     Document {
         request: DocumentWrite,
-        response: oneshot::Sender<vyrn_core::Result<Message>>,
+        /// `Ok` carries the rendered answer — including a rendered storage error,
+        /// so its error code survives the trip through the ordered publication
+        /// point; `Err` is text supplied by the pipeline itself when a commit
+        /// could not be published. See [`DeferredAnswer`].
+        response: oneshot::Sender<std::result::Result<Message, String>>,
     },
     CreateIndex {
         name: Vec<u8>,
@@ -798,12 +913,33 @@ struct TransactionCheck {
     index_updates: Vec<IndexUpdate>,
 }
 
+/// One member of a batch, as conflict validation sees it.
+///
+/// A plain operation carries only the key it writes. It can never be the request
+/// that gets rejected — it has no snapshot and read nothing, so nothing can have
+/// invalidated it — but it MUST be visible to the transactions ordered after it,
+/// which is precisely what was missing: a batch validated as if bare puts and
+/// deletes were not there.
+enum BatchEntry {
+    Plain { key: Vec<u8> },
+    Transaction(TransactionCheck),
+}
+
+/// What the write pipeline needs.
+///
+/// NO `readers` AND NO `changes`, deliberately. This stage applies batches and
+/// hands them on; refreshing the read handles and broadcasting changes belong to
+/// the flush stage alone, because that is the stage that knows a commit is
+/// durable and that visits commits in order. The write worker held both handles
+/// while the document arm published from here, which is exactly how a document
+/// change could reach a subscriber ahead of an earlier key/value commit still
+/// waiting on its barrier. Their absence is what makes that reorder
+/// unrepresentable rather than merely fixed: there is nothing here to publish
+/// with.
 struct WriteWorkerConfig {
     maximum_batch: usize,
     delay: Duration,
     checkpoint_writes: u64,
-    readers: Arc<Vec<RwLock<ReadEngine>>>,
-    changes: Arc<ChangeRing>,
     metrics: Arc<Metrics>,
     /// Set when accumulated writes have crossed the checkpoint threshold, so the
     /// background task compacts instead of a client's commit paying for it.
@@ -845,11 +981,16 @@ struct FlushWorkerConfig {
 /// completion stage lets the write worker start the next batch immediately, so
 /// one batch's `fdatasync` overlaps the next batch's tree work.
 struct PendingFlush {
-    /// `None` when no flush is owed, as in async durability, where records are
-    /// buffered for the background sync instead of being written on commit.
+    /// `None` when no flush is owed: async durability, where records are buffered
+    /// for the background sync, and document writes, which take an immediate
+    /// barrier inside the engine write lock and are already durable when they
+    /// reach this stage. They pass through it anyway so their changes are
+    /// broadcast in commit order — see [`DeferredAnswer`].
     lsn: Option<u64>,
     requests: Vec<WriteRequest>,
     results: Vec<BatchResult>,
+    /// Clients of requests that committed alone rather than joining the batch.
+    answers: Vec<DeferredAnswer>,
     published: Vec<change_log::ChangeRecord>,
     generation: u64,
     root: u64,
@@ -857,6 +998,36 @@ struct PendingFlush {
     /// When this batch was handed to the flush stage, so the wait for a barrier
     /// already in flight is charged separately from the barrier itself.
     queued: Instant,
+}
+
+/// A committed request whose answer waits on the ordered publication point.
+///
+/// WHY THIS EXISTS — the change-feed reorder it removes. Document writes commit
+/// alone under the engine write lock with an IMMEDIATE barrier, so they are
+/// durable the moment they are applied, while batched key/value commits defer
+/// their barrier to the flush stage. Broadcasting each from where it committed
+/// therefore raced by construction: the document arm published straight from the
+/// write pipeline while an EARLIER key/value commit was still sitting in the
+/// flush queue waiting for its `fdatasync`. A subscriber under mixed document and
+/// key/value load saw the later change first, and a subscriber replaying from a
+/// cursor afterwards saw them in the other order — the same stream in two
+/// different orders, which makes a change feed unusable for anything that
+/// reconstructs state from it.
+///
+/// So a successful document write no longer answers where it commits. It carries
+/// its answer here, through the flush stage, and `publish_commit` broadcasts and
+/// answers it in flush-queue order. That queue is fed by ONE task that applies
+/// batches sequentially, so its order IS commit order, and there is now exactly
+/// one place in this file that touches [`ChangeRing::send`].
+///
+/// The answer is a rendered [`Message`] rather than a `Result`, so a typed
+/// storage error keeps the error code `storage_error_message` chose for it
+/// (a unique-index violation stays `Conflict`, invalid JSON stays
+/// `InvalidRequest`) while the flush stage can still fail the request with text
+/// of its own.
+struct DeferredAnswer {
+    response: oneshot::Sender<std::result::Result<Message, String>>,
+    message: Message,
 }
 
 enum DocumentWrite {
@@ -900,6 +1071,11 @@ struct ServerState {
     read_queues: Vec<std::sync::mpsc::SyncSender<ReadRequest>>,
     next_reader: AtomicU64,
     engine: Arc<RwLock<Engine>>,
+    /// This node's WAL directory, consulted on a replica join to learn the oldest
+    /// LSN still on disk. Held as a path rather than a cached LSN because
+    /// checkpoints prune segments without announcing it, so anything cached would
+    /// go stale exactly when a joining replica needs it to be right.
+    wal_directory: PathBuf,
     transaction_timeout: Duration,
     metrics: Arc<Metrics>,
     /// Shared with the flush worker: connection handlers register replicas here,
@@ -931,6 +1107,12 @@ async fn main() -> Result<()> {
         || args.read_handles == 0
     {
         bail!("connection, authentication, checkpoint, and write queue limits must be greater than zero");
+    }
+    /* A zero deadline would abandon every read before it began, including the
+     * ones a health check makes, so the server would start and then serve
+     * nothing. Refused at startup rather than discovered in production. */
+    if args.statement_deadline_ms == 0 {
+        bail!("VYRN_STATEMENT_DEADLINE_MS must be greater than zero");
     }
     if args.allow_plaintext && args.tls_cert_file.is_some() {
         bail!("choose TLS or plaintext; one listener cannot serve both");
@@ -992,9 +1174,11 @@ async fn main() -> Result<()> {
         Duration::from_millis(args.replication_ack_timeout_ms),
     );
     if replication.enabled() {
-        eprintln!(
-            "synchronous replication enabled: {} acknowledgement(s) required, {}ms timeout",
-            args.replication_min_acks, args.replication_ack_timeout_ms
+        log_info!(
+            "vyrnd.replication",
+            "synchronous replication enabled",
+            min_acks = args.replication_min_acks,
+            ack_timeout_ms = args.replication_ack_timeout_ms
         );
     }
     /* The sink is attached ONLY when replication is on. With it absent the
@@ -1048,7 +1232,11 @@ async fn main() -> Result<()> {
                 .context("failed to publish the recovered root to a read handle")?;
         }
     }
-    let read_queues = start_read_workers(&readers, args.write_queue_capacity);
+    let read_queues = start_read_workers(
+        &readers,
+        args.write_queue_capacity,
+        Duration::from_millis(args.statement_deadline_ms),
+    );
     let engine = Arc::new(RwLock::new(engine));
     let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
     let change_sender = Arc::new(ChangeRing::new(args.write_queue_capacity));
@@ -1118,8 +1306,6 @@ async fn main() -> Result<()> {
             maximum_batch: args.write_batch_size,
             delay: Duration::from_micros(args.write_batch_delay_us),
             checkpoint_writes: args.checkpoint_writes,
-            readers: Arc::clone(&readers),
-            changes: Arc::clone(&change_sender),
             metrics: Arc::clone(&metrics),
             checkpoint_due: Arc::clone(&checkpoint_due),
             in_flight,
@@ -1138,6 +1324,7 @@ async fn main() -> Result<()> {
         read_queues,
         next_reader: AtomicU64::new(0),
         engine: Arc::clone(&engine),
+        wal_directory: args.data.join("wal"),
         transaction_timeout: Duration::from_secs(args.transaction_timeout_seconds),
         metrics: Arc::clone(&metrics),
         replication: Arc::clone(&replication),
@@ -1169,12 +1356,17 @@ async fn main() -> Result<()> {
             ca_file: args.replica_ca_file.clone(),
             replica_id,
             allow_plaintext: args.allow_plaintext,
+            wal_archive_dir: args.replica_wal_archive_dir.clone(),
             readers: Arc::clone(&readers),
         };
         tokio::spawn(async move {
             if let Err(error) = replica::run(replica_engine, config).await {
                 // Fatal replica errors are divergence, which retrying cannot fix.
-                eprintln!("replication stopped: {error:#}");
+                log_error!(
+                    "vyrnd.replication",
+                    "replication stopped; this replica will not catch up without an operator",
+                    detail = format!("{error:#}")
+                );
             }
         });
     }
@@ -1194,16 +1386,30 @@ async fn main() -> Result<()> {
     metrics.ready.store(true, Ordering::Release);
     let connection_limit = Arc::new(Semaphore::new(args.max_connections));
 
-    println!(
-        "vyrnd {} listening on {} ({})",
-        env!("CARGO_PKG_VERSION"),
-        args.bind,
-        if tls_acceptor.is_some() {
-            "TLS 1.3"
-        } else {
-            "PLAINTEXT DEVELOPMENT MODE"
-        }
+    log_info!(
+        "vyrnd",
+        "listening",
+        version = env!("CARGO_PKG_VERSION"),
+        bind = args.bind,
+        admin_bind = args.admin_bind,
+        tls = tls_acceptor.is_some(),
+        data = args.data.display(),
+        durability = args.durability,
+        checkpoint_writes = args.checkpoint_writes,
+        max_connections = args.max_connections
     );
+    /* Plaintext gets its own record at WARN rather than a parenthetical on the
+     * line above. An operator scanning for problems filters by severity; a
+     * server accepting unencrypted credentials on a network is a problem, and
+     * hiding it inside an INFO message about binding is how it reaches
+     * production unnoticed. */
+    if tls_acceptor.is_none() {
+        log_warn!(
+            "vyrnd",
+            "TLS is disabled; credentials and data cross the network in the clear",
+            bind = args.bind
+        );
+    }
 
     loop {
         tokio::select! {
@@ -1220,14 +1426,29 @@ async fn main() -> Result<()> {
                     if let Err(error) =
                         handle_connection(stream, tls_acceptor, state, peer.ip()).await
                     {
-                        eprintln!("connection {peer} closed: {error}");
+                        /* DEBUG, not INFO: this fires once per connection that
+                         * ends badly, and a client looping on a refused
+                         * credential or a flaky network would otherwise fill the
+                         * log with records about itself. The counters and the
+                         * auth records carry what an operator needs at INFO. */
+                        log_debug!(
+                            "vyrnd.connection",
+                            "connection closed with an error",
+                            peer = peer,
+                            detail = error
+                        );
                     }
                 });
             }
             result = shutdown_signal() => {
                 result.context("failed to listen for shutdown signal")?;
                 metrics.ready.store(false, Ordering::Release);
-                println!("vyrnd draining connections");
+                log_info!(
+                    "vyrnd",
+                    "signal received, draining connections",
+                    open = metrics.active_connections.load(Ordering::Acquire),
+                    timeout_s = args.shutdown_timeout_seconds
+                );
                 break;
             }
         }
@@ -1250,7 +1471,23 @@ async fn main() -> Result<()> {
     let drained = metrics.drained.notified();
     tokio::pin!(drained);
     if metrics.active_connections.load(Ordering::Acquire) != 0 {
-        let _ = timeout(Duration::from_secs(args.shutdown_timeout_seconds), drained).await;
+        /* The timeout's result was discarded, which made a drain that ran out of
+         * time indistinguishable from one that finished: both were followed by
+         * "shutdown complete" and an exit code of zero. Those are different
+         * events for whoever is reading the log after a rolling restart — one
+         * means every client finished its work, the other means some number of
+         * them were cut off mid-request — so the difference is now recorded. */
+        if timeout(Duration::from_secs(args.shutdown_timeout_seconds), drained)
+            .await
+            .is_err()
+        {
+            log_warn!(
+                "vyrnd",
+                "drain timed out; connections were closed with work in flight",
+                open = metrics.active_connections.load(Ordering::Acquire),
+                timeout_s = args.shutdown_timeout_seconds
+            );
+        }
     }
 
     /* FINAL SYNC. In `--durability async` mode a commit is acknowledged before
@@ -1275,15 +1512,23 @@ async fn main() -> Result<()> {
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            eprintln!("failed to sync storage on shutdown: {error}");
+            log_error!(
+                "vyrnd.shutdown",
+                "storage sync failed on shutdown; acknowledged writes may be lost",
+                detail = error
+            );
             bail!("shutdown could not make acknowledged writes durable: {error}");
         }
         Err(error) => {
-            eprintln!("storage sync task failed on shutdown: {error}");
+            log_error!(
+                "vyrnd.shutdown",
+                "storage sync task failed on shutdown; acknowledged writes may be lost",
+                detail = error
+            );
             bail!("shutdown could not make acknowledged writes durable");
         }
     }
-    println!("vyrnd shutdown complete");
+    log_info!("vyrnd", "shutdown complete");
     Ok(())
 }
 
@@ -1347,7 +1592,8 @@ async fn handle_connection(
      * before the auth-job permit is taken. That ordering is the whole point:
      * refusing after the hash would leave the expensive work reachable by an
      * unauthenticated peer, which is what the throttle exists to prevent. */
-    let authenticated = if state.auth_throttle.is_locked_out(peer) {
+    let locked_out = state.auth_throttle.is_locked_out(peer);
+    let authenticated = if locked_out {
         false
     } else {
         match first.message {
@@ -1381,6 +1627,29 @@ async fn handle_connection(
             .auth_failures_total
             .fetch_add(1, Ordering::Relaxed);
         state.auth_throttle.record_failure(peer);
+        /* A THROTTLE REFUSAL AND A BAD PASSWORD ARE DIFFERENT EVENTS, and the
+         * client cannot tell them apart by design — the response is identical so
+         * a guesser learns nothing about which addresses are locked. The log is
+         * where the distinction has to live: a run of `reason=throttled` means
+         * this address is being held out and is no longer paying for password
+         * hashes, while a run of `reason=rejected` means it still is.
+         *
+         * Nothing here names the credential. Not the password, not the username
+         * as supplied, not the stored hash — a log that records a failed
+         * authentication attempt records, by definition, a string somebody
+         * believed was a password, and those turn up in the right log often
+         * enough. The peer address is what an operator can act on.
+         *
+         * The reason is honest about its own precision: the verification folds
+         * hash, username and database mismatch into one boolean, and a malformed
+         * first frame lands here too, so `rejected` claims only that the
+         * handshake was refused. */
+        log_warn!(
+            "vyrnd.auth",
+            "authentication failed",
+            peer = peer,
+            reason = if locked_out { "throttled" } else { "rejected" }
+        );
         send_error(
             &mut framed,
             first.request_id,
@@ -1391,6 +1660,8 @@ async fn handle_connection(
         return Ok(());
     }
     state.auth_throttle.record_success(peer);
+    // DEBUG: one record per successful connection is per-request-shaped volume.
+    log_debug!("vyrnd.auth", "authenticated", peer = peer);
     send_frame(
         &mut framed,
         Envelope::new(first.request_id, Message::Authenticated),
@@ -1502,10 +1773,36 @@ async fn run_session(
                         .read()
                         .map(|engine| engine.last_lsn())
                         .unwrap_or(0);
-                    match replication::decide_join(last_lsn, primary_lsn) {
+                    /* The earliest LSN this primary can still supply. Checkpoints
+                     * delete sealed segments, so this rises over time and is the
+                     * fact that decides whether a lagging replica can be streamed
+                     * to at all. Read from the WAL directory rather than kept in
+                     * memory: which segments exist is something checkpoints change
+                     * without announcing, and a cached copy would go stale exactly
+                     * when a replica needs it to be right.
+                     *
+                     * A read failure reports 0, which means "nothing has been
+                     * pruned" and lets the replica stream. That is the safe
+                     * direction: the replica validates the join itself and refuses
+                     * a stream that does not abut its log, so an over-optimistic
+                     * answer here becomes a clear error there rather than a
+                     * silently holed log. */
+                    let oldest_available = task::spawn_blocking({
+                        let wal = state.wal_directory.clone();
+                        move || vyrn_core::replication::oldest_available_lsn(&wal)
+                    })
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .unwrap_or(0);
+                    match replication::decide_join(last_lsn, primary_lsn, oldest_available) {
                         replication::JoinDecision::Refuse(reason) => {
-                            eprintln!(
-                                "refused replica {replica_id:?} at LSN {last_lsn}: {reason}"
+                            log_warn!(
+                                "vyrnd.replication",
+                                "replica refused as diverged",
+                                replica = format!("{replica_id:?}"),
+                                last_lsn = last_lsn,
+                                reason = reason
                             );
                             framed
                                 .send(Envelope::new(
@@ -1515,10 +1812,62 @@ async fn run_session(
                                 .await?;
                             return Ok(());
                         }
+                        /* A GAP, ANSWERED WITH THE TRUTH RATHER THAN A REFUSAL.
+                         *
+                         * The records this replica needs next have been pruned, so
+                         * the primary says where streaming can actually begin —
+                         * `oldest_available` — instead of pretending it can resume
+                         * from the replica's last LSN. That is not a special
+                         * protocol case: `ReplicaStream` has always meant "records
+                         * start here", and `replication::check_join` on the replica
+                         * side has always classified a `first_lsn` past its log as
+                         * `GapBeforeStream`. Telling the truth is therefore enough
+                         * for the replica to recognise the gap, size it exactly,
+                         * and close it from the WAL archive before consuming the
+                         * stream.
+                         *
+                         * This replaces a `ReplicaDiverged` refusal that left a
+                         * merely-lagging replica permanently broken — it retried,
+                         * was refused, retried again — while a `min-acks 1` primary
+                         * BLOCKED WRITES waiting for the quorum that replica was
+                         * supposed to provide. An outage that only manual
+                         * intervention could end, for the ordinary event of a
+                         * replica being offline across a few checkpoints.
+                         */
+                        replication::JoinDecision::Rebuild { reason } => {
+                            log_info!(
+                                "vyrnd.replication",
+                                "replica needs a rebuild; streaming from the oldest \
+                                 available LSN so it can close the gap from the archive",
+                                replica = format!("{replica_id:?}"),
+                                last_lsn = last_lsn,
+                                first_lsn = oldest_available,
+                                reason = reason
+                            );
+                            framed
+                                .send(Envelope::new(
+                                    request_id,
+                                    Message::ReplicaStream {
+                                        first_lsn: oldest_available,
+                                    },
+                                ))
+                                .await?;
+                            stream_records(
+                                &mut framed,
+                                &state.replication,
+                                oldest_available,
+                                &replica_id,
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                         replication::JoinDecision::Stream { first_lsn } => {
-                            eprintln!(
-                                "replica {replica_id:?} joined at LSN {first_lsn} \
-                                 (primary at {primary_lsn})"
+                            log_info!(
+                                "vyrnd.replication",
+                                "replica joined",
+                                replica = format!("{replica_id:?}"),
+                                first_lsn = first_lsn,
+                                primary_lsn = primary_lsn
                             );
                             framed
                                 .send(Envelope::new(
@@ -1679,7 +2028,10 @@ async fn register_transaction_snapshot(state: &ServerState) -> std::result::Resu
     let engine = Arc::clone(&state.engine);
     let sequence = task::spawn_blocking(move || {
         let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
-        Ok::<_, StorageError>(engine.register_snapshot_shared())
+        // Registration itself can fail on a poisoned snapshot registry, and that
+        // failure must reach the client as a refused `Begin`: a transaction whose
+        // pin was never recorded would read at a revision nothing is retaining.
+        engine.register_snapshot_shared()
     })
     .await
     .map_err(|_| "snapshot registration task failed".to_owned())?
@@ -1701,11 +2053,12 @@ async fn register_transaction_snapshot(state: &ServerState) -> std::result::Resu
 async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
     let engine = Arc::clone(&state.engine);
     let released = task::spawn_blocking(move || {
-        if let Ok(engine) = engine.read() {
-            engine.release_snapshot_shared(sequence);
-            true
-        } else {
-            false
+        // Two ways this can fail to release: the ENGINE lock is poisoned, or the
+        // snapshot REGISTRY's own mutex is. Both leave the revision pinned, so
+        // both report false and leave the gauge saying so.
+        match engine.read() {
+            Ok(engine) => engine.release_snapshot_shared(sequence).is_ok(),
+            Err(_) => false,
         }
     })
     .await;
@@ -1748,8 +2101,17 @@ async fn stream_records(
     // Always, on every exit path.
     replication.deregister(id);
     match &result {
-        Ok(()) => eprintln!("replica {replica_id:?} stream ended"),
-        Err(error) => eprintln!("replica {replica_id:?} stream failed: {error}"),
+        Ok(()) => log_info!(
+            "vyrnd.replication",
+            "replica stream ended",
+            replica = format!("{replica_id:?}")
+        ),
+        Err(error) => log_warn!(
+            "vyrnd.replication",
+            "replica stream failed",
+            replica = format!("{replica_id:?}"),
+            detail = error
+        ),
     }
     result
 }
@@ -1792,7 +2154,11 @@ async fn stream_records_inner(
                          reconnect to resume from the WAL archive",
                         replication::Replication::backlog()
                     );
-                    eprintln!("dropping replica stream: {reason}");
+                    log_warn!(
+                        "vyrnd.replication",
+                        "dropping replica stream",
+                        reason = reason
+                    );
                     framed
                         .send(Envelope::new(0, Message::ReplicaDiverged { reason }))
                         .await?;
@@ -1808,7 +2174,11 @@ async fn stream_records_inner(
                     Message::ReplicaDiverged { reason } => {
                         // The replica is refusing what it was sent. Its own log is
                         // the authority on that, so stop rather than keep pushing.
-                        eprintln!("replica reported divergence: {reason}");
+                        log_error!(
+                            "vyrnd.replication",
+                            "replica reported divergence",
+                            reason = reason
+                        );
                         return Ok(());
                     }
                     _ => {
@@ -2313,6 +2683,7 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
 fn start_read_workers(
     readers: &Arc<Vec<RwLock<ReadEngine>>>,
     capacity: usize,
+    deadline: Duration,
 ) -> Vec<std::sync::mpsc::SyncSender<ReadRequest>> {
     readers
         .iter()
@@ -2328,36 +2699,66 @@ fn start_read_workers(
                             Ok(reader) => reader,
                             Err(_) => break,
                         };
-                        match request {
-                            ReadRequest::Get { key, response } => {
-                                let _ = response.send(reader.get(&key));
+                        /* Scans this turn owes more chunks to, oldest first.
+                         *
+                         * THE STALL THIS FIXES: one thread serves one queue, so
+                         * a request that runs long is a queue every client on
+                         * this handle waits behind — a 10,000-row scan of large
+                         * values used to hold every point read behind it while
+                         * the other fifteen handles sat idle. Serving the scan
+                         * in chunks and admitting queued requests between them
+                         * turns "wait for the whole scan" into "wait for one
+                         * chunk".
+                         */
+                        let mut scans = std::collections::VecDeque::new();
+                        serve_read(&reader, request, &mut scans, deadline);
+                        /* THE SAME READ GUARD FOR EVERY CHUNK, deliberately.
+                         *
+                         * `ReadEngine::refresh` needs this handle's WRITE lock,
+                         * so holding the read guard across the chunks is what
+                         * keeps a chunked scan a snapshot: all of its chunks
+                         * descend one tree root, and no publish can move the
+                         * root out from under it mid-scan. Releasing the guard
+                         * between chunks would be the cheaper-looking choice and
+                         * would quietly make a single scan able to return rows
+                         * from two different commits — trading a stall for a
+                         * torn read, which is a worse bug than the one being
+                         * fixed.
+                         *
+                         * It costs nothing that was not already paid: a long
+                         * scan held this guard for its whole duration before
+                         * this change too, so writers wait exactly as long as
+                         * they did. What changes is only that OTHER READS no
+                         * longer wait for all of it.
+                         */
+                        while !scans.is_empty() {
+                            // Bounded admission: unbounded would let a steady
+                            // stream of point reads hold a scan at its first
+                            // chunk forever, and admitting none would put those
+                            // reads back behind the whole scan.
+                            for _ in 0..SCAN_YIELD_REQUESTS {
+                                match receiver.try_recv() {
+                                    Ok(request) => {
+                                        serve_read(&reader, request, &mut scans, deadline)
+                                    }
+                                    // Empty or disconnected: either way there is
+                                    // nothing to admit. A disconnect is noticed
+                                    // by the outer `recv` once the scans in hand
+                                    // have been answered, so their clients still
+                                    // get their rows during a shutdown.
+                                    Err(_) => break,
+                                }
                             }
-                            ReadRequest::MultiGet { keys, response } => {
-                                let result = keys.into_iter().map(|key| reader.get(&key)).collect();
-                                let _ = response.send(result);
-                            }
-                            ReadRequest::Scan {
-                                start,
-                                end,
-                                limit,
-                                response,
-                            } => {
-                                let _ = response.send(reader.scan(
-                                    start.as_deref(),
-                                    end.as_deref(),
-                                    limit,
-                                ));
-                            }
-                            ReadRequest::IndexLookup {
-                                index,
-                                value,
-                                limit,
-                                response,
-                            } => {
-                                let _ = response.send(reader.lookup_index(&index, &value, limit));
-                            }
-                            ReadRequest::Document { request, response } => {
-                                let _ = response.send(read_document(&reader, request));
+                            let Some(mut job) = scans.pop_front() else {
+                                break;
+                            };
+                            match advance_scan(&reader, &mut job, deadline) {
+                                Some(result) => {
+                                    let _ = job.response.send(result);
+                                }
+                                // Still owed chunks; back of the queue, so
+                                // several concurrent scans share the worker.
+                                None => scans.push_back(job),
                             }
                         }
                     }
@@ -2368,15 +2769,183 @@ fn start_read_workers(
         .collect()
 }
 
+/// Serves one read request, parking a scan for chunked execution.
+///
+/// Everything except a scan is answered here and now: a point read is one
+/// root-to-leaf descent, and chunking it would add bookkeeping to the cheapest
+/// path on the server.
+fn serve_read(
+    reader: &ReadEngine,
+    request: ReadRequest,
+    scans: &mut std::collections::VecDeque<ScanJob>,
+    deadline: Duration,
+) {
+    match request {
+        ReadRequest::Get { key, response } => {
+            let _ = response.send(reader.get(&key));
+        }
+        ReadRequest::MultiGet { keys, response } => {
+            let _ = response.send(multi_get(reader, keys, deadline));
+        }
+        ReadRequest::Scan {
+            start,
+            end,
+            limit,
+            response,
+        } => scans.push_back(ScanJob {
+            from: start,
+            skip_resume: false,
+            end,
+            limit,
+            rows: Vec::new(),
+            response,
+            started: Instant::now(),
+        }),
+        ReadRequest::IndexLookup {
+            index,
+            value,
+            limit,
+            response,
+        } => {
+            let _ = response.send(reader.lookup_index(&index, &value, limit));
+        }
+        ReadRequest::Document { request, response } => {
+            let _ = response.send(read_document(reader, request));
+        }
+    }
+}
+
+/// Reads every key of a multi-get, abandoning the statement at its deadline.
+///
+/// A multi-get is up to `MAX_SCAN_LIMIT` independent descents, so it is the
+/// other request that can occupy a worker far longer than any single read. It is
+/// not chunked — a partially-read multi-get has nothing useful to resume from,
+/// since the answer is positional — but the deadline is checked as it goes, so
+/// the worker stops rather than finishing 10,000 descents nobody is waiting for.
+fn multi_get(
+    reader: &ReadEngine,
+    keys: Vec<Vec<u8>>,
+    deadline: Duration,
+) -> std::result::Result<Vec<Option<Vec<u8>>>, ReadFailure> {
+    let started = Instant::now();
+    let mut values = Vec::with_capacity(keys.len());
+    for (position, key) in keys.iter().enumerate() {
+        // Checked every so often rather than per key: `Instant::now` is a
+        // syscall on some platforms and a point read is fast enough that
+        // sampling it 64 keys at a time still bounds the overshoot to
+        // milliseconds.
+        if position % 64 == 0 && started.elapsed() >= deadline {
+            return Err(ReadFailure::DeadlineExceeded);
+        }
+        values.push(reader.get(key)?);
+    }
+    Ok(values)
+}
+
+/// Reads the next chunk of `job`, returning its answer once it is complete.
+///
+/// `None` means the scan is unfinished and owes more chunks. The deadline is
+/// enforced HERE, between chunks, which is what makes it a bound on how long one
+/// statement may occupy a shared worker rather than merely a bound on how long
+/// its own client waits.
+fn advance_scan(
+    reader: &ReadEngine,
+    job: &mut ScanJob,
+    deadline: Duration,
+) -> Option<std::result::Result<Rows, ReadFailure>> {
+    if job.started.elapsed() >= deadline {
+        /* Answered as a failure with the partial rows discarded. Returning what
+         * was collected would be worse than useless: `Rows` carries no "there is
+         * more" marker, so a truncated result is indistinguishable from a range
+         * that genuinely ended there, and a client would silently process a
+         * prefix of its data believing it had all of it. */
+        return Some(Err(ReadFailure::DeadlineExceeded));
+    }
+    // One extra row when resuming, because the chunk restarts AT the last key
+    // already collected and drops it again.
+    let wanted =
+        (job.limit - job.rows.len()).min(SCAN_CHUNK_ROWS) + usize::from(job.skip_resume);
+    let chunk = match reader.scan(job.from.as_deref(), job.end.as_deref(), wanted) {
+        Ok(chunk) => chunk,
+        Err(error) => return Some(Err(error.into())),
+    };
+    // Short of what was asked for means the range is exhausted, so this is the
+    // last chunk however few rows the limit still allowed.
+    let exhausted = chunk.len() < wanted;
+    let mut chunk = chunk.into_iter().peekable();
+    if job.skip_resume
+        && chunk
+            .peek()
+            .is_some_and(|(key, _)| Some(key) == job.from.as_ref())
+    {
+        // The row this chunk resumed from, already delivered. The equality check
+        // makes the skip depend on what was actually read rather than on the
+        // assumption that the tree did not move — true today because the read
+        // guard is held across the chunks, and a fact this code should not
+        // silently rely on if that ever changes.
+        chunk.next();
+    }
+    job.rows.extend(chunk);
+    match job.rows.last() {
+        Some((key, _)) => {
+            job.from = Some(key.clone());
+            job.skip_resume = true;
+        }
+        // An empty first chunk: the range holds nothing at all.
+        None => return Some(Ok(std::mem::take(&mut job.rows))),
+    }
+    if exhausted || job.rows.len() >= job.limit {
+        return Some(Ok(std::mem::take(&mut job.rows)));
+    }
+    None
+}
+
+/// Names why a read request could not be handed to a worker.
+///
+/// THE MESSAGE THIS FIXES: every dispatch site used to answer "storage reader
+/// queue is full" for both `Full` and `Disconnected`. A disconnected queue means
+/// the worker THREAD IS GONE — it broke out of its loop on a poisoned handle
+/// lock, or it panicked — and that condition never clears, whereas a full queue
+/// clears as soon as the worker catches up. Telling an operator the queue is full
+/// sends them to look at load and concurrency limits for a fault that is neither:
+/// the honest answer is that the reader stopped and the process needs restarting.
+/// Distinguishing them costs one match on an error the channel already returns.
+fn read_dispatch_error(error: std::sync::mpsc::TrySendError<ReadRequest>) -> Message {
+    match error {
+        std::sync::mpsc::TrySendError::Full(_) => {
+            server_error(ErrorCode::Storage, "storage reader queue is full")
+        }
+        std::sync::mpsc::TrySendError::Disconnected(_) => server_error(
+            ErrorCode::Storage,
+            "storage reader stopped; this node cannot serve reads until it is restarted",
+        ),
+    }
+}
+
+/// Turns a read worker's failure into the client's answer.
+///
+/// A deadline is `InvalidRequest`, not `Storage`: nothing is broken, the
+/// statement asked for more of a shared worker than one statement may have, and
+/// the fix is in the request — a smaller limit or a narrower range. Classifying
+/// it as a storage fault would also route it through the retry logic clients
+/// apply to storage errors, so the same oversized scan would be resubmitted.
+fn read_failure_message(failure: ReadFailure) -> Message {
+    match failure {
+        ReadFailure::Storage(error) => storage_error_message(error),
+        ReadFailure::DeadlineExceeded => server_error(
+            ErrorCode::InvalidRequest,
+            "read exceeded its time limit and was abandoned; \
+             narrow the range or lower the limit",
+        ),
+    }
+}
+
 async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
     let (response, receiver) = oneshot::channel();
-    let index =
-        state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len();
-    if state.read_queues[index]
-        .try_send(ReadRequest::Get { key, response })
-        .is_err()
+    if let Err(error) =
+        state.read_queues[next_reader(state)].try_send(ReadRequest::Get { key, response })
     {
-        return server_error(ErrorCode::Storage, "storage reader queue is full");
+        return read_dispatch_error(error);
     }
     match receiver.await {
         Ok(Ok(value)) => Message::Value { value },
@@ -2387,17 +2956,14 @@ async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
 
 async fn submit_multi_get(state: &ServerState, keys: Vec<Vec<u8>>) -> Message {
     let (response, receiver) = oneshot::channel();
-    let index =
-        state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len();
-    if state.read_queues[index]
-        .try_send(ReadRequest::MultiGet { keys, response })
-        .is_err()
+    if let Err(error) =
+        state.read_queues[next_reader(state)].try_send(ReadRequest::MultiGet { keys, response })
     {
-        return server_error(ErrorCode::Storage, "storage reader queue is full");
+        return read_dispatch_error(error);
     }
     match receiver.await {
         Ok(Ok(values)) => Message::Values { values },
-        Ok(Err(error)) => storage_error_message(error),
+        Ok(Err(failure)) => read_failure_message(failure),
         Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
     }
 }
@@ -2409,22 +2975,17 @@ async fn submit_scan(
     limit: usize,
 ) -> Message {
     let (response, receiver) = oneshot::channel();
-    let index =
-        state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len();
-    if state.read_queues[index]
-        .try_send(ReadRequest::Scan {
-            start,
-            end,
-            limit,
-            response,
-        })
-        .is_err()
-    {
-        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    if let Err(error) = state.read_queues[next_reader(state)].try_send(ReadRequest::Scan {
+        start,
+        end,
+        limit,
+        response,
+    }) {
+        return read_dispatch_error(error);
     }
     match receiver.await {
         Ok(Ok(rows)) => Message::Rows { rows },
-        Ok(Err(error)) => storage_error_message(error),
+        Ok(Err(failure)) => read_failure_message(failure),
         Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
     }
 }
@@ -2456,11 +3017,10 @@ fn read_document(reader: &ReadEngine, request: DocumentRead) -> vyrn_core::Resul
 
 async fn submit_document_read(state: &ServerState, request: DocumentRead) -> Message {
     let (response, receiver) = oneshot::channel();
-    if state.read_queues[next_reader(state)]
-        .try_send(ReadRequest::Document { request, response })
-        .is_err()
+    if let Err(error) =
+        state.read_queues[next_reader(state)].try_send(ReadRequest::Document { request, response })
     {
-        return server_error(ErrorCode::Storage, "storage reader queue is full");
+        return read_dispatch_error(error);
     }
     match receiver.await {
         Ok(Ok(message)) => message,
@@ -2476,16 +3036,13 @@ async fn submit_index_lookup(
     limit: usize,
 ) -> Message {
     let (response, receiver) = oneshot::channel();
-    if state.read_queues[next_reader(state)]
-        .try_send(ReadRequest::IndexLookup {
-            index,
-            value,
-            limit,
-            response,
-        })
-        .is_err()
-    {
-        return server_error(ErrorCode::Storage, "storage reader queue is full");
+    if let Err(error) = state.read_queues[next_reader(state)].try_send(ReadRequest::IndexLookup {
+        index,
+        value,
+        limit,
+        response,
+    }) {
+        return read_dispatch_error(error);
     }
     match receiver.await {
         Ok(Ok(keys)) => Message::Keys { keys },
@@ -2603,8 +3160,11 @@ async fn submit_document(state: &Arc<ServerState>, request: DocumentWrite) -> Me
         return server_error(ErrorCode::Storage, "storage writer is unavailable");
     }
     match receiver.await {
+        // Already a rendered message, storage errors included: the pipeline
+        // renders them so an error code chosen for the fault survives the trip
+        // through the ordered publication point.
         Ok(Ok(message)) => message,
-        Ok(Err(error)) => storage_error_message(error),
+        Ok(Err(message)) => server_error(ErrorCode::Storage, &message),
         Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
     }
 }
@@ -2869,14 +3429,51 @@ fn start_mvcc_gc(
                     .write()
                     .map_err(|_| StorageError::Poisoned)
                     .and_then(|mut engine| {
-                        let collected = engine.collect_versions();
-                        if due || collected >= checkpoint_versions {
+                        /* `collect_versions` reports a poisoned shared-snapshot
+                         * registry rather than collecting without consulting it,
+                         * so the failure propagates here and the loop below takes
+                         * readiness down. Swallowing it would collect past a live
+                         * transaction's snapshot, which is the one thing the
+                         * registry exists to prevent. */
+                        let collected = engine.collect_versions()?;
+                        /* Timed around the compaction alone, and reported below.
+                         * A checkpoint rewrites the whole tree, so it is the
+                         * longest thing this process does and the first suspect
+                         * when write latency spikes — and it left no trace at all:
+                         * `vyrn_checkpoints_total` is incremented where the
+                         * checkpoint is SCHEDULED, on the write path, not here
+                         * where it runs, so the counter could not even confirm one
+                         * had happened. */
+                        let compacted = if due || collected >= checkpoint_versions {
+                            let started = Instant::now();
                             engine.checkpoint()?;
-                        }
-                        Ok(collected)
+                            Some(started.elapsed())
+                        } else {
+                            None
+                        };
+                        Ok((collected, compacted))
                     })
             })
             .await;
+            match &result {
+                Ok(Ok((collected, Some(elapsed)))) => log_info!(
+                    "vyrnd.checkpoint",
+                    "checkpoint completed",
+                    duration_ms = elapsed.as_millis(),
+                    versions_collected = collected,
+                    // Which threshold fired: a write-count trigger or the
+                    // retained-version one. They point at different workloads.
+                    trigger = if due { "write count" } else { "retained versions" }
+                ),
+                Ok(Ok((collected, None))) => log_debug!(
+                    "vyrnd.mvcc_gc",
+                    "collected versions without compacting",
+                    versions_collected = collected
+                ),
+                // Both failure paths take readiness down in the loop below, which
+                // is where the reason is recorded.
+                Ok(Err(_)) | Err(_) => {}
+            }
             // Republish the compacted generation to the read handles; otherwise
             // they keep serving the old generation's pages.
             if matches!(result, Ok(Ok(_))) && due {
@@ -2899,19 +3496,17 @@ fn start_mvcc_gc(
                 })
                 .await;
                 if !matches!(refreshed, Ok(Ok(()))) {
-                    metrics.storage_failed.store(true, Ordering::Release);
-                    metrics.ready.store(false, Ordering::Release);
+                    withdraw_readiness(&metrics, "mvcc gc reader refresh");
                     return;
                 }
             }
-            if let Ok(Ok(collected)) = result {
+            if let Ok(Ok((collected, _))) = result {
                 metrics.mvcc_gc_runs.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .mvcc_versions_collected
                     .fetch_add(collected as u64, Ordering::Relaxed);
             } else {
-                metrics.storage_failed.store(true, Ordering::Release);
-                metrics.ready.store(false, Ordering::Release);
+                withdraw_readiness(&metrics, "mvcc gc");
                 return;
             }
         }
@@ -2948,8 +3543,7 @@ fn start_wal_archiver(
             })
             .await;
             if !matches!(rotated, Ok(Ok(()))) {
-                metrics.storage_failed.store(true, Ordering::Release);
-                metrics.ready.store(false, Ordering::Release);
+                withdraw_readiness(&metrics, "wal archive rotate");
                 return;
             }
             // Copied without the engine lock: sealed segments are immutable,
@@ -2983,7 +3577,11 @@ fn start_wal_archiver(
                         .wal_archive_failures_total
                         .fetch_add(1, Ordering::Relaxed);
                     if let Ok(Err(error)) = other {
-                        eprintln!("wal archive tick failed: {error}");
+                        log_error!(
+                            "vyrnd.wal_archive",
+                            "archive tick failed",
+                            detail = error
+                        );
                     }
                 }
             }
@@ -3020,8 +3618,7 @@ fn start_async_sync(engine: Arc<RwLock<Engine>>, interval: Duration, metrics: Ar
             })
             .await;
             if !matches!(result, Ok(Ok(()))) {
-                metrics.storage_failed.store(true, Ordering::Release);
-                metrics.ready.store(false, Ordering::Release);
+                withdraw_readiness(&metrics, "async sync");
                 return;
             }
         }
@@ -3062,12 +3659,13 @@ fn start_write_worker(
              * reports itself inside the pipeline. */
             Ok(()) => {}
             Err(error) => {
-                eprintln!(
-                    "write worker terminated abnormally: {error}; \
-                     writes are unavailable until the process is restarted"
+                log_error!(
+                    "vyrnd.write_worker",
+                    "write worker terminated abnormally; writes are unavailable \
+                     until the process is restarted",
+                    detail = error
                 );
-                metrics.storage_failed.store(true, Ordering::Release);
-                metrics.ready.store(false, Ordering::Release);
+                withdraw_readiness(&metrics, "write worker supervisor");
             }
         }
     });
@@ -3105,65 +3703,86 @@ async fn run_write_pipeline(
          * request with them.
          */
         let first = match first {
+            /* A document write commits ALONE under the engine write lock, with an
+             * immediate barrier, so it is already durable when the blocking task
+             * returns. What it must NOT do is broadcast its own changes here: a
+             * key/value commit that happened earlier may still be in the flush
+             * queue waiting for its `fdatasync`, and publishing from this arm
+             * would put the later change on a subscriber's stream first. So the
+             * answer and the change records are handed to the flush stage, which
+             * is the one ordered publication point. See [`DeferredAnswer`].
+             */
             WriteRequest::Document { request, response } => {
                 let engine = Arc::clone(&engine);
                 let result = task::spawn_blocking(move || {
                     let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
                     let outcome = apply_document_write(&mut engine, request);
-                    let published = engine.last_published().to_vec();
+                    /* Change records are taken ONLY on success. `last_published`
+                     * holds whatever the previous successful commit published, and
+                     * a document write that fails before reaching the change log —
+                     * invalid JSON, an unknown collection, a unique violation —
+                     * leaves it untouched. Reading it unconditionally therefore
+                     * re-broadcast the PREVIOUS commit's records, delivering them
+                     * to every subscriber a second time under a cursor they had
+                     * already processed. */
+                    let published = match &outcome {
+                        Ok(_) => engine.last_published().to_vec(),
+                        Err(_) => Vec::new(),
+                    };
                     let (generation, root, len) = engine.committed_root();
                     Ok::<_, StorageError>((outcome, published, generation, root, len))
                 })
                 .await;
-                match result {
-                    Ok(Ok((outcome, published, generation, root, len))) => {
-                        if let Err(error) = &outcome {
-                            record_storage_error(&config.metrics, error);
+                let (message, published, generation, root, len) = match result {
+                    Ok(Ok((outcome, published, generation, root, len))) => match outcome {
+                        Ok((message, _)) => (message, published, generation, root, len),
+                        /* Nothing committed, so nothing is owed to the ordered
+                         * publication point and the client is answered here.
+                         * Rendered through `storage_error_message` so the code the
+                         * error deserves survives — a unique-index violation stays
+                         * `Conflict` rather than becoming a generic storage fault. */
+                        Err(error) => {
+                            record_storage_error(&config.metrics, "document write", &error);
+                            let _ = response.send(Ok(storage_error_message(error)));
+                            continue;
                         }
-                        let mut reader_failed = false;
-                        for reader in config.readers.iter() {
-                            match reader.write() {
-                                Ok(mut reader) => {
-                                    if let Err(error) = reader.refresh(generation, root, len) {
-                                        record_storage_error(&config.metrics, &error);
-                                        reader_failed = true;
-                                    }
-                                }
-                                Err(_) => {
-                                    config.metrics.storage_failed.store(true, Ordering::Release);
-                                    config.metrics.ready.store(false, Ordering::Release);
-                                    reader_failed = true;
-                                }
-                            }
-                        }
-                        for record in published {
-                            config.changes.send(ChangeEvent {
-                                sequence: record.sequence,
-                                key: record.key,
-                                value: record.value,
-                                cursor: Some(change_log::Cursor::new(
-                                    record.sequence,
-                                    record.index,
-                                )),
-                                // The ring sets this if it has to shed the payload.
-                                elided: false,
-                            });
-                        }
-                        let _ = response.send(match outcome {
-                            Ok((message, _)) if !reader_failed => Ok(message),
-                            Ok(_) => Err(StorageError::Poisoned),
-                            Err(error) => Err(error),
-                        });
-                    }
+                    },
+                    // The engine lock was poisoned: the write never ran.
                     Ok(Err(error)) => {
-                        record_storage_error(&config.metrics, &error);
-                        let _ = response.send(Err(error));
+                        record_storage_error(&config.metrics, "document write", &error);
+                        let _ = response.send(Ok(storage_error_message(error)));
+                        continue;
                     }
                     Err(_) => {
-                        config.metrics.storage_failed.store(true, Ordering::Release);
-                        config.metrics.ready.store(false, Ordering::Release);
-                        let _ = response.send(Err(StorageError::Poisoned));
+                        withdraw_readiness(&config.metrics, "document write task");
+                        let _ = response.send(Ok(storage_error_message(StorageError::Poisoned)));
+                        continue;
                     }
+                };
+                // Counted like a batch's barrier, so the flush stage's matching
+                // decrement balances and the write worker sees work outstanding.
+                config.in_flight.fetch_add(1, Ordering::AcqRel);
+                let queued = Instant::now();
+                if flushes
+                    .send(PendingFlush {
+                        // Already durable: this commit took its own barrier, so it
+                        // passes through the flush stage purely to be published in
+                        // order and must not make the group sync again.
+                        lsn: None,
+                        requests: Vec::new(),
+                        results: Vec::new(),
+                        answers: vec![DeferredAnswer { response, message }],
+                        published,
+                        generation,
+                        root,
+                        len,
+                        queued,
+                    })
+                    .await
+                    .is_err()
+                {
+                    config.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    return;
                 }
                 continue;
             }
@@ -3256,14 +3875,50 @@ async fn run_write_pipeline(
                 }
             }
         }
-        // Validate every batched transaction against its own snapshot, and
-        // also against the writes of earlier transactions in this same batch
-        // so grouping cannot let two conflicting commits through together.
+        /* Validate every batched transaction against its own snapshot, and
+         * against everything EARLIER IN THIS SAME BATCH already writes, so
+         * grouping cannot admit a conflicting pair.
+         *
+         * WHAT "EARLIER IN THIS BATCH" MEANS, and why position decides. The whole
+         * batch becomes one WAL record at one LSN, so no client can observe a
+         * state between two of its members. Validation therefore picks the
+         * serial order the queue already implies: request `i` is serialized after
+         * requests `0..i`. A transaction that read a key an EARLIER member writes
+         * read a value that order says it should not have seen, so it is
+         * rejected; a transaction that read a key a LATER member writes is fine,
+         * because it legitimately precedes that write.
+         *
+         * TWO HOLES THIS CLOSES, both of which let a conflicting pair commit
+         * together:
+         *
+         *   - PLAIN OPERATIONS WERE INVISIBLE. Only `Transaction` requests
+         *     contributed keys, so a bare `Put`/`Delete` batched alongside a
+         *     transaction that had READ that key was not a conflict for anybody:
+         *     the transaction validated clean against its snapshot (the put was
+         *     not committed yet — it is in this very batch) and the put has no
+         *     reads of its own to invalidate. Both committed, and the
+         *     transaction's write was decided from a value the same commit
+         *     overwrote. A plain operation can never be the request that is
+         *     rejected — it has no snapshot and no reads — but it must be visible
+         *     to the transactions ordered after it.
+         *
+         *   - INDEX CLAIMS WERE INVISIBLE. A transaction's `index_reads` were
+         *     checked against the engine but not against the index entries
+         *     earlier members of the batch add or remove, so "look up who holds
+         *     this index value, then write based on the answer" — the shape of
+         *     every uniqueness check a client performs itself — grouped with the
+         *     transaction that changes that answer and both committed.
+         *
+         * Tracked as `(index, value)` pairs rather than as encoded index entry
+         * keys because the encoding is `vyrn-core`'s private business; the pair
+         * is what an `index_reads` entry names anyway, so the comparison is
+         * direct.
+         */
         if requests
             .iter()
             .any(|request| matches!(request, WriteRequest::Transaction { .. }))
         {
-            let checks: Vec<_> = requests
+            let entries: Vec<_> = requests
                 .iter()
                 .enumerate()
                 .filter_map(|(index, request)| match request {
@@ -3275,7 +3930,7 @@ async fn run_write_pipeline(
                         operations,
                         index_updates,
                         ..
-                    } => Some(TransactionCheck {
+                    } => Some(BatchEntry::Transaction(TransactionCheck {
                         index,
                         snapshot_sequence: *snapshot_sequence,
                         read_keys: read_keys.clone(),
@@ -3283,42 +3938,35 @@ async fn run_write_pipeline(
                         index_reads: index_reads.clone(),
                         operations: operations.clone(),
                         index_updates: index_updates.clone(),
+                    })),
+                    WriteRequest::Operation { operation, .. } => Some(BatchEntry::Plain {
+                        key: operation_key(operation).to_vec(),
                     }),
-                    _ => None,
+                    /* Nothing else can be in a batch — the dispatch match above
+                     * `continue`s on every other kind and `drain_writes` parks
+                     * them — and if one ever were, contributing no claims is the
+                     * safe direction: it cannot mask a conflict, because a
+                     * request that reaches the batch responder it does not belong
+                     * to is answered with an error rather than applied. */
+                    WriteRequest::Document { .. }
+                    | WriteRequest::CreateIndex { .. }
+                    | WriteRequest::DropIndex { .. } => None,
                 })
                 .collect();
             let conflict_engine = Arc::clone(&engine);
             let verdict = task::spawn_blocking(move || {
                 let engine = conflict_engine.read().map_err(|_| StorageError::Poisoned)?;
-                let mut rejected = Vec::new();
-                // A hash set rather than a list: scanning every earlier write
-                // for each read key made validation quadratic in batch size,
-                // which capped transaction throughput as queue depth grew.
-                let mut committed_keys: HashSet<Vec<u8>> = HashSet::new();
-                for check in &checks {
-                    let overlaps_batch = check
-                        .read_keys
-                        .iter()
-                        .any(|key| committed_keys.contains(key));
-                    if overlaps_batch
-                        || has_conflict(
-                            &engine,
-                            check.snapshot_sequence,
-                            &check.read_keys,
-                            &check.read_ranges,
-                            &check.index_reads,
-                            &check.operations,
-                            &check.index_updates,
-                        )?
-                    {
-                        rejected.push(check.index);
-                    } else {
-                        committed_keys.extend(
-                            check.operations.iter().map(|op| operation_key(op).to_vec()),
-                        );
-                    }
-                }
-                Ok::<_, StorageError>(rejected)
+                reject_conflicts(&entries, |check| {
+                    has_conflict(
+                        &engine,
+                        check.snapshot_sequence,
+                        &check.read_keys,
+                        &check.read_ranges,
+                        &check.index_reads,
+                        &check.operations,
+                        &check.index_updates,
+                    )
+                })
             })
             .await;
             match verdict {
@@ -3342,13 +3990,12 @@ async fn run_write_pipeline(
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
-                    record_storage_error(&config.metrics, &error);
+                    record_storage_error(&config.metrics, "transaction conflict check", &error);
                     respond_writes(requests, Err(error.to_string()));
                     continue;
                 }
                 Err(_) => {
-                    config.metrics.storage_failed.store(true, Ordering::Release);
-                    config.metrics.ready.store(false, Ordering::Release);
+                    withdraw_readiness(&config.metrics, "conflict check task");
                     respond_writes(requests, Err("conflict check task failed".into()));
                     continue;
                 }
@@ -3432,6 +4079,9 @@ async fn run_write_pipeline(
                     lsn,
                     requests: Vec::new(),
                     results,
+                    // Only a request that committed alone carries one of these; a
+                    // batched commit answers through `requests`.
+                    answers: Vec::new(),
                     published,
                     generation,
                     root,
@@ -3473,12 +4123,11 @@ async fn run_write_pipeline(
                 }
             }
             Ok(Err(error)) => {
-                record_storage_error(&config.metrics, &error);
+                record_storage_error(&config.metrics, "batch apply", &error);
                 respond_writes(requests, Err(error.to_string()));
             }
             Err(_) => {
-                config.metrics.storage_failed.store(true, Ordering::Release);
-                config.metrics.ready.store(false, Ordering::Release);
+                withdraw_readiness(&config.metrics, "batch apply task");
                 respond_writes(requests, Err("storage writer task failed".into()));
             }
         }
@@ -3501,13 +4150,13 @@ fn finish_index_change(
     match result {
         Ok(Ok(outcome)) => {
             if let Err(error) = &outcome {
-                record_storage_error(&config.metrics, error);
+                record_storage_error(&config.metrics, "index change", error);
             }
             let _ = response.send(outcome);
         }
         // The engine lock was poisoned, so the request never ran.
         Ok(Err(error)) => {
-            record_storage_error(&config.metrics, &error);
+            record_storage_error(&config.metrics, "index change", &error);
             let _ = response.send(Err(error));
         }
         /* The blocking task itself died. Earlier this left the client waiting on
@@ -3515,8 +4164,7 @@ fn finish_index_change(
          * stopped"; answering explicitly keeps the reason attached to the
          * request. */
         Err(_) => {
-            config.metrics.storage_failed.store(true, Ordering::Release);
-            config.metrics.ready.store(false, Ordering::Release);
+            withdraw_readiness(&config.metrics, "index change task");
             let _ = response.send(Err(StorageError::Poisoned));
         }
     }
@@ -3614,12 +4262,11 @@ fn start_flush_worker(
                 let error = match synced {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => {
-                        record_storage_error(&config.metrics, &error);
+                        record_storage_error(&config.metrics, "WAL flush", &error);
                         Some(error.to_string())
                     }
                     Err(_) => {
-                        config.metrics.storage_failed.store(true, Ordering::Release);
-                        config.metrics.ready.store(false, Ordering::Release);
+                        withdraw_readiness(&config.metrics, "wal flush task");
                         Some("WAL flush task failed".into())
                     }
                 };
@@ -3654,7 +4301,14 @@ fn start_flush_worker(
                 if let Some(message) = error {
                     let covered = batch.len() as u64;
                     for flush in batch {
-                        respond_writes(flush.requests, Err(message.clone()));
+                        /* A document write coalesced into this group is answered
+                         * too, even though its own barrier already succeeded: it
+                         * is NOT published, because the ordered publication point
+                         * below is skipped, so reporting success would tell a
+                         * client to expect its change on a feed that never carried
+                         * it. Every request in a failed group gets the same answer
+                         * for the same reason. */
+                        fail_commit(flush.requests, flush.answers, &message);
                     }
                     // Release these before looping, or the write worker would keep
                     // accumulating behind a barrier that has already failed.
@@ -3678,16 +4332,7 @@ fn start_flush_worker(
             let mut stop = false;
             let mut remaining = batch.into_iter();
             for flush in remaining.by_ref() {
-                let PendingFlush {
-                    requests,
-                    results,
-                    published,
-                    generation,
-                    root,
-                    len,
-                    ..
-                } = flush;
-                if !publish_commit(&config, requests, results, published, generation, root, len) {
+                if !publish_commit(&config, flush) {
                     stop = true;
                     break;
                 }
@@ -3721,12 +4366,12 @@ fn start_flush_worker(
              * rather than the whole group.
              */
             for flush in remaining {
-                respond_writes(
+                fail_commit(
                     flush.requests,
-                    Err("write is durable but was not published: \
-                         the storage writer stopped before readers were refreshed; \
-                         it is readable after a restart"
-                        .into()),
+                    flush.answers,
+                    "write is durable but was not published: \
+                     the storage writer stopped before readers were refreshed; \
+                     it is readable after a restart",
                 );
             }
             // Release the writer before returning, so a failure here cannot leave
@@ -3744,16 +4389,33 @@ fn start_flush_worker(
 
 /// Refreshes the read handles, broadcasts the commit, and answers its clients.
 ///
+/// THE ONE ORDERED PUBLICATION POINT. Every change this server broadcasts goes
+/// through here, and this runs on the flush stage, which takes batches strictly
+/// in the order the single write pipeline produced them. That is what makes a
+/// subscriber's stream commit-ordered: commit order is queue order, and queue
+/// order is the order of the `ChangeRing::send` calls below.
+///
+/// Document writes reach here already durable (they took their own barrier) and
+/// carry their answers in `answers`; batched key/value commits carry theirs in
+/// `requests`. Both are answered after the same broadcast, so no client is told
+/// its write succeeded before the change it produced has been published.
+///
 /// Returns false when storage has failed and the flush stage must stop.
-fn publish_commit(
-    config: &FlushWorkerConfig,
-    requests: Vec<WriteRequest>,
-    results: Vec<BatchResult>,
-    published: Vec<change_log::ChangeRecord>,
-    generation: u64,
-    root: u64,
-    len: u64,
-) -> bool {
+///
+/// Takes the whole [`PendingFlush`] rather than its fields: everything here needs
+/// them together, and destructuring at the boundary means adding one more piece of
+/// per-commit state cannot silently miss a call site.
+fn publish_commit(config: &FlushWorkerConfig, flush: PendingFlush) -> bool {
+    let PendingFlush {
+        requests,
+        results,
+        answers,
+        published,
+        generation,
+        root,
+        len,
+        ..
+    } = flush;
     // Only now is the batch durable, so only now may readers publish it.
     //
     // A checkpoint may have compacted the tree while this batch was being
@@ -3774,9 +4436,8 @@ fn publish_commit(
                 }
             }
             Err(_) => {
-                config.metrics.storage_failed.store(true, Ordering::Release);
-                config.metrics.ready.store(false, Ordering::Release);
-                respond_writes(requests, Err("storage reader lock poisoned".into()));
+                withdraw_readiness(&config.metrics, "reader lock poisoned");
+                fail_commit(requests, answers, "storage reader lock poisoned");
                 return false;
             }
         }
@@ -3798,8 +4459,8 @@ fn publish_commit(
             .read()
             .is_ok_and(|engine| engine.committed_root().0 != generation);
         if !retired {
-            record_storage_error(&config.metrics, &error);
-            respond_writes(requests, Err(error.to_string()));
+            record_storage_error(&config.metrics, "reader refresh", &error);
+            fail_commit(requests, answers, &error.to_string());
             return false;
         }
     }
@@ -3816,7 +4477,26 @@ fn publish_commit(
         });
     }
     respond_writes(requests, Ok(results));
+    // Answered after the broadcast, like the batched requests above: a client
+    // must never learn its write committed before the change it produced is on
+    // the feed, or it can read its own write's absence from a subscription.
+    for answer in answers {
+        let _ = answer.response.send(Ok(answer.message));
+    }
     true
+}
+
+/// Fails everything one flush was carrying, whatever kind of request it was.
+///
+/// Both kinds have to be answered from every failure path: a `oneshot` sender
+/// dropped without a send tells its client only that the channel closed, which is
+/// the least informative answer available for a write whose fate this stage
+/// actually knows.
+fn fail_commit(requests: Vec<WriteRequest>, answers: Vec<DeferredAnswer>, message: &str) {
+    respond_writes(requests, Err(message.to_owned()));
+    for answer in answers {
+        let _ = answer.response.send(Err(message.to_owned()));
+    }
 }
 
 type DocumentChangeEvent = (Vec<u8>, Option<Vec<u8>>);
@@ -3878,6 +4558,17 @@ fn operation_key(operation: &BatchOperation) -> &[u8] {
     }
 }
 
+/// Answer for a request that reached the batch responder it does not belong to.
+///
+/// A routing bug rather than a storage fault, so it says so instead of borrowing
+/// `Poisoned`'s "reopen the database to recover", which would send an operator
+/// looking for damage that does not exist. Answering at all is the point: the
+/// sender is owned here, and dropping it would leave the client waiting for its
+/// connection to time out. See the arms below for why this is not a panic.
+const MISROUTED_REQUEST: &str =
+    "request reached the wrong stage of the write pipeline and was not applied; \
+     this is a server routing bug — retrying is safe";
+
 fn respond_writes(
     requests: Vec<WriteRequest>,
     result: std::result::Result<Vec<BatchResult>, String>,
@@ -3902,7 +4593,7 @@ fn respond_writes(
                      * not an option either: its sender is owned here, so the
                      * client would block until its connection timed out. */
                     WriteRequest::Document { response, .. } => {
-                        let _ = response.send(Err(StorageError::Poisoned));
+                        let _ = response.send(Err(MISROUTED_REQUEST.to_owned()));
                     }
                     WriteRequest::CreateIndex { response, .. }
                     | WriteRequest::DropIndex { response, .. } => {
@@ -3933,7 +4624,7 @@ fn respond_writes(
                     }
                     // See the matching arms above: answered, not panicked.
                     WriteRequest::Document { response, .. } => {
-                        let _ = response.send(Err(StorageError::Poisoned));
+                        let _ = response.send(Err(MISROUTED_REQUEST.to_owned()));
                     }
                     WriteRequest::CreateIndex { response, .. }
                     | WriteRequest::DropIndex { response, .. } => {
@@ -3946,6 +4637,93 @@ fn respond_writes(
             }
         }
     }
+}
+
+/// Decides which transactions in one batch must be rejected, returning their
+/// positions in the batch.
+///
+/// THE BATCH-LOCAL HALF OF SERIALIZABILITY. `against_engine` answers "did anything
+/// COMMITTED invalidate this transaction"; this function answers the question that
+/// check cannot see — "did anything EARLIER IN THIS SAME BATCH invalidate it" —
+/// and the two together are what make grouping safe.
+///
+/// The whole batch becomes one WAL record at one LSN, so no client can observe a
+/// state between two of its members. Validation therefore adopts the serial order
+/// the queue already implies: entry `i` is serialized after entries `0..i`. A
+/// transaction that read something an EARLIER entry writes read a value that order
+/// says it could not have seen, and is rejected; one that read something a LATER
+/// entry writes is fine, because it legitimately precedes that write.
+///
+/// Split out of the pipeline as a pure function over the batch so it can be tested
+/// without spawning a server and racing two clients into the same batch — the
+/// grouping window is a timing property, and a test that has to win a race to
+/// reach the code under test is a test that passes when the code is broken.
+/// `against_engine` is injected for the same reason.
+fn reject_conflicts(
+    entries: &[BatchEntry],
+    mut against_engine: impl FnMut(&TransactionCheck) -> vyrn_core::Result<bool>,
+) -> vyrn_core::Result<Vec<usize>> {
+    let mut rejected = Vec::new();
+    // Hash sets rather than lists: scanning every earlier write for each read key
+    // made validation quadratic in batch size, which capped transaction
+    // throughput as queue depth grew.
+    let mut committed_keys: HashSet<Vec<u8>> = HashSet::new();
+    let mut committed_index_values: HashSet<(Vec<u8>, Vec<u8>)> = HashSet::new();
+    for entry in entries {
+        let check = match entry {
+            /* A plain operation joins the committed set unconditionally and is
+             * never a rejection candidate: it has no snapshot and read nothing, so
+             * nothing can have invalidated it. Being VISIBLE is its whole role
+             * here, and its absence was the hole — a batch was validated as if
+             * bare puts and deletes were not in it. */
+            BatchEntry::Plain { key } => {
+                committed_keys.insert(key.clone());
+                continue;
+            }
+            BatchEntry::Transaction(check) => check,
+        };
+        let overlaps_batch = check
+            .read_keys
+            .iter()
+            .any(|key| committed_keys.contains(key))
+            || check
+                .index_reads
+                .iter()
+                .any(|read| committed_index_values.contains(read))
+            /* Ranges are checked against the batch's own writes for the same
+             * reason they are checked against the engine: a key appearing inside
+             * a scanned range is a phantom whether the write that created it is
+             * already committed or merely earlier in this batch. The committed
+             * keys are iterated per range rather than the reverse because a
+             * transaction has a handful of ranges at most, while the batch's key
+             * set is the larger side. */
+            || check.read_ranges.iter().any(|(start, end)| {
+                committed_keys.iter().any(|key| {
+                    start.as_ref().is_none_or(|start| key >= start)
+                        && end.as_ref().is_none_or(|end| key < end)
+                })
+            });
+        if overlaps_batch || against_engine(check)? {
+            rejected.push(check.index);
+            // Deliberately contributes nothing: a rejected transaction does not
+            // commit, so its writes must not invalidate the ones ordered after it.
+            continue;
+        }
+        committed_keys.extend(check.operations.iter().map(|op| operation_key(op).to_vec()));
+        for update in &check.index_updates {
+            // The primary key too: `has_conflict` treats an index update as
+            // touching it, so the batch-local check has to agree or the two
+            // disagree about what counts as a write.
+            committed_keys.insert(update.primary_key.clone());
+            /* BOTH sides of a move. Removing a primary key from one index value
+             * and adding it to another changes the answer to a lookup of either,
+             * so a transaction that read either value is stale. */
+            for value in [&update.old_value, &update.new_value].into_iter().flatten() {
+                committed_index_values.insert((update.index.clone(), value.clone()));
+            }
+        }
+    }
+    Ok(rejected)
 }
 
 fn has_conflict(
@@ -3985,11 +4763,62 @@ fn has_conflict(
     Ok(false)
 }
 
-fn record_storage_error(metrics: &Metrics, error: &StorageError) {
+/// Marks storage failed, takes readiness down, and says why.
+///
+/// The two stores always moved together, at thirteen sites, and not one of them
+/// recorded a reason. So `/health/ready` began answering 503 and the process
+/// offered no account of which background task had died — the single hardest
+/// state to diagnose in this server, because every counter keeps its last value
+/// and the log stayed silent. `reason` names the site.
+///
+/// `record_storage_error` handles the case where a `StorageError` is in hand;
+/// this is for the ones where there is no error to report, only a task that
+/// cannot continue — a `JoinError` from a panicked worker, or a poisoned lock.
+fn withdraw_readiness(metrics: &Metrics, reason: &str) {
+    metrics.storage_failed.store(true, Ordering::Release);
+    metrics.ready.store(false, Ordering::Release);
+    log_error!(
+        "vyrnd",
+        "readiness withdrawn; this node has stopped serving",
+        reason = reason
+    );
+}
+
+/// Counts a storage failure, withdraws readiness when it is one, and logs it.
+///
+/// `operation` names the path that failed. It is worth the parameter: nine call
+/// sites funnel through here, and "storage operation failed" without a subject
+/// tells an operator only that something broke somewhere in the engine.
+///
+/// LOGGED HERE RATHER THAN AT THE CALL SITES, for the reason the logging exists
+/// at all: `docs/production.md` tells an operator to act when a storage error is
+/// logged, and until now nothing logged one. Every path that records a storage
+/// failure already passes through this function, so putting the record here makes
+/// that promise true everywhere at once and keeps a future call site from
+/// silently opting out of it.
+///
+/// The severity split matches the readiness split rather than inventing a second
+/// judgement. `Poisoned` and `Io` mean this node's storage is broken and it has
+/// stopped serving, which is an operator's problem now; anything else is a single
+/// failed operation on a server that is still healthy, which is a warning.
+fn record_storage_error(metrics: &Metrics, operation: &str, error: &StorageError) {
     metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
     if matches!(error, StorageError::Poisoned | StorageError::Io(_)) {
         metrics.storage_failed.store(true, Ordering::Release);
         metrics.ready.store(false, Ordering::Release);
+        log_error!(
+            "vyrnd.storage",
+            "storage failure; readiness withdrawn",
+            operation = operation,
+            detail = error
+        );
+    } else {
+        log_warn!(
+            "vyrnd.storage",
+            "storage operation failed",
+            operation = operation,
+            detail = error
+        );
     }
 }
 
@@ -4195,6 +5024,233 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use tempfile::tempdir;
+
+    /// A transaction check that has read `read_keys` and writes `writes`.
+    ///
+    /// `snapshot_sequence` is irrelevant to these tests: they pass an
+    /// `against_engine` that always answers false, isolating the batch-local half
+    /// of validation, which is the half the grouping bugs were in.
+    fn check(
+        index: usize,
+        read_keys: &[&[u8]],
+        writes: &[&[u8]],
+        index_reads: &[(&[u8], &[u8])],
+        index_updates: Vec<IndexUpdate>,
+    ) -> BatchEntry {
+        BatchEntry::Transaction(TransactionCheck {
+            index,
+            snapshot_sequence: 0,
+            read_keys: read_keys.iter().map(|key| key.to_vec()).collect(),
+            read_ranges: Vec::new(),
+            index_reads: index_reads
+                .iter()
+                .map(|(index, value)| (index.to_vec(), value.to_vec()))
+                .collect(),
+            operations: writes
+                .iter()
+                .map(|key| BatchOperation::Put(key.to_vec(), b"v".to_vec()))
+                .collect(),
+            index_updates,
+        })
+    }
+
+    /// Validation with the engine check stubbed out to "nothing committed".
+    fn rejected(entries: &[BatchEntry]) -> Vec<usize> {
+        reject_conflicts(entries, |_| Ok(false)).expect("validation should not fail")
+    }
+
+    /* THE HOLE THIS CLOSES: a bare `Put`/`Delete` batched with a transaction that
+     * had READ that key was invisible to validation. The transaction validated
+     * clean against its snapshot — the put is in this very batch, not yet
+     * committed — and the put has no reads of its own, so neither was rejected.
+     * Both committed, and the transaction's write was decided from a value the
+     * same commit overwrote: write skew created purely by grouping.
+     *
+     * A unit test rather than two racing clients: whether two requests land in one
+     * batch is a timing property of an idle server's accumulation window, so an
+     * integration test would have to win a race to reach this code at all — and
+     * would pass, quietly, whenever it lost. */
+    #[test]
+    fn a_plain_write_earlier_in_the_batch_conflicts_with_a_transaction_that_read_it() {
+        let entries = vec![
+            BatchEntry::Plain {
+                key: b"balance".to_vec(),
+            },
+            check(1, &[b"balance"], &[b"withdrawal"], &[], Vec::new()),
+        ];
+        assert_eq!(
+            rejected(&entries),
+            vec![1],
+            "a transaction that read a key a plain write earlier in its own batch \
+             overwrites must be rejected; admitting both is write skew that only \
+             grouping created"
+        );
+    }
+
+    /// The mirror case, which is what stops the fix from being "reject everything":
+    /// a plain write ORDERED AFTER the transaction invalidates nothing, because the
+    /// transaction legitimately precedes it in the batch's serial order.
+    #[test]
+    fn a_plain_write_later_in_the_batch_does_not_conflict() {
+        let entries = vec![
+            check(0, &[b"balance"], &[b"withdrawal"], &[], Vec::new()),
+            BatchEntry::Plain {
+                key: b"balance".to_vec(),
+            },
+        ];
+        assert!(
+            rejected(&entries).is_empty(),
+            "a transaction serialized BEFORE a plain write in the same batch is legal; \
+             rejecting it would fail commits that have no conflict"
+        );
+    }
+
+    /* THE SECOND HOLE: index claims. A client's own uniqueness check is "look up
+     * who holds this value, then write based on the answer", and two transactions
+     * doing that concurrently must not both commit. Index reads were checked
+     * against the engine but not against the index entries earlier members of the
+     * same batch add or remove, so grouped they both passed. */
+    #[test]
+    fn an_index_claim_earlier_in_the_batch_conflicts_with_a_lookup_of_that_value() {
+        let claim = IndexUpdate {
+            index: b"email".to_vec(),
+            primary_key: b"users/first".to_vec(),
+            old_value: None,
+            new_value: Some(b"a@example.com".to_vec()),
+        };
+        let entries = vec![
+            check(0, &[], &[b"users/first"], &[], vec![claim]),
+            check(
+                1,
+                &[],
+                &[b"users/second"],
+                &[(b"email", b"a@example.com")],
+                Vec::new(),
+            ),
+        ];
+        assert_eq!(
+            rejected(&entries),
+            vec![1],
+            "a transaction that looked up an index value another member of its batch \
+             claims must be rejected, or the uniqueness it verified is violated by the \
+             pair of them"
+        );
+    }
+
+    /// Both sides of a move, because removing a primary key from one index value
+    /// changes the answer to a lookup of THAT value just as much as adding it
+    /// changes the answer for the new one.
+    #[test]
+    fn vacating_an_index_value_conflicts_with_a_lookup_of_the_old_value() {
+        let move_away = IndexUpdate {
+            index: b"email".to_vec(),
+            primary_key: b"users/first".to_vec(),
+            old_value: Some(b"old@example.com".to_vec()),
+            new_value: Some(b"new@example.com".to_vec()),
+        };
+        let entries = vec![
+            check(0, &[], &[b"users/first"], &[], vec![move_away]),
+            check(
+                1,
+                &[],
+                &[b"audit"],
+                &[(b"email", b"old@example.com")],
+                Vec::new(),
+            ),
+        ];
+        assert_eq!(
+            rejected(&entries),
+            vec![1],
+            "a lookup of the index value an earlier batch member VACATED is stale too; \
+             only checking the new value would miss half of every move"
+        );
+    }
+
+    /// An index read of an untouched value must still pass, or the check would
+    /// reject every transaction that consults any index at all.
+    #[test]
+    fn an_index_lookup_of_an_untouched_value_does_not_conflict() {
+        let claim = IndexUpdate {
+            index: b"email".to_vec(),
+            primary_key: b"users/first".to_vec(),
+            old_value: None,
+            new_value: Some(b"a@example.com".to_vec()),
+        };
+        let entries = vec![
+            check(0, &[], &[b"users/first"], &[], vec![claim]),
+            check(
+                1,
+                &[],
+                &[b"audit"],
+                &[(b"email", b"someone-else@example.com")],
+                Vec::new(),
+            ),
+        ];
+        assert!(
+            rejected(&entries).is_empty(),
+            "an index lookup of a value nothing in the batch touched is not a conflict"
+        );
+    }
+
+    /// A rejected transaction must not invalidate the ones after it: it does not
+    /// commit, so its writes never happen and cannot have been read.
+    #[test]
+    fn a_rejected_transaction_does_not_reject_the_ones_after_it() {
+        let entries = vec![
+            BatchEntry::Plain {
+                key: b"balance".to_vec(),
+            },
+            // Rejected: read a key the plain write above overwrites.
+            check(1, &[b"balance"], &[b"doomed"], &[], Vec::new()),
+            // Reads only what the rejected transaction would have written.
+            check(2, &[b"doomed"], &[b"fine"], &[], Vec::new()),
+        ];
+        assert_eq!(
+            rejected(&entries),
+            vec![1],
+            "a transaction reading a key that only a REJECTED transaction would have \
+             written must commit: that write never happened"
+        );
+    }
+
+    /// A scanned range is checked against the batch's own writes, because a key
+    /// appearing inside it is a phantom whether the write that created it is
+    /// already committed or merely earlier in the same batch.
+    #[test]
+    fn a_batch_write_inside_a_scanned_range_is_a_phantom() {
+        let mut inside = check(1, &[], &[b"audit"], &[], Vec::new());
+        if let BatchEntry::Transaction(check) = &mut inside {
+            check.read_ranges = vec![(Some(b"users/".to_vec()), Some(b"users0".to_vec()))];
+        }
+        let entries = vec![
+            BatchEntry::Plain {
+                key: b"users/new".to_vec(),
+            },
+            inside,
+        ];
+        assert_eq!(
+            rejected(&entries),
+            vec![1],
+            "a key written earlier in the batch inside a range this transaction \
+             scanned is a phantom and must be caught"
+        );
+
+        // And a write OUTSIDE the range is not.
+        let mut outside = check(1, &[], &[b"audit"], &[], Vec::new());
+        if let BatchEntry::Transaction(check) = &mut outside {
+            check.read_ranges = vec![(Some(b"users/".to_vec()), Some(b"users0".to_vec()))];
+        }
+        let entries = vec![
+            BatchEntry::Plain {
+                key: b"accounts/new".to_vec(),
+            },
+            outside,
+        ];
+        assert!(
+            rejected(&entries).is_empty(),
+            "a write outside every scanned range is not a phantom"
+        );
+    }
 
     /// The quantile is only worth reading if the bucket it names actually holds
     /// the value, so index and lower bound have to agree in both directions.

@@ -331,34 +331,81 @@ impl RecordSink for ReplicationSink {
 pub enum JoinDecision {
     /// Stream live records starting at `first_lsn`.
     Stream { first_lsn: u64 },
-    /// Refuse: the histories cannot be joined by streaming.
+    /// The replica cannot be caught up by streaming, but CAN be rebuilt.
+    ///
+    /// The primary answers with a base backup plus the archived WAL the replica
+    /// needs, and the replica replaces its data directory with the result. See
+    /// [`JoinDecision::Rebuild`]'s use in `main.rs`.
+    Rebuild { reason: String },
+    /// Refuse: the histories cannot be joined at all.
     Refuse(String),
 }
 
 /// Decides whether a replica at `replica_lsn` can join a primary at `primary_lsn`.
 ///
-/// The gap case is the interesting one. A replica behind the primary is normal
-/// and streaming closes the gap — but only if the primary still HOLDS those
-/// records. Live records are broadcast from the point of subscription, so a
-/// replica that is behind by more than the broadcast buffer cannot be caught up
-/// by streaming alone and must replay from the WAL archive first.
+/// THE GAP CASE IS WHY THIS RETURNS THREE THINGS RATHER THAN TWO. A replica
+/// behind the primary is normal and streaming closes the gap — but only if the
+/// records in between still EXIST somewhere the primary can reach. A replica that
+/// was down long enough for a checkpoint to prune the segments it needs, and for
+/// the archive to be pruned too, cannot be caught up by streaming: the records it
+/// is missing are gone.
+///
+/// That used to be [`JoinDecision::Refuse`], which meant a replica that had
+/// merely been offline for a while came back permanently broken — it retried, was
+/// refused, and stayed refused until an operator noticed and rebuilt it by hand.
+/// A synchronous primary with `min-acks 1` is meanwhile BLOCKING WRITES for want
+/// of that replica, so the failure mode was an outage that only manual
+/// intervention could end. So the gap now asks for a rebuild instead: the primary
+/// ships a base backup, the replica adopts it and streams on from there. Slower
+/// than streaming by exactly the size of the database, and it is automatic.
+///
+/// `replica_lsn == 0` is the ordinary first join of an empty replica, NOT a gap:
+/// there is nothing on that node to be inconsistent with, so streaming from LSN 1
+/// is correct whenever the primary still holds LSN 1. It only needs a rebuild if
+/// the primary has pruned that far, which is the same test every other lagging
+/// replica gets.
 ///
 /// This function deliberately does not consult the archive: whether the archive
 /// can serve a given LSN is an I/O question, and answering it here would put
-/// filesystem access on the connection-accept path. The replica is told what it
-/// needs and asks for it.
-pub fn decide_join(replica_lsn: u64, primary_lsn: u64) -> JoinDecision {
+/// filesystem access on the connection-accept path. The caller passes in
+/// `oldest_available_lsn` — the earliest LSN the primary can still supply from
+/// its live WAL — which it already knows.
+pub fn decide_join(
+    replica_lsn: u64,
+    primary_lsn: u64,
+    oldest_available_lsn: u64,
+) -> JoinDecision {
     // Ahead of the primary: unreachable by streaming, and appending the
-    // primary's next record would rewrite this replica's history.
+    // primary's next record would rewrite this replica's history. A rebuild is
+    // the only fix, and unlike the gap case it is not obviously safe to do
+    // automatically — the replica holds commits this primary never had, so
+    // discarding them is a decision about data loss rather than a catch-up.
+    // Reported as `Refuse` so an operator makes that call.
     if replica_lsn > primary_lsn {
         return JoinDecision::Refuse(format!(
             "replica is at LSN {replica_lsn} but this primary is only at {primary_lsn}; \
-             streaming cannot reconcile this. Rebuild the replica from a base backup."
+             streaming cannot reconcile this, and the replica holds commits this primary \
+             does not. Rebuild the replica from a base backup once you have confirmed \
+             those commits are not needed."
         ));
     }
-    JoinDecision::Stream {
-        first_lsn: replica_lsn.saturating_add(1),
+    let first_lsn = replica_lsn.saturating_add(1);
+    /* The record this replica needs next has been pruned, so streaming would
+     * hand it a log with a hole in it — which its own `check_join` refuses, and
+     * rightly: a WAL with a gap is one no recovery can explain. Rebuild instead.
+     *
+     * `>` and not `>=`: `oldest_available_lsn` is itself still available, so a
+     * replica needing exactly that record can stream. */
+    if oldest_available_lsn > first_lsn {
+        return JoinDecision::Rebuild {
+            reason: format!(
+                "replica needs LSN {first_lsn} but the oldest record this primary still \
+                 holds is {oldest_available_lsn}; the records in between have been \
+                 checkpointed and pruned. Rebuilding this replica from a base backup."
+            ),
+        };
     }
+    JoinDecision::Stream { first_lsn }
 }
 
 impl Replication {

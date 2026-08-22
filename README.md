@@ -25,7 +25,7 @@ Vyrn is a correctness-first database built in Rust from its storage format upwar
 - Checksummed offline backup verification and empty-directory restore
 - Continuous non-blocking WAL archiving with lag/failure metrics, archive verification, safe WAL pruning, and point-in-time recovery from a base backup plus archive
 - Readiness/liveness endpoints, Prometheus-format metrics, SIGINT/SIGTERM connection draining, and bounded server-side group commit
-- Structured stderr logs with RFC 3339 timestamps, levels, and `key=value` fields, filtered by `VYRN_LOG`, with connection-URL passwords redacted. Implemented in the gateway and CLI; `vyrnd` is not yet converted
+- Structured stderr logs with RFC 3339 timestamps, levels, and `key=value` fields, filtered by `VYRN_LOG`, with connection-URL passwords redacted, across the server, the gateway, and the CLI
 - Point reads and consistent scans through the persistent B+ tree and bounded page cache, without duplicating all live values in server memory
 - Ordered prefix subscriptions/change notifications with bounded lag detection
 - Durable mode by default plus explicit bounded-loss async mode for realtime ephemeral workloads

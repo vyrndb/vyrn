@@ -24,6 +24,7 @@
 use crate::{
     Error, Result, RECORD_END, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, RECORD_MAGIC, VERSION,
 };
+use std::path::Path;
 
 /// What a received record describes, once its framing has been verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +243,164 @@ pub fn check_contiguous(last_lsn: u64, lsn: u64) -> std::result::Result<bool, Di
         expected,
         received: lsn,
     })
+}
+
+/// The oldest LSN a primary can still supply from its live WAL.
+///
+/// A joining replica has to be told whether the records it is missing still
+/// exist. Checkpoints delete sealed segments once their commits are baked into a
+/// checkpoint root, so a replica that was offline across a few checkpoints needs
+/// records the primary no longer holds — and streaming to it anyway would hand it
+/// a log with a hole, which [`check_join`] refuses and no recovery could explain.
+/// The primary compares this against the replica's next needed LSN and asks for a
+/// rebuild instead.
+///
+/// The FIRST LSN of the oldest segment, read from that segment's header, rather
+/// than a scan of its records: the header is 32 bytes and the answer only has to
+/// be a floor. An empty WAL directory reports 0, which reads as "nothing has been
+/// pruned" and lets any replica stream — correct, because a primary with no
+/// segments has no history to be missing.
+///
+/// Deliberately a directory read rather than engine state: which segments exist is
+/// a fact about the filesystem that checkpoints change without telling anyone, and
+/// caching it would be a cache that goes stale exactly when it matters.
+pub fn oldest_available_lsn(wal_directory: &Path) -> Result<u64> {
+    let mut oldest: Option<u64> = None;
+    for entry in std::fs::read_dir(wal_directory)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(id) = name
+            .strip_suffix(".vwal")
+            .and_then(|number| number.parse::<u64>().ok())
+        {
+            oldest = Some(oldest.map_or(id, |current: u64| current.min(id)));
+        }
+    }
+    let Some(oldest) = oldest else {
+        return Ok(0);
+    };
+    crate::read_segment_first_lsn(&wal_directory.join(crate::segment_name(oldest)))
+}
+
+/// Records the archive holds from `from_lsn` onward, up to the given bounds.
+///
+/// WHAT THIS IS FOR. A replica that fell behind far enough for the primary to
+/// prune the segments it needs cannot be caught up by streaming — the records are
+/// gone from the primary's live WAL. They are not gone from the ARCHIVE, though,
+/// which is exactly what an archive is for, and archived segments are the
+/// primary's own WAL segments byte for byte. So the replica closes its gap by
+/// reading them from the archive and applying them through
+/// [`crate::Engine::apply_replicated_record`] — the same path a streamed record
+/// takes, with the same validation and the same durability ordering.
+///
+/// A READER RATHER THAN A RECOVERY. The obvious alternative is
+/// [`crate::recover::recover_to`], which merges the archive into a data directory
+/// and replays it — but that opens the target with `Engine::open`, and a running
+/// replica already holds that directory's lock. Handing the bytes back and letting
+/// the caller apply them through the engine it already has needs no second open,
+/// works while the replica is serving reads, and reuses the append path whose
+/// ordering guarantees are already established.
+///
+/// BOUNDED IN BOTH DIRECTIONS because an archive can hold far more than fits in
+/// memory: the caller loops, applying one batch and asking for the next from the
+/// LSN it reached. `max_records` and `max_bytes` are both honoured, and at least
+/// one record is always returned when one exists at or after `from_lsn`, so a
+/// single record larger than `max_bytes` cannot stall the loop forever.
+///
+/// Records are returned FRAMED AND UNVERIFIED, in LSN order. Verification belongs
+/// to the caller, which already runs [`verify_record`] on every record it accepts
+/// from a primary: an archive is no more trusted than a socket, and having one
+/// check for both sources means there is one place where that judgement lives.
+pub fn archived_records_from(
+    archive_directory: &Path,
+    from_lsn: u64,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut segments = Vec::new();
+    for entry in std::fs::read_dir(archive_directory)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if let Some(id) = name
+            .strip_suffix(".vwal")
+            .and_then(|number| number.parse::<u64>().ok())
+        {
+            segments.push(id);
+        }
+    }
+    segments.sort_unstable();
+
+    let mut records: Vec<Vec<u8>> = Vec::new();
+    let mut bytes = 0;
+    for (position, id) in segments.iter().enumerate() {
+        /* Skip a segment whose successor already begins at or below the wanted
+         * LSN: everything in it precedes what the caller asked for, so there is
+         * no reason to read its body. The LAST segment is never skipped, since
+         * nothing follows it to prove it is exhausted. */
+        if let Some(next) = segments.get(position + 1) {
+            let next_first =
+                read_segment_first_lsn_of(archive_directory, *next).unwrap_or(0);
+            if next_first != 0 && next_first <= from_lsn {
+                continue;
+            }
+        }
+        let bytes_of_segment = std::fs::read(archive_directory.join(crate::segment_name(*id)))?;
+        if bytes_of_segment.len() < crate::SEGMENT_HEADER_LEN {
+            return Err(stream_error(format!(
+                "archived segment {id} is shorter than its header"
+            )));
+        }
+        let mut offset = crate::SEGMENT_HEADER_LEN;
+        while offset + RECORD_HEADER_LEN <= bytes_of_segment.len() {
+            let header = &bytes_of_segment[offset..offset + RECORD_HEADER_LEN];
+            /* A frame that does not begin with a record is the end of this
+             * segment's records, not damage: every segment carries a zero-filled
+             * runway past its last record. Treated as end-of-segment exactly as
+             * replay treats it, so the runway is not mistaken for a corrupt
+             * archive. A record whose CONTENTS are damaged is a different matter
+             * and is caught by the caller's `verify_record`. */
+            if &header[0..4] != RECORD_MAGIC {
+                break;
+            }
+            let lsn = crate::read_u64(header, 5);
+            let payload_len = crate::read_u32(header, 17) as usize;
+            let Some(total_len) = RECORD_HEADER_LEN
+                .checked_add(payload_len)
+                .and_then(|size| size.checked_add(RECORD_FOOTER_LEN))
+            else {
+                return Err(stream_error(format!(
+                    "archived segment {id} declares a record length that overflows"
+                )));
+            };
+            // A record running past the end of the file is a truncated archive,
+            // not a runway: the magic matched, so bytes were meant to be here.
+            if offset + total_len > bytes_of_segment.len() {
+                return Err(stream_error(format!(
+                    "archived segment {id} ends inside a record at byte {offset}"
+                )));
+            }
+            if lsn >= from_lsn {
+                // The byte bound yields only once something is in hand, so one
+                // oversized record still makes progress instead of deadlocking.
+                if !records.is_empty()
+                    && (records.len() >= max_records || bytes + total_len > max_bytes)
+                {
+                    return Ok(records);
+                }
+                records.push(bytes_of_segment[offset..offset + total_len].to_vec());
+                bytes += total_len;
+            }
+            offset += total_len;
+        }
+    }
+    Ok(records)
+}
+
+/// A segment header's first LSN, or `None` when it cannot be read.
+///
+/// Absence is not fatal here: this only decides whether a segment can be SKIPPED,
+/// and failing to skip means reading a segment whose records are then filtered by
+/// LSN anyway. A genuinely damaged segment is caught when its records are read.
+fn read_segment_first_lsn_of(archive_directory: &Path, id: u64) -> Option<u64> {
+    crate::read_segment_first_lsn(&archive_directory.join(crate::segment_name(id))).ok()
 }
 
 /// A stream-level failure, distinct from storage corruption.

@@ -393,6 +393,294 @@ fn a_replica_refuses_client_writes() {
 }
 
 #[test]
+fn a_replica_whose_records_were_pruned_rebuilds_from_the_archive() {
+    /* THE FAILURE THIS COVERS. A replica that is offline while the primary
+     * checkpoints comes back needing WAL records the primary has already pruned.
+     * `decide_join` used to answer `Refuse`, the replica bailed with "rebuild from
+     * a base backup", and its reconnect loop repeated that forever — so an
+     * ordinary absence became a permanent breakage, while a primary running
+     * `--replication-min-acks 1` BLOCKED WRITES waiting for the quorum that very
+     * replica was supposed to supply. Only an operator noticing and rebuilding by
+     * hand ended it.
+     *
+     * Now the primary streams from the oldest LSN it still holds, the replica
+     * recognises the gap that leaves, and closes it from the WAL ARCHIVE — which
+     * holds exactly the pruned segments, byte for byte the primary's own records.
+     *
+     * The whole cluster is built by hand here rather than through `cluster()`,
+     * because the primary needs an archive directory and the replica has to be
+     * stopped, left behind, and restarted — none of which the shared helper does.
+     */
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hash = dir.path().join("password.phc");
+    let password = dir.path().join("password.txt");
+    write_password_hash(&hash);
+    write_password(&password);
+    // Outside the data directory: backup enumeration is non-recursive, so a
+    // nested archive would be excluded from backups yet destroyed by a restore —
+    // the server refuses to start that way.
+    let archive = dir.path().join("archive");
+
+    let primary = spawn(
+        &dir.path().join("primary"),
+        &hash,
+        &[
+            ("VYRN_REPLICATION_MIN_ACKS", "1".into()),
+            /* SHORT ON PURPOSE, and it dominates this test's runtime. Every write
+             * made during the outage below has no replica to acknowledge it, so
+             * each one waits out this timeout in full. At the 5s default the sixty
+             * outage writes took five minutes; at 300ms they take twenty seconds,
+             * and the behaviour under test is identical either way — what matters
+             * is that the writes are durable locally and get archived, not how
+             * long their doomed quorum wait lasts. */
+            ("VYRN_REPLICATION_ACK_TIMEOUT_MS", "300".into()),
+            (
+                "VYRN_WAL_ARCHIVE_DIR",
+                archive.to_string_lossy().into_owned(),
+            ),
+            // Archive promptly so the test does not wait on a long interval.
+            ("VYRN_WAL_ARCHIVE_INTERVAL_MS", "200".into()),
+            /* A low checkpoint threshold is what makes the primary PRUNE while the
+             * replica is away. Without pruning there is no gap, and this test
+             * would silently degrade into an ordinary reconnect. */
+            ("VYRN_CHECKPOINT_WRITES", "5".into()),
+        ],
+    );
+
+    let replica_data = dir.path().join("replica");
+    let replica_settings = |include_archive: bool| {
+        let mut settings = vec![
+            (
+                "VYRN_REPLICA_OF",
+                format!(
+                    "vyrn://vyrn@127.0.0.1:{}/default?tls=disable",
+                    primary.port
+                ),
+            ),
+            (
+                "VYRN_REPLICA_PASSWORD_FILE",
+                password.to_string_lossy().into_owned(),
+            ),
+            ("VYRN_REPLICA_ID", "rebuild-under-test".into()),
+        ];
+        if include_archive {
+            settings.push((
+                "VYRN_REPLICA_WAL_ARCHIVE_DIR",
+                archive.to_string_lossy().into_owned(),
+            ));
+        }
+        settings
+    };
+
+    // Phase one: an ordinary replica, caught up by streaming.
+    {
+        let replica = spawn(&replica_data, &hash, &replica_settings(true));
+        assert!(
+            wait_for_metric(
+                &primary,
+                "vyrn_replicas_connected",
+                1,
+                Duration::from_secs(30)
+            ),
+            "the replica never connected to the primary"
+        );
+        put(&primary.url(), "before/outage", "kept").expect("write with the replica present");
+        assert_eq!(
+            get(&replica.url(), "before/outage").expect("replica read"),
+            Some("kept".to_owned()),
+            "the replica should hold the acknowledged write"
+        );
+        // Dropping stops the process: the outage begins here.
+        drop(replica);
+    }
+    assert!(
+        wait_for_metric(
+            &primary,
+            "vyrn_replication_dropped_replicas_total",
+            1,
+            Duration::from_secs(15)
+        ),
+        "the primary should have noticed the replica leaving"
+    );
+
+    /* THE OUTAGE. Writes continue and cross the checkpoint threshold repeatedly,
+     * so segments holding the records this replica needs are archived and then
+     * pruned from the primary's live WAL.
+     *
+     * `min-acks 1` with no replica means every one of these writes FAILS its
+     * quorum — and that is fine, because the failure is the quorum promise, not
+     * the write: the record is durable locally and applied, which the flush
+     * stage's comment spells out. That is exactly the situation being recovered
+     * from, and it is why the results are deliberately not asserted on. */
+    for index in 0..60 {
+        let _ = put(
+            &primary.url(),
+            &format!("during/outage/{index:03}"),
+            &format!("value-{index}"),
+        );
+    }
+    // Give the archiver its ticks, so the pruned segments are safely in the
+    // archive before the replica asks for them.
+    std::thread::sleep(Duration::from_secs(2));
+
+    /* Phase two: the SAME data directory rejoins. Its log ends in the outage's
+     * past, and the records it needs next are gone from the primary. */
+    let rebuilt = spawn(&replica_data, &hash, &replica_settings(true));
+    assert!(
+        wait_for_metric(
+            &primary,
+            "vyrn_replicas_connected",
+            1,
+            Duration::from_secs(60)
+        ),
+        "the lagging replica never rejoined; a replica whose records were pruned \
+         must rebuild from the archive rather than being refused forever"
+    );
+
+    /* THE CENTRAL ASSERTION: the replica caught up to the primary, across records
+     * that only ever existed in the archive. `during/outage/000` is the important
+     * one — it was written immediately after the replica left, so it is deep
+     * inside the pruned range and can ONLY have arrived through the archive. */
+    let caught_up = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last = None;
+        while Instant::now() < deadline {
+            last = get(&rebuilt.url(), "during/outage/000").unwrap_or(None);
+            if last.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        last
+    };
+    assert_eq!(
+        caught_up,
+        Some("value-0".to_owned()),
+        "the replica did not recover the records the primary had pruned; the gap was \
+         not closed from the WAL archive"
+    );
+    // And the tail of the outage too, so this is a full catch-up rather than one
+    // lucky segment.
+    assert_eq!(
+        get(&rebuilt.url(), "during/outage/059").expect("replica read"),
+        Some("value-59".to_owned()),
+        "the replica recovered the start of the gap but not the end of it"
+    );
+    // The write from before the outage must survive the rebuild: closing a gap
+    // must not discard history the replica already held.
+    assert_eq!(
+        get(&rebuilt.url(), "before/outage").expect("replica read"),
+        Some("kept".to_owned()),
+        "closing the gap destroyed history the replica already had"
+    );
+
+    // Streaming works again afterwards, which is what proves the rebuild left the
+    // replica in a state the ordinary path can continue from.
+    put(&primary.url(), "after/rebuild", "streamed")
+        .expect("with the replica rejoined, writes should reach quorum again");
+    assert_eq!(
+        get(&rebuilt.url(), "after/rebuild").expect("replica read"),
+        Some("streamed".to_owned()),
+        "the rebuilt replica should keep up by streaming once its gap is closed"
+    );
+}
+
+#[test]
+fn a_lagging_replica_without_an_archive_says_why_it_cannot_recover() {
+    /* THE HONEST-FAILURE HALF of the same feature. Closing a gap needs the pruned
+     * records, and a replica with no archive configured genuinely does not have
+     * them — so it must fail, and the failure must NAME the missing archive rather
+     * than repeating the old "rebuild from a base backup" for a situation that an
+     * archive would have recovered automatically.
+     *
+     * Asserted through the primary's view: the replica bails on the gap and does
+     * not stay joined, so `vyrn_replicas_connected` never settles at 1. That is
+     * the observable difference from the test above, where the same outage ends
+     * with the replica caught up. */
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hash = dir.path().join("password.phc");
+    let password = dir.path().join("password.txt");
+    write_password_hash(&hash);
+    write_password(&password);
+    let archive = dir.path().join("archive");
+
+    let primary = spawn(
+        &dir.path().join("primary"),
+        &hash,
+        &[
+            ("VYRN_REPLICATION_MIN_ACKS", "1".into()),
+            ("VYRN_REPLICATION_ACK_TIMEOUT_MS", "500".into()),
+            (
+                "VYRN_WAL_ARCHIVE_DIR",
+                archive.to_string_lossy().into_owned(),
+            ),
+            ("VYRN_WAL_ARCHIVE_INTERVAL_MS", "200".into()),
+            ("VYRN_CHECKPOINT_WRITES", "5".into()),
+        ],
+    );
+
+    let replica_data = dir.path().join("replica");
+    // NOTE: no VYRN_REPLICA_WAL_ARCHIVE_DIR — that is the whole point.
+    let settings = vec![
+        (
+            "VYRN_REPLICA_OF",
+            format!(
+                "vyrn://vyrn@127.0.0.1:{}/default?tls=disable",
+                primary.port
+            ),
+        ),
+        (
+            "VYRN_REPLICA_PASSWORD_FILE",
+            password.to_string_lossy().into_owned(),
+        ),
+        ("VYRN_REPLICA_ID", "no-archive".into()),
+    ];
+
+    {
+        let replica = spawn(&replica_data, &hash, &settings);
+        assert!(
+            wait_for_metric(
+                &primary,
+                "vyrn_replicas_connected",
+                1,
+                Duration::from_secs(30)
+            ),
+            "the replica never connected"
+        );
+        put(&primary.url(), "before/outage", "kept").expect("write with the replica present");
+        drop(replica);
+    }
+    for index in 0..60 {
+        let _ = put(&primary.url(), &format!("during/outage/{index:03}"), "value");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _stuck = spawn(&replica_data, &hash, &settings);
+    /* It must NOT reach a steady joined state: it connects, is told where the
+     * stream begins, sees the gap it cannot close, and disconnects — repeatedly.
+     * Sampling over several seconds rather than checking once, because a single
+     * observation could land inside one of those brief connections. */
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut recovered = false;
+    while Instant::now() < deadline {
+        if get(&_stuck.url(), "during/outage/059")
+            .unwrap_or(None)
+            .is_some()
+        {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        !recovered,
+        "a replica with no WAL archive cannot have recovered pruned records — it does \
+         not have them. Reporting success here would mean it had silently accepted a \
+         log with a hole in it, which its own recovery would refuse to open."
+    );
+}
+
+#[test]
 fn writes_fail_rather_than_silently_dropping_the_guarantee() {
     // A short timeout so the test is quick; the behaviour is the same at any.
     let mut cluster = cluster(800);

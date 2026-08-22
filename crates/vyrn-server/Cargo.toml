@@ -17,6 +17,7 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 serde_json.workspace = true
 vyrn-core = { path = "../vyrn-core" }
+vyrn-log = { path = "../vyrn-log" }
 vyrn-protocol = { path = "../vyrn-protocol" }
 
 [dev-dependencies]

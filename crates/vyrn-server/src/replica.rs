@@ -27,7 +27,10 @@ use std::{
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_util::codec::Framed;
-use vyrn_core::{replication::verify_record, Engine, ReadEngine};
+use vyrn_core::{
+    replication::{check_join, verify_record, Divergence},
+    Engine, ReadEngine,
+};
 use vyrn_protocol::{Envelope, Message, VyrnCodec};
 
 use crate::BoxedTransport;
@@ -39,6 +42,20 @@ const RECONNECT_MIN: Duration = Duration::from_millis(250);
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How much archived WAL one gap-closing batch applies at a time.
+///
+/// Bounded because an archive can be far larger than memory: a replica that was
+/// offline for a day may need more records than this process could hold, so they
+/// are applied incrementally rather than read whole. Both bounds are honoured
+/// together, since neither a record count nor a byte count alone describes a log
+/// whose records range from tens of bytes to megabytes.
+///
+/// Matched to the stream's own batching intent: large enough that one `fdatasync`
+/// covers many records, small enough that a failure part-way through has repeated
+/// only a bounded amount of work.
+const ARCHIVE_BATCH_RECORDS: usize = 1_024;
+const ARCHIVE_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct ReplicaConfig {
     /// `vyrn://user@host:port/database` of the primary.
     pub primary_url: String,
@@ -46,6 +63,15 @@ pub struct ReplicaConfig {
     pub ca_file: Option<std::path::PathBuf>,
     pub replica_id: String,
     pub allow_plaintext: bool,
+    /// WAL archive to recover pruned records from when the primary's stream does
+    /// not abut this replica's log.
+    ///
+    /// `None` leaves the previous behaviour for that case — a loud failure telling
+    /// the operator to rebuild — because closing a gap requires the records, and
+    /// without an archive this node genuinely does not have them. Pointing this at
+    /// the primary's archive is what turns "rebuild this replica by hand" into an
+    /// automatic recovery.
+    pub wal_archive_dir: Option<std::path::PathBuf>,
     /// The read handles clients are served from.
     ///
     /// Reads do NOT go through the write engine — they use separate
@@ -171,7 +197,136 @@ async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Re
         "replicating from {host}:{port} starting at LSN {first_lsn} (local log ends at {last_lsn})"
     );
 
+    /* CLOSE A GAP BEFORE CONSUMING THE STREAM.
+     *
+     * `check_join` is the replica's own judgement about whether the primary's
+     * stream abuts its log. `GapBeforeStream` means the records in between were
+     * checkpointed and pruned on the primary, so streaming cannot deliver them —
+     * and applying the stream anyway would produce a WAL with a hole in it, which
+     * this node's own recovery would refuse to open on the next restart.
+     *
+     * This used to be fatal. The primary refused the join outright, the replica
+     * bailed with "rebuild from a base backup", and the reconnect loop repeated
+     * that forever — so a replica that had merely been offline across a few
+     * checkpoints came back permanently broken, while a `min-acks 1` primary
+     * blocked writes waiting for the quorum that replica was supposed to supply.
+     * Only an operator noticing and rebuilding by hand ended it.
+     *
+     * Now the gap is closed from the WAL archive, which holds exactly those
+     * pruned segments — byte for byte the primary's own records. Rebuilding this
+     * way needs no second `Engine::open` (this process already holds the data
+     * directory's lock) and reuses `apply_batch`, so archived records take the
+     * same verify → append → sync → publish path a streamed record takes.
+     */
+    if let Some(divergence) = check_join(last_lsn, primary_lsn(last_lsn, first_lsn), first_lsn) {
+        match divergence {
+            Divergence::GapBeforeStream {
+                replica_lsn,
+                first_lsn,
+            } => {
+                let Some(archive) = config.wal_archive_dir.as_deref() else {
+                    bail!(
+                        "this replica is at LSN {replica_lsn} but the primary's stream starts at \
+                         {first_lsn}; the records in between were pruned on the primary and no \
+                         WAL archive is configured here to recover them. Pass \
+                         --replica-wal-archive-dir pointing at the primary's archive, or rebuild \
+                         this replica from a base backup."
+                    )
+                };
+                eprintln!(
+                    "gap detected: local log ends at {replica_lsn}, primary streams from \
+                     {first_lsn}; closing the gap from the WAL archive at {}",
+                    archive.display()
+                );
+                let reached =
+                    close_gap_from_archive(engine, &config.readers, archive, first_lsn).await?;
+                /* The archive has to reach the record directly before the
+                 * stream's first, or applying the stream would still leave a
+                 * hole. Reported rather than papered over: an archive that is
+                 * itself behind is an operator problem (the archiver is not
+                 * keeping up, or this replica is pointed at a stale copy), and
+                 * continuing would corrupt this replica's log. */
+                if reached.saturating_add(1) < first_lsn {
+                    bail!(
+                        "the WAL archive closed the gap only to LSN {reached}, but the primary's \
+                         stream starts at {first_lsn}; the archive is missing the records in \
+                         between. Rebuild this replica from a base backup taken after \
+                         LSN {reached}."
+                    );
+                }
+                eprintln!("gap closed from the archive through LSN {reached}");
+            }
+            // The other two are genuinely unrecoverable by streaming, and the
+            // primary refuses them before it ever offers a stream; reaching one
+            // here means the primary offered something inconsistent with what it
+            // was told, which must not be applied.
+            other => bail!("refusing the primary's stream: {other}"),
+        }
+    }
+
     apply_stream(engine, &config.readers, &mut framed).await
+}
+
+/// The primary LSN to validate a join against, given what the primary offered.
+///
+/// `check_join`'s first test is "is this replica AHEAD of the primary", which the
+/// primary itself has already made and refused on. The replica does not learn the
+/// primary's LSN from `ReplicaStream` — only where the stream begins — so this
+/// supplies a value that cannot trip that test, leaving the gap check as the one
+/// this side is actually deciding. Named rather than inlined so the reasoning is
+/// attached to it: passing the replica's own LSN here would be a silent way of
+/// disabling a check that looks like it is running.
+fn primary_lsn(replica_lsn: u64, first_lsn: u64) -> u64 {
+    replica_lsn.max(first_lsn)
+}
+
+/// Applies archived records from `from_lsn` until the archive is exhausted,
+/// returning the highest LSN this replica now holds.
+///
+/// Batched for the same reason the stream is: one `fdatasync` per batch rather
+/// than per record, and bounded so an archive far larger than memory is applied
+/// incrementally instead of being read whole.
+async fn close_gap_from_archive(
+    engine: &Arc<RwLock<Engine>>,
+    readers: &Arc<Vec<RwLock<ReadEngine>>>,
+    archive: &Path,
+    through_at_least: u64,
+) -> Result<u64> {
+    let mut last = engine
+        .read()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+        .last_lsn();
+    loop {
+        let from = last.saturating_add(1);
+        let directory = archive.to_path_buf();
+        let records = tokio::task::spawn_blocking(move || {
+            vyrn_core::replication::archived_records_from(
+                &directory,
+                from,
+                ARCHIVE_BATCH_RECORDS,
+                ARCHIVE_BATCH_BYTES,
+            )
+        })
+        .await
+        .context("archive read task failed")?
+        .context("failed to read the WAL archive")?;
+        if records.is_empty() {
+            return Ok(last);
+        }
+        // The same apply path a streamed batch takes, so archived records get the
+        // same verification, the same durability barrier, and the same publish to
+        // the read handles.
+        match apply_batch(engine, readers, &records).await? {
+            Some(applied) => last = applied,
+            /* Every record in the batch was a duplicate and nothing advanced. The
+             * archive cannot take this replica further, so stopping here is what
+             * prevents an infinite loop asking for the same records forever. */
+            None => return Ok(last),
+        }
+        if last >= through_at_least.saturating_sub(1) {
+            return Ok(last);
+        }
+    }
 }
 
 /// Receives records, makes them durable, and acknowledges them.

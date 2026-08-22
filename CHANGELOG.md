@@ -67,8 +67,13 @@ test. Highlights:
   discards the rest of a segment), monotonic space growth from non-rebalancing
   B-tree deletes, `>2^53` integer precision loss in the TypeScript SDK, and the
   absence of automatic failover.
-- `vyrnd` itself is not yet converted to the structured format; the runbook says
-  so plainly rather than promising coverage that does not exist.
+- `vyrnd` is converted too, so the runbook's instruction to act on a logged
+  storage error is now something the process can actually do. Storage failures
+  carry the operation that failed; a readiness withdrawal names the background
+  task that stopped, which no counter could; a rejected handshake distinguishes a
+  throttled address from a checked-and-failed password, a difference the client
+  deliberately cannot see; and a completed checkpoint reports its duration and
+  what triggered it.
 
 ### Changed
 

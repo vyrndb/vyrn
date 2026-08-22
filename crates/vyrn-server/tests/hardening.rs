@@ -106,8 +106,22 @@ fn write_password_hash(path: &Path) {
 }
 
 fn spawn(data: &Path, hash: &Path) -> Node {
+    spawn_with_log(data, hash, None)
+}
+
+/// Spawns a node, optionally redirecting its stderr to `log` so a test can read
+/// back what it wrote.
+///
+/// Separate from [`spawn`] because capturing the log is the exception: a pipe
+/// would fill and block the server once nothing drained it, so the capture goes
+/// to a file and the ordinary case keeps discarding.
+fn spawn_with_log(data: &Path, hash: &Path, log: Option<&Path>) -> Node {
     let port = free_port();
     let admin_port = free_port();
+    let stderr = match log {
+        Some(path) => Stdio::from(std::fs::File::create(path).expect("create log file")),
+        None => Stdio::null(),
+    };
     let child = Command::new(vyrnd())
         .env("VYRN_BIND", format!("127.0.0.1:{port}"))
         .env("VYRN_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
@@ -115,7 +129,7 @@ fn spawn(data: &Path, hash: &Path) -> Node {
         .env("VYRN_PASSWORD_HASH_FILE", hash)
         .env("VYRN_ALLOW_PLAINTEXT", "true")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawn vyrnd");
     let node = Node {
@@ -436,6 +450,51 @@ fn a_locked_out_address_is_refused_without_paying_for_a_password_hash() {
         per_refusal * 5 < per_verification,
         "a locked-out attempt must be refused before the Argon2 verification: \
          refusal took {per_refusal:?}, a real verification took {per_verification:?}"
+    );
+}
+
+#[test]
+fn a_rejected_handshake_is_logged_without_the_credential_it_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hash = dir.path().join("password.phc");
+    write_password_hash(&hash);
+    let log = dir.path().join("vyrnd.log");
+    let node = spawn_with_log(&dir.path().join("data"), &hash, Some(&log));
+
+    /* A log that records a failed authentication records, by definition, a string
+     * somebody believed was a password — and those turn up in the right log often
+     * enough that this is worth asserting rather than assuming. The wrong password
+     * here is distinctive so a substring search cannot miss it. */
+    const WRONG: &str = "unmistakable-wrong-password-9f3a1c";
+    let wrong = url_with_password(&node, WRONG);
+    let error = connect(&wrong).expect_err("bad password must be refused");
+    assert!(is_authentication_failed(&error));
+
+    // A successful handshake too: the correct credential must not leak either.
+    put(&node.url(), "logged", "value").expect("correct credentials should work");
+
+    // Stop the server so its stderr is flushed and complete before it is read.
+    drop(node);
+    let written = std::fs::read_to_string(&log).unwrap_or_default();
+
+    assert!(
+        !written.contains(WRONG),
+        "the rejected password appears in the log:\n{written}"
+    );
+    assert!(
+        !written.contains(PASSWORD),
+        "the real password appears in the log:\n{written}"
+    );
+    // The Argon2 hash is a credential too — an offline cracking target.
+    let stored = std::fs::read_to_string(&hash).expect("read hash");
+    assert!(
+        !written.contains(stored.trim()),
+        "the stored password hash appears in the log:\n{written}"
+    );
+    // And the rejection is still reported, so this is not passing by silence.
+    assert!(
+        written.contains("authentication failed"),
+        "a rejected handshake must be logged at all:\n{written}"
     );
 }
 

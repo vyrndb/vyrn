@@ -108,13 +108,21 @@ Two properties are deliberate:
 
 Logs complement the metrics on the admin listener; they do not replace them. Alert on the metrics, then read the logs to find out why. Note that `vyrn_checkpoints_total` counts checkpoints *scheduled* by the write pipeline, not completed by the maintenance task.
 
-**Coverage is currently uneven, and this is the honest state of it.** The `vyrn-http` gateway and the `vyrn` CLI emit the format above throughout. The `vyrnd` server does not yet: its diagnostics are still unlevelled, untimestamped plain lines, and several conditions an operator would want are not reported at all — a storage error answered to a client, a rejected authentication, a maintenance task that stopped, a drain that hit its timeout. Until that conversion lands, treat `vyrnd`'s own output as human-readable text rather than something to filter or ship, and rely on the admin listener's metrics plus readiness for `vyrnd` alerting. The failure-handling procedure below is written against readiness and metrics for exactly this reason.
+All three binaries — `vyrnd`, the `vyrn-http` gateway, and the `vyrn` CLI — emit the format above throughout. In `vyrnd` specifically, the records worth knowing about are:
+
+- **`vyrnd.storage`** — every storage failure, carrying the `operation` that failed. At `error` when the engine is poisoned or I/O failed, which is also when readiness drops; at `warn` for a single failed operation on a server that is still healthy.
+- **`vyrnd` `readiness withdrawn`** — emitted with a `reason` naming the task that stopped (`wal flush task`, `mvcc gc`, `async sync`, `write worker supervisor`, and so on). This is the record that tells you *which* background worker died, which no counter can.
+- **`vyrnd.auth`** — a rejected handshake, with `reason=throttled` when the address was locked out before the password was checked and `reason=rejected` when it was checked and failed. The client cannot distinguish these two, deliberately, so the log is the only place the difference exists. A run of `throttled` means the address is being held out and is no longer costing you Argon2 work.
+- **`vyrnd.checkpoint`** — a completed compaction with its `duration_ms` and the `trigger` that fired. A checkpoint is the longest operation this process performs and the first thing to suspect when write latency spikes.
+- **`vyrnd.replication`** — join decisions, rebuilds, divergence, and stream failures.
+
+Two conditions are reported at `debug` on purpose, because they are per-connection: a connection that closed with an error, and a successful authentication. A client looping on a refused credential would otherwise fill the log with records about itself.
 
 There is no log rotation and no file sink. Vyrn writes to stderr and expects the supervisor to handle the stream — systemd's journal, Docker's logging driver (`docker-compose.yml` configures rotation), or a collector of your choosing.
 
 ## Failure handling
 
-The trigger is `/health/ready` returning 503, since `vyrnd` sets readiness false on every storage failure that poisons the engine. Do not wait for a logged storage error: `vyrnd` does not yet log those (see the coverage note above), so readiness and the admin listener's metrics are the signals that actually fire. The gateway does log its upstream cause, so a `database_storage_error` in the gateway's log names what the database reported.
+The trigger is `/health/ready` returning 503, since `vyrnd` sets readiness false on every storage failure that poisons the engine. Alert on that rather than on a log line: readiness is a state you can poll, and a log record is an event you might miss. Then read the log to find out why — a `vyrnd.storage` record names the operation that failed, and the accompanying `readiness withdrawn` record names the task that stopped. The gateway logs its upstream cause too, so a `database_storage_error` there names what the database reported.
 
 When readiness becomes false:
 
