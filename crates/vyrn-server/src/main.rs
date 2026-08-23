@@ -1225,7 +1225,7 @@ async fn main() -> Result<()> {
              a write-back buffer"
         );
     }
-    let engine = Engine::open_with_options(
+    let mut engine = Engine::open_with_options(
         &args.data,
         EngineOptions {
             durability,
@@ -1236,6 +1236,9 @@ async fn main() -> Result<()> {
         },
     )
     .context("failed to open Vyrn data directory")?;
+    // The read handles are fed from this engine's commits, so every
+    // write-back commit must stage its publication. A no-op in classic mode.
+    engine.enable_write_back_publish();
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("failed to bind {}", args.bind))?;

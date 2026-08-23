@@ -37,6 +37,11 @@ use std::{
 /// negligible beside a 64 MiB segment.
 const RUNWAY: u64 = 1 << 20;
 
+/// The most one runway fill may cover, however large the records driving it —
+/// a bound on the zeros a fill writes and on what an idle segment can carry
+/// past its records.
+const MAX_RUNWAY: u64 = 8 << 20;
+
 /// A shared handle to the active WAL segment.
 pub struct Wal {
     /// The descriptor records are written through, with its write position.
@@ -100,13 +105,26 @@ impl Writer {
         if required <= self.zeroed {
             return Ok(());
         }
-        let target = self.zeroed.saturating_add(self.runway);
-        if required > target {
+        if required > self.zeroed.saturating_add(self.runway) {
             // The record's own write extends and initialises the file here.
             // `append` records how far that reached, so the bytes it covered are
             // not zero-filled again afterwards.
             return Ok(());
         }
+        // The record fits one configured step, so a fill happens — but ONE
+        // step is the wrong amount to fill when records are large: a 64 KiB
+        // record burns a 1 MiB runway in sixteen commits, so each of them
+        // carries a sixteenth of the expensive extension barrier, which
+        // measured as most of the gap to a plain log at that size. Scaling
+        // the fill with the record keeps the AMORTISATION RATIO roughly
+        // constant instead: ~64 records of whatever size share each barrier.
+        // Small records are unchanged (the configured step is the floor), and
+        // the self-initialising bail above still decides who fills at all, so
+        // a record bigger than the step never has its span written twice.
+        let step = wanted
+            .saturating_mul(64)
+            .clamp(self.runway, MAX_RUNWAY.max(self.runway));
+        let target = self.zeroed.saturating_add(step);
         let zeros = vec![0; (target - self.zeroed) as usize];
         write_all_at(&self.file, &zeros, self.zeroed)?;
         self.file.sync_data()?;

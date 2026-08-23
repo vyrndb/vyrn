@@ -181,6 +181,21 @@ pub(crate) fn merged_get(
     }
 }
 
+/// [`merged_get`] without the copy — see [`crate::SharedBytes`].
+pub(crate) fn merged_get_shared(
+    tree: &PageTree,
+    buffer: Option<&Overlay>,
+    key: &[u8],
+) -> Result<Option<crate::SharedBytes>> {
+    match buffer.and_then(|buffer| buffer.get(key)) {
+        Some(entry) => Ok(entry
+            .value
+            .as_ref()
+            .map(|value| crate::SharedBytes::buffered(Arc::clone(value)))),
+        None => Ok(tree.get_shared(key)?.map(crate::SharedBytes::tree)),
+    }
+}
+
 pub(crate) fn merged_revision(
     tree: &PageTree,
     buffer: Option<&Overlay>,
@@ -334,6 +349,84 @@ pub(crate) fn merged_scan(
             }
         } else {
             rows.push(from_tree.next().expect("peeked"));
+        }
+    }
+    Ok(rows)
+}
+
+/// [`merged_scan`] without copying values out — rows carry [`crate::SharedBytes`].
+/// The same merge, the same tie-breaking, the same delete masking; only the
+/// materialisation differs, so the two must stay line-for-line parallel.
+pub(crate) fn merged_scan_shared(
+    tree: &PageTree,
+    buffer: Option<&Overlay>,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    limit: usize,
+    excluded_prefix: Option<&[u8]>,
+) -> Result<Vec<(Vec<u8>, crate::SharedBytes, u64)>> {
+    let Some(buffer) = buffer.filter(|buffer| !buffer.is_empty()) else {
+        return Ok(tree
+            .scan_shared_with_revisions(start, end, limit, excluded_prefix)?
+            .into_iter()
+            .map(|(key, value, revision)| (key, crate::SharedBytes::tree(value), revision))
+            .collect());
+    };
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    use std::ops::Bound;
+    let bounds = (
+        start.map_or(Bound::Unbounded, Bound::Included),
+        end.map_or(Bound::Unbounded, Bound::Excluded),
+    );
+    let wanted = |key: &[u8]| excluded_prefix.is_none_or(|prefix| !key.starts_with(prefix));
+    let deletes = buffer
+        .entries
+        .range::<[u8], _>(bounds)
+        .filter(|(key, entry)| wanted(key) && entry.value.is_none())
+        .count();
+    let tree_rows = tree.scan_shared_with_revisions(
+        start,
+        end,
+        limit.saturating_add(deletes),
+        excluded_prefix,
+    )?;
+    let mut rows = Vec::with_capacity(limit.min(1024));
+    let mut buffered = buffer
+        .entries
+        .range::<[u8], _>(bounds)
+        .filter(|(key, _)| wanted(key))
+        .peekable();
+    let mut from_tree = tree_rows.into_iter().peekable();
+    while rows.len() < limit {
+        let take_buffered = match (buffered.peek(), from_tree.peek()) {
+            (Some((buffered_key, _)), Some((tree_key, _, _))) => {
+                buffered_key.as_slice() <= tree_key.as_slice()
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_buffered {
+            let (key, entry) = buffered.next().expect("peeked");
+            // The tree's copy of the same key is superseded either way.
+            if from_tree
+                .peek()
+                .is_some_and(|(tree_key, _, _)| tree_key == key)
+            {
+                from_tree.next();
+            }
+            if let Some(value) = &entry.value {
+                rows.push((
+                    key.clone(),
+                    crate::SharedBytes::buffered(Arc::clone(value)),
+                    entry.revision,
+                ));
+            }
+        } else {
+            let (key, value, revision) = from_tree.next().expect("peeked");
+            rows.push((key, crate::SharedBytes::tree(value), revision));
         }
     }
     Ok(rows)

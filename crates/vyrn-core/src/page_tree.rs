@@ -70,6 +70,8 @@ fn cache_pages() -> usize {
 
 type Page = [u8; PAGE_SIZE];
 type VersionedRow = (Vec<u8>, Vec<u8>, u64);
+/// A scan row whose value has not been copied out of its backing storage.
+pub(crate) type SharedRow = (Vec<u8>, SharedTreeValue, u64);
 /// A key's stored value and the revision that wrote it, absent when the key is gone.
 type RevisionedValue = Option<(Vec<u8>, u64)>;
 /// A found key's revision and its value, where the value is present only when
@@ -88,7 +90,7 @@ type MaybeValued = Option<(Option<Vec<u8>>, u64)>;
 /// allocations and a copy. `Owned` remains for bytes that never lived in a
 /// page: new entries from a batch's mutations, and blob-backed keys.
 #[derive(Clone, Debug)]
-enum Bytes {
+pub(crate) enum Bytes {
     Owned(Vec<u8>),
     Paged {
         page: Arc<Page>,
@@ -106,7 +108,7 @@ impl Bytes {
         }
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
             Bytes::Owned(bytes) => bytes,
             Bytes::Paged { page, offset, len } => {
@@ -149,6 +151,42 @@ enum EntryValue {
 struct NodeRef {
     page_id: u64,
     min_key: Bytes,
+}
+
+/// Where a leaf cell's value lives, so `get` and `get_shared` can each
+/// materialise it their own way from one cell walk.
+enum LeafHit {
+    /// The value's bytes inside the leaf page itself.
+    Inline { offset: usize, len: usize },
+    /// The value's record in the value log.
+    External(ValueRef),
+}
+
+/// A value read without copying: still inside its cached page, or the value
+/// cache's own allocation.
+#[derive(Clone, Debug)]
+pub(crate) enum SharedTreeValue {
+    Paged(Bytes),
+    Log(Arc<Vec<u8>>),
+}
+
+impl SharedTreeValue {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            SharedTreeValue::Paged(bytes) => bytes.as_slice(),
+            SharedTreeValue::Log(value) => value,
+        }
+    }
+
+    /// Owned bytes, copying only when something else shares the backing.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            SharedTreeValue::Paged(bytes) => bytes.into_vec(),
+            SharedTreeValue::Log(value) => {
+                Arc::try_unwrap(value).unwrap_or_else(|shared| (*shared).clone())
+            }
+        }
+    }
 }
 
 /// A single key's change within one batched tree mutation.
@@ -859,17 +897,45 @@ impl PageTree {
         let leaf_id = self.find_leaf(key, None)?;
         let page = self.pages.read(leaf_id)?;
         require_type(&page, leaf_id, LEAF)?;
-        self.find_in_leaf(&page, leaf_id, key)
+        match self.find_in_leaf(&page, leaf_id, key)? {
+            Some((LeafHit::Inline { offset, len }, revision)) => {
+                Ok(Some((page[offset..offset + len].to_vec(), revision)))
+            }
+            Some((LeafHit::External(reference), revision)) => {
+                Ok(Some((self.values.read(&reference)?, revision)))
+            }
+            None => Ok(None),
+        }
     }
 
-    /// Finds one key's value inside a leaf page without decoding the page.
-    ///
-    /// The value is materialised here rather than handed back as an
-    /// [`EntryValue`] for the caller to resolve: an inline value returned that way
-    /// would be copied out of the page and then cloned again by `read_value`, and
-    /// at 1 MiB one avoidable copy of the bytes is most of the cost of the read.
-    /// Cells ascend by key, so the walk stops at the first cell past the target.
-    fn find_in_leaf(&self, page: &Page, page_id: u64, key: &[u8]) -> Result<RevisionedValue> {
+    /// One key's value without copying it: an inline value is handed back
+    /// still inside its cached page (kept alive by the `Arc`), and a spilled
+    /// value is the value cache's own allocation. This is the read the
+    /// zero-copy `get` API serves from — the descent is `get`'s, the
+    /// materialisation cost is a reference-count bump.
+    pub(crate) fn get_shared(&self, key: &[u8]) -> Result<Option<SharedTreeValue>> {
+        if self.root == 0 {
+            return Ok(None);
+        }
+        let leaf_id = self.find_leaf(key, None)?;
+        let page = self.pages.read(leaf_id)?;
+        require_type(&page, leaf_id, LEAF)?;
+        match self.find_in_leaf(&page, leaf_id, key)? {
+            Some((LeafHit::Inline { offset, len }, _)) => Ok(Some(SharedTreeValue::Paged(
+                Bytes::paged(&page, offset, len),
+            ))),
+            Some((LeafHit::External(reference), _)) => Ok(Some(SharedTreeValue::Log(
+                self.values.read_shared(&reference)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Finds one key's cell inside a leaf page without decoding the page,
+    /// reporting WHERE the value is rather than materialising it, so `get`
+    /// can copy it out and `get_shared` can hand it back in place. Cells
+    /// ascend by key, so the walk stops at the first cell past the target.
+    fn find_in_leaf(&self, page: &Page, page_id: u64, key: &[u8]) -> Result<Option<(LeafHit, u64)>> {
         let count = read_u32(page, 20) as usize;
         // Same bound and same reasoning as `decode_leaf`: a count past what the
         // page can physically hold is a forged field, not a large tree.
@@ -927,16 +993,19 @@ impl PageTree {
                 require_page(offset, value_len, page_id)?;
             }
             if ordering == std::cmp::Ordering::Equal {
-                let value = if value_external {
-                    self.values.read(&ValueRef {
+                let hit = if value_external {
+                    LeafHit::External(ValueRef {
                         offset: value_offset,
                         len: value_len as u32,
                         revision,
-                    })?
+                    })
                 } else {
-                    page[offset..offset + value_len].to_vec()
+                    LeafHit::Inline {
+                        offset,
+                        len: value_len,
+                    }
                 };
-                return Ok(Some((value, revision)));
+                return Ok(Some((hit, revision)));
             }
             if !value_external {
                 offset += value_len;
@@ -1328,6 +1397,25 @@ impl PageTree {
         limit: usize,
         excluded_prefix: Option<&[u8]>,
     ) -> Result<Vec<VersionedRow>> {
+        Ok(self
+            .scan_shared_with_revisions(start, end, limit, excluded_prefix)?
+            .into_iter()
+            .map(|(key, value, revision)| (key, value.into_vec(), revision))
+            .collect())
+    }
+
+    /// The scan every scan is built on: rows carry their values un-copied —
+    /// inline values still inside their cached pages, spilled values as the
+    /// value cache's own allocations. The copying wrapper above materialises
+    /// them for callers that need owned bytes; `scan_shared` hands them to
+    /// the caller as they are.
+    pub(crate) fn scan_shared_with_revisions(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<SharedRow>> {
         let mut rows = Vec::with_capacity(limit.min(1024));
         if self.root != 0 && limit != 0 {
             self.scan_node(self.root, start, end, limit, excluded_prefix, &mut rows, 0)?;
@@ -1496,7 +1584,7 @@ impl PageTree {
         end: Option<&[u8]>,
         limit: usize,
         excluded_prefix: Option<&[u8]>,
-        rows: &mut Vec<VersionedRow>,
+        rows: &mut Vec<SharedRow>,
         depth: usize,
     ) -> Result<()> {
         if depth >= MAX_TREE_DEPTH {
@@ -1537,10 +1625,12 @@ impl PageTree {
                     // once here, with the first copy dropped immediately after.
                     let revision = entry.revision;
                     let value = match entry.value {
-                        EntryValue::Inline(value) => value.into_vec(),
+                        // Still inside its page, which the row's `Bytes` keeps
+                        // alive — no copy at any size.
+                        EntryValue::Inline(value) => SharedTreeValue::Paged(value),
                         EntryValue::External(reference) => {
                             pending.push((rows.len(), reference));
-                            Vec::new()
+                            SharedTreeValue::Paged(Bytes::Owned(Vec::new()))
                         }
                     };
                     rows.push((entry.key.into_vec(), value, revision));
@@ -1556,7 +1646,7 @@ impl PageTree {
                     for ((slot, _), value) in
                         pending.iter().zip(self.values.read_many(&references)?)
                     {
-                        rows[*slot].1 = value;
+                        rows[*slot].1 = SharedTreeValue::Log(value);
                     }
                 }
             }

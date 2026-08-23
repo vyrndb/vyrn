@@ -14,6 +14,62 @@ pub mod wal_archive;
 pub use overlay::{PublishedMutation, WriteBackPublish};
 pub use wal::Wal;
 
+/// A value returned without copying its bytes.
+///
+/// `get_shared` hands back the engine's own storage of the value — a slice
+/// of a cached tree page, the value cache's allocation, or the write-back
+/// buffer's — kept alive through a reference count for as long as this
+/// handle exists. Cloning is a count bump. Dereferences to `[u8]`; call
+/// [`SharedBytes::to_vec`] when owned bytes are genuinely needed.
+///
+/// The trade against [`Engine::get`]: a large value costs nothing to return,
+/// and in exchange the handle pins its backing — a cached page or cache slot
+/// stays resident while the handle lives, so hold these briefly rather than
+/// accumulating them.
+#[derive(Clone, Debug)]
+pub struct SharedBytes(SharedRepr);
+
+#[derive(Clone, Debug)]
+enum SharedRepr {
+    Tree(page_tree::SharedTreeValue),
+    Buffered(Arc<Vec<u8>>),
+}
+
+impl SharedBytes {
+    fn tree(value: page_tree::SharedTreeValue) -> Self {
+        Self(SharedRepr::Tree(value))
+    }
+
+    fn buffered(value: Arc<Vec<u8>>) -> Self {
+        Self(SharedRepr::Buffered(value))
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.0 {
+            SharedRepr::Tree(value) => value.as_slice(),
+            SharedRepr::Buffered(value) => value,
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<u8> {
+        self.as_slice().to_vec()
+    }
+}
+
+impl std::ops::Deref for SharedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 /// Diagnostic breakdown of the work `apply_batch` does under the engine write
 /// lock.
 ///
@@ -561,6 +617,41 @@ impl ReadEngine {
         overlay::merged_get(&self.tree, self.overlay.as_ref(), key)
     }
 
+    /// [`ReadEngine::get`] without copying the value out — see [`SharedBytes`].
+    pub fn get_shared(&self, key: &[u8]) -> Result<Option<SharedBytes>> {
+        validate_user_key(key)?;
+        overlay::merged_get_shared(&self.tree, self.overlay.as_ref(), key)
+    }
+
+    /// [`ReadEngine::scan`] without copying values out — see [`SharedBytes`].
+    pub fn scan_shared(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, SharedBytes)>> {
+        if let Some(key) = start {
+            validate_user_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_user_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        Ok(overlay::merged_scan_shared(
+            &self.tree,
+            self.overlay.as_ref(),
+            start,
+            end,
+            limit,
+            Some(INTERNAL_PREFIX),
+        )?
+        .into_iter()
+        .map(|(key, value, _)| (key, value))
+        .collect())
+    }
+
     pub fn scan(
         &self,
         start: Option<&[u8]>,
@@ -701,6 +792,11 @@ pub struct Engine {
     /// `last_published` lifecycle otherwise (cleared on the way into every
     /// batch, taken by the caller after a successful one).
     write_back_publish: Vec<overlay::PublishedMutation>,
+    /// Whether commits stage `write_back_publish` at all. Off by default:
+    /// staging clones every mutation's key on the commit path, and only an
+    /// embedder with read handles to feed — the server — ever takes it.
+    /// An embedded engine must not pay for a publication nobody reads.
+    write_back_publish_enabled: bool,
     /// The LSN through which the tree has absorbed the write-back buffer:
     /// every buffered entry at or below it is also behind the tree's current
     /// root, so a read handle serving that root may drop its overlay copies.
@@ -866,6 +962,7 @@ impl Engine {
             failure: None,
             last_published: Vec::new(),
             write_back_publish: Vec::new(),
+            write_back_publish_enabled: false,
             write_back_absorbed: state.lsn,
             shared_snapshots: std::sync::Mutex::new(BTreeMap::new()),
             wal_len,
@@ -877,6 +974,44 @@ impl Engine {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         validate_user_key(key)?;
         self.get_internal(key)
+    }
+
+    /// [`Engine::get`] without copying the value out — see [`SharedBytes`].
+    pub fn get_shared(&self, key: &[u8]) -> Result<Option<SharedBytes>> {
+        validate_user_key(key)?;
+        self.ensure_healthy()?;
+        validate_key(key)?;
+        overlay::merged_get_shared(&self.tree, self.write_back.as_ref(), key)
+    }
+
+    /// [`Engine::scan`] without copying values out — see [`SharedBytes`].
+    pub fn scan_shared(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, SharedBytes)>> {
+        self.ensure_healthy()?;
+        if let Some(key) = start {
+            validate_user_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_user_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        Ok(overlay::merged_scan_shared(
+            &self.tree,
+            self.write_back.as_ref(),
+            start,
+            end,
+            limit,
+            Some(INTERNAL_PREFIX),
+        )?
+        .into_iter()
+        .map(|(key, value, _)| (key, value))
+        .collect())
     }
 
     pub(crate) fn get_internal(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -1971,11 +2106,13 @@ impl Engine {
                     // `revision` — the same stamp its puts carry.
                     page_tree::Mutation::Delete => (None, revision),
                 };
-                self.write_back_publish.push(overlay::PublishedMutation {
-                    key: key.clone(),
-                    value: value.clone(),
-                    revision: entry_revision,
-                });
+                if self.write_back_publish_enabled {
+                    self.write_back_publish.push(overlay::PublishedMutation {
+                        key: key.clone(),
+                        value: value.clone(),
+                        revision: entry_revision,
+                    });
+                }
                 buffer.record(key, value, entry_revision);
             }
             self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
@@ -2115,6 +2252,17 @@ impl Engine {
     /// Must be read under the same exclusive access as the commit that staged
     /// it — the next batch clears the staging on its way in, exactly like
     /// [`Engine::last_published`].
+    /// Makes every write-back commit stage its mutations for
+    /// [`Engine::take_write_back_publish`].
+    ///
+    /// Call once after open, before serving writes, when read handles are fed
+    /// from this engine — the server does. Off by default because staging
+    /// clones every mutation's key, a cost an embedded engine with no read
+    /// handles must not pay.
+    pub fn enable_write_back_publish(&mut self) {
+        self.write_back_publish_enabled = true;
+    }
+
     pub fn take_write_back_publish(&mut self) -> overlay::WriteBackPublish {
         if self.write_back.is_none() {
             return overlay::WriteBackPublish::default();

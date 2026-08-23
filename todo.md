@@ -138,6 +138,22 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       scan_1000 4 KiB 25× hot / 3.35× cold; 128 B rows untouched (never in the log);
       scan_1000/128b −2.5% accepted. Full write-up in docs/benchmarks.md.
 
+- [x] **PERF round 6 (zero-copy reads + head-to-head)** — `get_shared`/`scan_shared` on Engine and
+      ReadEngine return `SharedBytes` (page-backed inline values, value-cache-backed spilled ones,
+      overlay-backed buffered ones; copying APIs are now materialising wrappers over the same
+      paths, equivalence asserted in the model tests). Write-back publish staging opt-in
+      (`enable_write_back_publish`, server calls it; embedded pays nothing). WAL runway fill
+      scales with record size (~64 records per extension barrier at any size, cap 8 MiB,
+      self-initialising rule untouched). Standalone 3-engine harness in `../vyrn-compare`
+      (sled + redb, zero-copy APIs all around, sled flushed per put in its durable row): vyrn #1
+      on point_get 128 B, both scans, durable_put 128 B/4 KiB. docs/benchmarks.md has the table.
+- [ ] **The four contested benchmark rows.** point_get 4 KiB/64 KiB lose to redb's mmap guards:
+      the levers are a per-page cell-offset index (leaf lookups binary-search instead of walking
+      ~40 variable-length cells) and the page cache's per-level mutex. batch_put 128 B loses to
+      redb ~1.2x: per-op allocation diet on the write-back batch path (change-record staging and
+      WAL encode each clone every value). durable_put 64 KiB trails flushed sled ~1.15x,
+      consistent across runs but inside this host's fsync noise; measure on Linux before chasing.
+
 ## ⬜ Queued
 
 - [ ] **Measure PERF round 4 on the Linux host, paired.** Three separate pairings with

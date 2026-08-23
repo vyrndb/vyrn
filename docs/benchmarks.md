@@ -360,6 +360,48 @@ or hot; the value cache's full factors apply to working sets that fit its
 budget, which is also precisely the regime the comparison stores' own caches
 were serving in.
 
+### Fixed: reads that copy nothing — `get_shared` and `scan_shared`
+
+The engines vyrn is compared against do not hand back owned bytes: sled's
+`get` returns a refcounted buffer, redb's returns a guard borrowing its mmap.
+vyrn's API copied every value into a fresh `Vec` even when the bytes were
+already sitting in a cached page or the value cache — at 64 KiB that copy was
+most of a hot read. `get_shared` and `scan_shared` return [`SharedBytes`]:
+inline values still inside their cached page (the `Arc` keeps it alive),
+spilled values as the value cache's own allocation, buffered values as the
+write-back overlay's. A hit is a descent plus a reference-count bump. The
+copying `get`/`scan` remain, now thin materialising wrappers over the same
+paths, and the model tests assert both agree on every probe.
+
+Two costs found while measuring left with it: the write-back publish staging
+(a key clone per mutation) is now opt-in via `Engine::enable_write_back_publish`
+— the server calls it, an embedded engine no longer pays for a publication
+nobody reads — and the WAL runway now scales its fill with the record size
+(`reserve` covers ~64 records of whatever size per expensive extension
+barrier, capped at 8 MiB, small records unchanged, the self-initialising rule
+for records larger than a step untouched).
+
+Measured against sled and redb in one process on this host (the standalone
+harness in `../vyrn-compare`, each engine on its zero-copy read API and
+1 GiB cache parity, sled additionally forced to `flush()` per put in its
+durable row — its default is a 500 ms background flush, which is the number
+naive durability comparisons quote):
+
+    #1 for vyrn      point_get 128 B (~2.0–2.3 M/s, 1.3–2.4x over both),
+                     scan_1000 128 B (~8.7–9.8 M rows/s),
+                     scan_1000 4 KiB (~4.7–5.4 M rows/s, 1.4x over redb),
+                     durable_put 128 B and 4 KiB (at the shared fsync floor,
+                     tied with or ahead of flushed sled; redb behind)
+    still behind     point_get 4 KiB and 64 KiB (redb's mmap guard wins —
+                     the levers left are a per-page cell-offset index so leaf
+                     lookups binary-search instead of walking, and the page
+                     cache's per-level mutex), batch_put 128 B (redb ~1.2x —
+                     per-op allocation diet), durable_put 64 KiB (sled ~1.15x,
+                     inside this host's fsync noise band but consistent)
+
+Write rows on this host vary ±10–15% run to run; the read rows are stable and
+the rankings reproduced across runs.
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and

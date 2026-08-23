@@ -83,6 +83,16 @@ fn a_write_back_engine_answers_identically_to_a_classic_engine() {
                 "get({}) diverged at step {step}",
                 String::from_utf8_lossy(&probe)
             );
+            // The zero-copy read must answer identically to the copying one,
+            // on both engines, whatever mix of buffered and absorbed state
+            // the key is in.
+            for engine in [&classic, &buffered] {
+                assert_eq!(
+                    engine.get_shared(&probe).unwrap().map(|value| value.to_vec()),
+                    engine.get(&probe).unwrap(),
+                    "get_shared diverged from get at step {step}"
+                );
+            }
             assert_eq!(
                 classic.changed_since(&probe, step / 2).unwrap(),
                 buffered.changed_since(&probe, step / 2).unwrap(),
@@ -97,6 +107,20 @@ fn a_write_back_engine_answers_identically_to_a_classic_engine() {
                 buffered.scan(Some(&start), None, limit).unwrap(),
                 "scan diverged at step {step}"
             );
+            // The zero-copy scan must return the same rows as the copying
+            // one, on both engines, buffered and absorbed state alike.
+            for engine in [&classic, &buffered] {
+                assert_eq!(
+                    engine
+                        .scan_shared(Some(&start), None, limit)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_vec()))
+                        .collect::<Vec<_>>(),
+                    engine.scan(Some(&start), None, limit).unwrap(),
+                    "scan_shared diverged from scan at step {step}"
+                );
+            }
             assert_eq!(classic.len(), buffered.len(), "len diverged at step {step}");
         }
         if step % 97 == 0 {
@@ -228,6 +252,8 @@ fn a_published_read_handle_answers_identically_to_a_classic_one() {
     let mut classic = Engine::open(classic_dir.path()).unwrap();
     let mut buffered =
         Engine::open_with_options(buffered_dir.path(), write_back_options(4 * 1024)).unwrap();
+    // What the server does after open: read handles are fed from this engine.
+    buffered.enable_write_back_publish();
     let mut classic_reader = ReadEngine::open(classic_dir.path()).unwrap();
     let mut buffered_reader = ReadEngine::open_with_write_back(buffered_dir.path()).unwrap();
 
@@ -366,6 +392,16 @@ fn a_published_read_handle_answers_identically_to_a_classic_one() {
                 buffered_reader.scan(Some(&start), None, limit).unwrap(),
                 "reader scan diverged at step {step}"
             );
+            assert_eq!(
+                buffered_reader
+                    .scan_shared(Some(&start), None, limit)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(key, value)| (key, value.to_vec()))
+                    .collect::<Vec<_>>(),
+                buffered_reader.scan(Some(&start), None, limit).unwrap(),
+                "reader scan_shared diverged from scan at step {step}"
+            );
         }
         if step % 17 == 0 {
             let value = bucket(rng.next());
@@ -385,6 +421,55 @@ fn a_published_read_handle_answers_identically_to_a_classic_one() {
     );
 }
 
+/// `get_shared` must agree with `get` for every storage a value can live in:
+/// inline in a leaf page, spilled to the value log below and above its
+/// copy-versus-seek threshold, buffered in a write-back overlay, deleted,
+/// and absent — on the engine and on a read handle alike.
+#[test]
+fn get_shared_agrees_with_get_everywhere_a_value_can_live() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine =
+        Engine::open_with_options(directory.path(), write_back_options(1024 * 1024)).unwrap();
+    engine.enable_write_back_publish();
+    let mut reader = ReadEngine::open_with_write_back(directory.path()).unwrap();
+    let sizes = [16usize, 1024, 1025, 4096, 40 * 1024, 200 * 1024];
+    for (index, size) in sizes.iter().enumerate() {
+        let value: Vec<u8> = (0..*size).map(|byte| (byte + index) as u8).collect();
+        engine
+            .put(format!("shared/{index}").into_bytes(), value)
+            .unwrap();
+    }
+    engine.delete(b"shared/1").unwrap();
+    let publish = engine.take_write_back_publish();
+    let (generation, root, len) = engine.committed_root();
+    reader.refresh(generation, root, len).unwrap();
+    reader.publish_write_back(&publish).unwrap();
+    // Buffered state first, then the same keys after the tree absorbs them.
+    for pass in ["buffered", "absorbed"] {
+        for index in 0..sizes.len() {
+            let key = format!("shared/{index}").into_bytes();
+            let expected = engine.get(&key).unwrap();
+            assert_eq!(
+                engine.get_shared(&key).unwrap().map(|value| value.to_vec()),
+                expected,
+                "engine get_shared diverged ({pass}, key {index})"
+            );
+            assert_eq!(
+                reader.get_shared(&key).unwrap().map(|value| value.to_vec()),
+                reader.get(&key).unwrap(),
+                "reader get_shared diverged ({pass}, key {index})"
+            );
+        }
+        assert!(engine.get_shared(b"shared/none").unwrap().is_none());
+        if pass == "buffered" {
+            engine.checkpoint().unwrap();
+            let (generation, root, len) = engine.committed_root();
+            reader.refresh(generation, root, len).unwrap();
+            reader.evict_write_back_through(engine.write_back_absorbed_through().unwrap());
+        }
+    }
+}
+
 /// Feeding a write-back commit to a handle opened without write-back replay is
 /// a wiring bug, and it must be refused rather than absorbed silently: a
 /// handle that drops mutations serves a tree that lags the log forever.
@@ -393,6 +478,7 @@ fn publishing_to_a_plain_read_handle_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let mut engine =
         Engine::open_with_options(directory.path(), write_back_options(1024 * 1024)).unwrap();
+    engine.enable_write_back_publish();
     let mut reader = ReadEngine::open(directory.path()).unwrap();
     engine.put(b"wired-wrong".to_vec(), b"value".to_vec()).unwrap();
     let publish = engine.take_write_back_publish();

@@ -284,6 +284,30 @@ impl ValueLog {
         if let Some(value) = self.cached(reference) {
             return Ok(value);
         }
+        let value = self.read_uncached(reference)?;
+        self.remember(reference, &value);
+        Ok(value)
+    }
+
+    /// [`ValueLog::read`] without the copy: a cache hit is a reference-count
+    /// bump, and a miss returns the same allocation the cache keeps. This is
+    /// what a zero-copy `get` serves large values through.
+    pub(crate) fn read_shared(&self, reference: &ValueRef) -> Result<Arc<Vec<u8>>> {
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(value) = cache.get(reference.offset, reference.revision, reference.len) {
+                return Ok(value);
+            }
+        }
+        let shared = Arc::new(self.read_uncached(reference)?);
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(reference.offset, reference.revision, Arc::clone(&shared));
+        }
+        Ok(shared)
+    }
+
+    /// The file read behind both `read` paths: framing, CRC, and reference
+    /// metadata verified exactly as always; no cache involved.
+    fn read_uncached(&self, reference: &ValueRef) -> Result<Vec<u8>> {
         let total_len = HEADER_LEN
             .checked_add(reference.len as usize)
             .and_then(|length| length.checked_add(FOOTER_LEN))
@@ -347,7 +371,6 @@ impl ValueLog {
                 "value reference metadata mismatch",
             ));
         }
-        self.remember(reference, &value);
         Ok(value)
     }
 
@@ -365,19 +388,24 @@ impl ValueLog {
     /// same framing, the same CRC over the same bytes, the same reference
     /// metadata check. Coalescing changes how bytes reach memory, never what
     /// is accepted.
-    pub(crate) fn read_many(&self, references: &[ValueRef]) -> Result<Vec<Vec<u8>>> {
+    pub(crate) fn read_many(&self, references: &[ValueRef]) -> Result<Vec<Arc<Vec<u8>>>> {
         if references.len() < 2 {
-            return references.iter().map(|r| self.read(r)).collect();
+            return references.iter().map(|r| self.read_shared(r)).collect();
         }
-        let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(references.len());
+        let mut results: Vec<Option<Arc<Vec<u8>>>> = Vec::with_capacity(references.len());
         results.resize_with(references.len(), || None);
-        // The cache first; only the misses go to the file.
+        // The cache first; only the misses go to the file. A hit is handed
+        // back as the cache's own allocation — no copy at all.
         let mut order: Vec<usize> = Vec::with_capacity(references.len());
-        for (slot, reference) in references.iter().enumerate() {
-            match self.cached(reference) {
-                Some(value) => results[slot] = Some(value),
-                None => order.push(slot),
+        if let Ok(mut cache) = self.cache.lock() {
+            for (slot, reference) in references.iter().enumerate() {
+                match cache.get(reference.offset, reference.revision, reference.len) {
+                    Some(value) => results[slot] = Some(value),
+                    None => order.push(slot),
+                }
             }
+        } else {
+            order.extend(0..references.len());
         }
         // Physical order over the misses, remembering each one's output slot.
         order.sort_unstable_by_key(|&index| references[index].offset);
@@ -422,10 +450,10 @@ impl ValueLog {
         &self,
         references: &[ValueRef],
         slots: &[usize],
-        results: &mut [Option<Vec<u8>>],
+        results: &mut [Option<Arc<Vec<u8>>>],
     ) -> Result<()> {
         if let [slot] = slots {
-            results[*slot] = Some(self.read(&references[*slot])?);
+            results[*slot] = Some(self.read_shared(&references[*slot])?);
             return Ok(());
         }
         let start = references[slots[0]].offset;
@@ -446,8 +474,10 @@ impl ValueLog {
             if read_u64(record, 5) != reference.revision || read_u32(record, 13) != reference.len {
                 return Err(corrupt_value(offset, "value reference metadata mismatch"));
             }
-            let value = record[HEADER_LEN..record_len - FOOTER_LEN].to_vec();
-            self.remember(reference, &value);
+            let value = Arc::new(record[HEADER_LEN..record_len - FOOTER_LEN].to_vec());
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.insert(reference.offset, reference.revision, Arc::clone(&value));
+            }
             results[slot] = Some(value);
             cursor += record_len;
         }
@@ -710,7 +740,7 @@ mod tests {
                 assert_eq!(values.len(), layout.len());
                 for (position, &index) in layout.iter().enumerate() {
                     assert_eq!(
-                        values[position], references[index].1,
+                        *values[position], references[index].1,
                         "{pass} read_many returned the wrong value at position \
                          {position} for reference {index}"
                     );
