@@ -22,9 +22,7 @@ struct Captured {
 
 impl RecordSink for Captured {
     fn record(&self, lsn: u64, record: &[u8]) {
-        self.records
-            .const_lock()
-            .push((lsn, record.to_vec()));
+        self.records.const_lock().push((lsn, record.to_vec()));
     }
 }
 
@@ -202,9 +200,21 @@ fn an_abutting_stream_is_accepted() {
 fn duplicate_records_are_skipped_rather_than_failing() {
     // A reconnect can legitimately resend records the replica already has.
     // Treating those as an error would make reconnection impossible.
-    assert_eq!(check_contiguous(10, 11), Ok(true), "the next record applies");
-    assert_eq!(check_contiguous(10, 10), Ok(false), "a duplicate is skipped");
-    assert_eq!(check_contiguous(10, 1), Ok(false), "an old record is skipped");
+    assert_eq!(
+        check_contiguous(10, 11),
+        Ok(true),
+        "the next record applies"
+    );
+    assert_eq!(
+        check_contiguous(10, 10),
+        Ok(false),
+        "a duplicate is skipped"
+    );
+    assert_eq!(
+        check_contiguous(10, 1),
+        Ok(false),
+        "an old record is skipped"
+    );
     assert_eq!(
         check_contiguous(10, 12),
         Err(Divergence::NonContiguous {
@@ -219,7 +229,10 @@ fn duplicate_records_are_skipped_rather_than_failing() {
 fn an_empty_or_header_only_record_is_rejected() {
     assert!(verify_record(&[]).is_err());
     assert!(verify_record(&[0; 44]).is_err());
-    assert!(verify_record(&[0; 45]).is_err(), "zeroed header is not valid");
+    assert!(
+        verify_record(&[0; 45]).is_err(),
+        "zeroed header is not valid"
+    );
 }
 
 /// The property the whole design rests on: a replica that applies a primary's

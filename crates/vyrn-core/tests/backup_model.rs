@@ -315,7 +315,10 @@ fn a_missing_middle_segment_is_refused_instead_of_backed_up() {
     let mut segments: Vec<PathBuf> = std::fs::read_dir(&wal_directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "vwal"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "vwal")
+        })
         .collect();
     segments.sort();
     assert!(
@@ -407,9 +410,16 @@ fn backups_refuse_outputs_that_clobber_engine_state() {
     );
     assert_eq!(std::fs::read(&segment_path).unwrap(), segment_before);
     assert!(!source_dir.path().join("values-fabricated.vlog").exists());
-    assert!(!source_dir.path().join("revisions-fabricated.vmvcc").exists());
+    assert!(!source_dir
+        .path()
+        .join("revisions-fabricated.vmvcc")
+        .exists());
     assert!(
-        !source_dir.path().join("wal").join("planted.vyrnbkp").exists(),
+        !source_dir
+            .path()
+            .join("wal")
+            .join("planted.vyrnbkp")
+            .exists(),
         "the backup planted a file inside wal/"
     );
     assert!(

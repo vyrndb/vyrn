@@ -326,7 +326,9 @@ fn a_record_whose_head_page_never_persisted_truncates_instead_of_failing_to_open
     let mut torn = logged.clone();
     torn[committed..committed + RECORD_HEADER_BYTES].fill(0);
     assert!(
-        torn[committed + RECORD_HEADER_BYTES..full].iter().any(|byte| *byte != 0),
+        torn[committed + RECORD_HEADER_BYTES..full]
+            .iter()
+            .any(|byte| *byte != 0),
         "the tail must survive for this to be the case the overrun rule misses"
     );
 

@@ -704,3 +704,208 @@ fn a_scan_returns_the_same_rows_it_did_before_chunking() {
         assert_eq!(ranged.last().expect("last row").0, b"row/000999".to_vec());
     });
 }
+
+/// Write-back buffering on the SHIPPED server. Every read below travels the
+/// full path — connection task, reader queue, `ReadEngine` — so this is the
+/// test that the flush stage's publication actually reaches the read handles'
+/// overlay copies, for every kind of commit the server can make: batched
+/// key/value writes, deletes, document writes, and index changes. The buffer
+/// is small enough that many absorbs land mid-test, so reads repeatedly cross
+/// buffered → absorbed → evicted. The kill at the end is the mode's whole bet:
+/// the buffer dies with the process and the WAL alone brings every commit back.
+#[test]
+fn write_back_serves_correct_reads_and_survives_a_kill() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hash = dir.path().join("password.phc");
+    write_password_hash(&hash);
+    let data = dir.path().join("data");
+    let extra = [("VYRN_WRITE_BACK_BYTES", "4096".to_string())];
+
+    let node = spawn(&data, &hash, &extra);
+    let url = node.url();
+    runtime().block_on(async {
+        let mut client = connect(&url).await;
+
+        /* An index created under write-back must become visible to the read
+         * handles WITHOUT any later commit: its definition travels the flush
+         * queue like a batch's mutations do. Polled, not asserted immediately —
+         * the client's acknowledgement deliberately races the flush stage's
+         * publication — but bounded, so "never" still fails. */
+        client
+            .create_index(b"wb-idx".to_vec(), false)
+            .await
+            .expect("create index");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match client
+                .lookup_index(b"wb-idx".to_vec(), b"nothing".to_vec(), None)
+                .await
+            {
+                Ok(keys) => {
+                    assert!(keys.is_empty(), "a fresh index must be empty");
+                    break;
+                }
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the index never became visible to the read handles: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+
+        client
+            .create_collection("wb-docs", &[])
+            .await
+            .expect("create collection");
+        client
+            .put_document("wb-docs", "doc-1", &serde_json::json!({"n": 1}))
+            .await
+            .expect("put document");
+        assert!(
+            client
+                .get_document("wb-docs", "doc-1")
+                .await
+                .expect("get document")
+                .is_some(),
+            "a document written through the write-back path must be readable"
+        );
+
+        for index in 0..300u32 {
+            let key = format!("wb/{index:04}").into_bytes();
+            client.put(key.clone(), vec![b'v'; 100]).await.expect("put");
+            // Acknowledgement happens only after the readers were fed, so
+            // read-your-write on this connection is deterministic, not a race.
+            let read = client.get(key).await.expect("get");
+            assert_eq!(
+                read.as_deref(),
+                Some(&[b'v'; 100][..]),
+                "read-your-write failed at key {index}"
+            );
+            if index % 10 == 0 && index > 0 {
+                let victim = format!("wb/{:04}", index - 10).into_bytes();
+                assert!(client.delete(victim.clone()).await.expect("delete"));
+                assert_eq!(
+                    client.get(victim).await.expect("get deleted"),
+                    None,
+                    "a delete must mask the tree through the overlay"
+                );
+            }
+        }
+        let rows = client
+            .scan(Some(b"wb/".to_vec()), Some(b"wb0".to_vec()), Some(1000))
+            .await
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            300 - 29,
+            "the scan must see every put minus every delete"
+        );
+    });
+
+    // A hard kill: `Drop` uses `Child::kill`, so nothing flushes on the way
+    // out and the buffered tail exists only in the WAL.
+    drop(node);
+    let node = spawn(&data, &hash, &extra);
+    let url = node.url();
+    runtime().block_on(async {
+        let mut client = connect(&url).await;
+        assert_eq!(
+            client
+                .get(b"wb/0299".to_vec())
+                .await
+                .expect("get after recovery")
+                .as_deref(),
+            Some(&[b'v'; 100][..]),
+            "the newest write must come back from the WAL after a kill"
+        );
+        assert_eq!(
+            client
+                .get(b"wb/0280".to_vec())
+                .await
+                .expect("get deleted after recovery"),
+            None,
+            "a deleted key must stay deleted after recovery"
+        );
+        assert!(
+            client
+                .get_document("wb-docs", "doc-1")
+                .await
+                .expect("get document after recovery")
+                .is_some(),
+            "a document must come back from the WAL after a kill"
+        );
+    });
+}
+
+/// One pipelined burst must behave exactly like the same operations issued one
+/// at a time: executed in order, answered in order, one answer per operation —
+/// with the whole burst costing one round trip. The put→get→delete→get chain
+/// on a single key is the ordering probe: any reordering or skew between
+/// requests and responses changes its answers. The empty-key operation in the
+/// middle is the error probe: a refused operation must consume exactly its own
+/// slot, not derail the answers behind it — and the connection must remain
+/// usable for ordinary requests afterwards.
+#[test]
+fn a_pipelined_burst_answers_every_operation_in_order() {
+    use vyrn_client::{PipelineOperation, PipelineResponse};
+    let (_dir, node) = node(&[]);
+    let url = node.url();
+    runtime().block_on(async {
+        let mut client = connect(&url).await;
+
+        let mut operations = Vec::new();
+        for index in 0..200u32 {
+            operations.push(PipelineOperation::Put(
+                format!("pipe/{index:03}").into_bytes(),
+                format!("value-{index}").into_bytes(),
+            ));
+        }
+        operations.push(PipelineOperation::Get(b"pipe/007".to_vec()));
+        operations.push(PipelineOperation::Get(Vec::new())); // refused: empty key
+        operations.push(PipelineOperation::Delete(b"pipe/007".to_vec()));
+        operations.push(PipelineOperation::Get(b"pipe/007".to_vec()));
+        operations.push(PipelineOperation::Delete(b"pipe/never-existed".to_vec()));
+
+        let results = client.pipeline(operations).await.expect("pipeline burst");
+        assert_eq!(results.len(), 205, "one answer per operation, no more, no fewer");
+        for (index, result) in results[..200].iter().enumerate() {
+            assert_eq!(
+                result.as_ref().expect("put succeeds"),
+                &PipelineResponse::Written,
+                "put {index} must be acknowledged"
+            );
+        }
+        assert_eq!(
+            results[200].as_ref().expect("get succeeds"),
+            &PipelineResponse::Value(Some(b"value-7".to_vec())),
+            "the get must see the put earlier in the same burst"
+        );
+        assert!(
+            results[201].is_err(),
+            "an empty key must be refused in its own slot"
+        );
+        assert_eq!(
+            results[202].as_ref().expect("delete succeeds"),
+            &PipelineResponse::Deleted(true),
+            "the delete follows the error and must still act on the right key"
+        );
+        assert_eq!(
+            results[203].as_ref().expect("get after delete succeeds"),
+            &PipelineResponse::Value(None),
+            "the second get must see the delete earlier in the same burst"
+        );
+        assert_eq!(
+            results[204].as_ref().expect("delete of missing key succeeds"),
+            &PipelineResponse::Deleted(false),
+        );
+
+        // The connection stays healthy for ordinary lockstep requests.
+        assert_eq!(
+            client.get(b"pipe/003".to_vec()).await.expect("plain get"),
+            Some(b"value-3".to_vec()),
+            "a plain request after a burst must work on the same connection"
+        );
+    });
+}

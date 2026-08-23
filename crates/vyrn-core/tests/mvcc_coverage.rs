@@ -224,8 +224,9 @@ fn a_held_snapshot_stays_readable_across_many_writes() {
     // Keys created after the snapshot must not appear in it.
     assert_eq!(engine.get_at(b"other-0", snapshot).unwrap(), None);
     let rows = engine.scan_at(None, None, 100, snapshot).unwrap();
-    assert!(rows.iter().any(|(key, value)| key == b"key"
-        && value == b"first"));
+    assert!(rows
+        .iter()
+        .any(|(key, value)| key == b"key" && value == b"first"));
     assert!(!rows.iter().any(|(key, _)| key.starts_with(b"other-")));
     assert_eq!(
         engine

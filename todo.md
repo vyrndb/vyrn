@@ -112,8 +112,33 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       because three could not substantiate any claim about this engine's throughput.
 - [x] **Final sweep** — 308 tests across 44 binaries, 0 failures, 0 warnings; clippy
       `-D warnings` clean workspace-wide; TypeScript build and 22/22 SDK tests green.
+- [x] **PERF round 2 (write path)** — apply cost per request 81 → 50 µs at the 32-client batch
+      shape, paired runs same host/session (Windows). Three changes, each found by a new
+      `tree_decode`/`tree_encode`/`tree_append`/`tree_flush` split of the `tree` phase (now printed
+      by `apply-profile`): (1) page-append buffering — one contiguous write per mutation instead of
+      one syscall per copy-on-write page (~30 µs/request of pure `WriteFile` time at 3.5
+      pages/request), flushed before the new root can escape so every on-disk invariant is
+      unchanged, and a failed batch now *discards* its buffered pages instead of leaving disk
+      orphans (mutation-verified test); (2) `collect_many` walks cells in place like
+      `find_in_leaf` — pre-state 34.6 → 7.0 µs/request, page reads 32 → 23 (deterministic);
+      (3) `write_internal_level` chunks by index ranges like `write_leaf_level` instead of cloning
+      every child's min_key. Full write-up with measurements in docs/benchmarks.md. Workspace 311
+      tests green ×2, clippy `-D warnings` clean. Bytes-level write amplification (14 KiB per 128 B
+      write) still stands — that one is the persistence-strategy change, still queued.
 
 ## ⬜ Queued
+
+- [ ] **Measure PERF round 4 on the Linux host, paired.** Three separate pairings with
+      `compare-builds-linux.sh`: write-back on vs off (write + transaction modes — also read
+      `vyrn_flushed_batches_total / vyrn_wal_flushes_total`, which round 2's apply shrink plus
+      write-back should finally move off 1.007: apply no longer outlasts the barrier, so batches
+      should coalesce and the 256-client saturation should lift), inline reads vs parent (read
+      mode), and a pipelined-client run vs lockstep (needs a `MODES=pipeline` arm in the harness;
+      the client API exists). No served-path claim goes in benchmarks.md until these run.
+- [ ] **TypeScript SDK pipeline API** — the server side already serves any client that writes
+      several frames before reading; the SDK just cannot express it yet. Mirror
+      `Client::pipeline`: one write per burst, per-operation answers, refused ops consume their
+      own slot.
 
 - [ ] **Split the change record so a commit is not charged for its own bookkeeping.** Reported as
       a batch-only problem; it is worse than that. Measured: a *single* put of exactly
@@ -145,6 +170,48 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       `validate_index_name` imports the document layer's constant instead of restating it, so the
       test that pinned the two spellings together now covers the routing rather than guarding
       against drift.
+- [x] **PERF round 3 (zero-copy + write-back)** — two changes on top of round 2, both measured
+      with the same probe on the same host. (1) Zero-copy page decode: `Entry.key`,
+      `EntryValue::Inline`, and `NodeRef.min_key` became `Bytes` (owned, or an `Arc<Page>`-backed
+      slice read in place), and `prepare_batch` takes its mutations by move — decode cost
+      26.4 → 9.8 µs/commit at the single-key shape, apply 50.0 → 44.6 µs/request at the 32-client
+      shape. (2) **Write-back buffering, opt-in via `EngineOptions::write_back_buffer`** (default
+      0 = off; server and replicas unchanged, replica apply refuses it explicitly): a commit is a
+      WAL record plus an in-memory buffer entry, every read merges the buffer over the tree, the
+      tree absorbs the buffer in one amortised pass at a byte threshold and on checkpoint. WAL
+      records name `WRITE_BACK_ROOT` (never adoptable) so reopen always takes the existing
+      redo-from-checkpoint path — mutation-verified: encoding the stale tree root instead makes
+      both recovery tests fail with silent data loss. Measured: engine CPU per request beside the
+      fsync went ~70 → ~5 µs (32-client shape) and ~200 → ~16 µs (single-key), pages/request
+      3.5 → 0.1. Six tests in `tests/write_back.rs`, including a 600-step classic-vs-write-back
+      equivalence model crossing several threshold flushes. `docs/benchmarks.md` has the full
+      write-up. ~~Queued follow-up: the server's `ReadEngine`s must learn to see the buffer~~ —
+      done in PERF round 4 below.
+- [x] **PERF round 4 (served-path structure)** — three changes, all tested, none timed on this
+      host (Windows timings do not travel; the paired Linux runs are queued below).
+      (1) **Server write-back** (`--write-back-bytes`): every `ReadEngine` keeps its own overlay
+      copy of the buffer, fed one durable commit at a time by the flush stage — `PendingFlush`
+      carries `Engine::take_write_back_publish()` (captured under the engine lock like
+      `last_published`, taken only on success), applied under the same reader write lock as the
+      root refresh, evicted per-entry by absorb watermark (never clear-all: the checkpoint task
+      publishes concurrently, and a commit that reached a reader after the checkpoint absorbed
+      must survive its eviction — reader-parity model test pins exactly that interleaving, with a
+      read-your-write probe per step because a sampled probe provably missed a 3-LSN-early
+      eviction). Merge logic extracted to `overlay::merged_*`, one implementation for Engine and
+      ReadEngine. Index create/drop now publish through the flush stage (empty publication in
+      classic mode — behavior unchanged there). Found and fixed pre-existing: `drop_index` /
+      `clear_index_entries` scanned the raw tree and missed buffered entries — a recreated index
+      resurrected them as stale lookups (mutation-verified). End-to-end: shipped server at
+      `VYRN_WRITE_BACK_BYTES=4096`, read-your-write ×300 + docs + index visibility + kill and
+      WAL-only recovery; fails at the third read with the publication reverted.
+      (2) **Inline point reads**: `submit_get` answers on the connection task via shared
+      `try_read` on a read handle (succeeds even beside a running scan; falls back to the reader
+      queue while a publish holds the handle). Scans/multi-gets/documents stay on workers.
+      (3) **Protocol pipelining**: the session drains every buffered request before flushing
+      (lockstep clients unchanged), responses leave in one write per burst under the same
+      wedged-peer timeout; `Client::pipeline` submits a get/put/delete batch in one round trip
+      with per-operation answers — in-burst ordering pinned by a put→get→delete→get chain test.
+      Workspace green, clippy `-D warnings` clean.
 - [ ] **Run `scripts/crash-soak.sh` on Linux.** Written, `bash -n` clean, and every env var and
       CLI flag it uses was verified to exist — but never executed, because it is Linux-only by
       design and this host is Windows. Its `shutdown` mode is also the only coverage that exists

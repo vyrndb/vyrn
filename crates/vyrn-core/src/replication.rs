@@ -109,7 +109,9 @@ impl std::fmt::Display for Divergence {
 /// nothing, which is why the lengths come first.
 pub fn verify_record(bytes: &[u8]) -> Result<RecordHeader> {
     if bytes.len() < RECORD_HEADER_LEN {
-        return Err(stream_error("replication record is shorter than its header"));
+        return Err(stream_error(
+            "replication record is shorter than its header",
+        ));
     }
     if &bytes[0..4] != RECORD_MAGIC {
         return Err(stream_error("replication record has invalid magic"));
@@ -336,8 +338,7 @@ pub fn archived_records_from(
          * no reason to read its body. The LAST segment is never skipped, since
          * nothing follows it to prove it is exhausted. */
         if let Some(next) = segments.get(position + 1) {
-            let next_first =
-                read_segment_first_lsn_of(archive_directory, *next).unwrap_or(0);
+            let next_first = read_segment_first_lsn_of(archive_directory, *next).unwrap_or(0);
             if next_first != 0 && next_first <= from_lsn {
                 continue;
             }

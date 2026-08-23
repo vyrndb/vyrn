@@ -6,7 +6,7 @@
 //! keyspace per simulated client, so a batch lands on as many distinct leaves as
 //! it has clients — and prints where that time goes.
 use std::time::Instant;
-use vyrn_core::{profile, BatchOperation, Engine};
+use vyrn_core::{profile, BatchOperation, Engine, EngineOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let clients: u64 = std::env::var("CLIENTS")
@@ -25,11 +25,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(128);
+    // Bytes of write-back buffer; 0 (the default) profiles the classic path.
+    let write_back: usize = std::env::var("WRITE_BACK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let directory = std::env::temp_dir().join("vyrn-apply-profile");
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory)?;
-    let mut engine = Engine::open(&directory)?;
+    let mut engine = Engine::open_with_options(
+        &directory,
+        EngineOptions {
+            write_back_buffer: write_back,
+            ..EngineOptions::default()
+        },
+    )?;
+    println!("write_back={write_back}");
     let value = vec![7u8; value_size];
 
     // Build a tree of realistic depth first; a batch against an empty tree
@@ -65,22 +77,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let after = profile::snapshot();
 
     let delta = |name: &str| -> u64 {
-        let a = after.iter().find(|(k, _)| *k == name).map(|(_, v)| *v).unwrap_or(0);
-        let b = before.iter().find(|(k, _)| *k == name).map(|(_, v)| *v).unwrap_or(0);
+        let a = after
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
+        let b = before
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| *v)
+            .unwrap_or(0);
         a - b
     };
     let requests = delta("__requests").max(1);
     let batch_count = delta("__batches").max(1);
 
-    println!(
-        "\napply phase budget  clients={clients} value_size={value_size} prefill={prefill}"
-    );
+    println!("\napply phase budget  clients={clients} value_size={value_size} prefill={prefill}");
     println!(
         "  {requests} requests in {batch_count} batches ({:.1} per batch), wall {:?}",
         requests as f64 / batch_count as f64,
         elapsed
     );
-    println!("  {:<12} {:>12} {:>14}", "phase", "us/request", "% of apply");
+    println!(
+        "  {:<12} {:>12} {:>14}",
+        "phase", "us/request", "% of apply"
+    );
     let phases = ["change_log", "prestate", "plan", "tree", "mvcc", "wal"];
     let total: u64 = phases.iter().map(|p| delta(p)).sum();
     for phase in phases {
@@ -89,7 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {:<12} {:>9.2} us {:>12.1}%",
             phase,
             ns as f64 / requests as f64 / 1000.0,
-            if total > 0 { ns as f64 * 100.0 / total as f64 } else { 0.0 }
+            if total > 0 {
+                ns as f64 * 100.0 / total as f64
+            } else {
+                0.0
+            }
         );
     }
     println!(
@@ -97,6 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "TOTAL",
         total as f64 / requests as f64 / 1000.0
     );
+    for sub in ["tree_decode", "tree_encode", "tree_append", "tree_flush"] {
+        println!(
+            "  {:<12} {:>9.2} us  (inside tree)",
+            sub,
+            delta(sub) as f64 / requests as f64 / 1000.0,
+        );
+    }
     let hits = delta("__page_hits");
     let misses = delta("__page_misses");
     let appends = delta("__page_appends");

@@ -189,7 +189,8 @@ fn plant_via_replication(directory: &Path, key: &[u8], value: &[u8]) -> Engine {
     let mut engine = Engine::open(directory).unwrap();
     let (root, len, _) = engine.committed_root();
     let record = build_record(1, key, value, root, len);
-    replication::verify_record(&record).expect("the framing must be valid for this to be a test of contents");
+    replication::verify_record(&record)
+        .expect("the framing must be valid for this to be a test of contents");
     engine.apply_replicated_record(&record).unwrap();
     engine
 }
@@ -199,7 +200,10 @@ fn seeded(directory: &Path) {
     let mut engine = Engine::open(directory).unwrap();
     for index in 0..12u32 {
         engine
-            .put(format!("key/{index:04}").into_bytes(), vec![index as u8; 40])
+            .put(
+                format!("key/{index:04}").into_bytes(),
+                vec![index as u8; 40],
+            )
             .unwrap();
     }
     let mut people = engine.collection("people", &[]).unwrap();
@@ -289,7 +293,10 @@ fn every_prefix_of_a_valid_document_key_parses_or_declines_cleanly() {
         if let Some(target) = document::change_target(prefix) {
             decoded += 1;
             assert_eq!(length, key.len(), "a truncated document key decoded");
-            assert_eq!((target.collection.as_str(), target.id.as_str()), ("people", "ada"));
+            assert_eq!(
+                (target.collection.as_str(), target.id.as_str()),
+                ("people", "ada")
+            );
         }
         // The collection-scoped decoder is held to the same rule; it returns an
         // error rather than an Option, and an error is a clean outcome.
@@ -387,7 +394,10 @@ fn a_pathologically_nested_document_is_an_error_rather_than_a_stack_overflow() {
         let engine = plant_via_replication(planted_directory.path(), &ada, &value);
         let people = engine.open_collection("people").unwrap();
         if depth > 128 {
-            assert!(people.get("ada").is_err(), "{depth} levels read back as valid");
+            assert!(
+                people.get("ada").is_err(),
+                "{depth} levels read back as valid"
+            );
         }
     }
 }
@@ -468,7 +478,11 @@ fn every_prefix_of_a_valid_dump_is_refused_except_the_whole_file() {
         match portable::import(&mut target, &prefix_path) {
             Ok(pairs) => {
                 accepted += 1;
-                assert_eq!(length, original.len(), "a dump truncated at {length} imported");
+                assert_eq!(
+                    length,
+                    original.len(),
+                    "a dump truncated at {length} imported"
+                );
                 assert_eq!(pairs, exported);
             }
             Err(_) => {
@@ -631,7 +645,11 @@ fn every_prefix_of_a_valid_archive_index_is_refused_except_the_whole_file() {
         std::fs::write(archive.join("ARCHIVE"), &original[..length]).unwrap();
         if wal_archive::verify_archive(&archive).is_ok() {
             accepted += 1;
-            assert_eq!(length, original.len(), "an index truncated at {length} verified");
+            assert_eq!(
+                length,
+                original.len(),
+                "an index truncated at {length} verified"
+            );
         }
     }
     assert_eq!(accepted, 1, "exactly the complete index should verify");
@@ -662,16 +680,58 @@ fn a_forged_archive_index_count_or_lsn_is_a_clean_error_rather_than_an_overflow(
     // range. Both the LSN add and the segment-id add are exercised.
     let saturating_cases: Vec<Vec<IndexEntry>> = vec![
         vec![
-            IndexEntry { segment_id: 1, first_lsn: 1, last_lsn: u64::MAX, byte_len: 0, crc: 0, archived_at: 0 },
-            IndexEntry { segment_id: 2, first_lsn: 5, last_lsn: 5, byte_len: 0, crc: 0, archived_at: 0 },
+            IndexEntry {
+                segment_id: 1,
+                first_lsn: 1,
+                last_lsn: u64::MAX,
+                byte_len: 0,
+                crc: 0,
+                archived_at: 0,
+            },
+            IndexEntry {
+                segment_id: 2,
+                first_lsn: 5,
+                last_lsn: 5,
+                byte_len: 0,
+                crc: 0,
+                archived_at: 0,
+            },
         ],
         vec![
-            IndexEntry { segment_id: u64::MAX - 1, first_lsn: 1, last_lsn: u64::MAX, byte_len: 0, crc: 0, archived_at: 0 },
-            IndexEntry { segment_id: u64::MAX, first_lsn: u64::MAX, last_lsn: u64::MAX, byte_len: u64::MAX, crc: u32::MAX, archived_at: u64::MAX },
+            IndexEntry {
+                segment_id: u64::MAX - 1,
+                first_lsn: 1,
+                last_lsn: u64::MAX,
+                byte_len: 0,
+                crc: 0,
+                archived_at: 0,
+            },
+            IndexEntry {
+                segment_id: u64::MAX,
+                first_lsn: u64::MAX,
+                last_lsn: u64::MAX,
+                byte_len: u64::MAX,
+                crc: u32::MAX,
+                archived_at: u64::MAX,
+            },
         ],
         vec![
-            IndexEntry { segment_id: 1, first_lsn: u64::MAX, last_lsn: u64::MAX, byte_len: 0, crc: 0, archived_at: 0 },
-            IndexEntry { segment_id: 2, first_lsn: 0, last_lsn: 0, byte_len: 0, crc: 0, archived_at: 0 },
+            IndexEntry {
+                segment_id: 1,
+                first_lsn: u64::MAX,
+                last_lsn: u64::MAX,
+                byte_len: 0,
+                crc: 0,
+                archived_at: 0,
+            },
+            IndexEntry {
+                segment_id: 2,
+                first_lsn: 0,
+                last_lsn: 0,
+                byte_len: 0,
+                crc: 0,
+                archived_at: 0,
+            },
         ],
     ];
     for entries in saturating_cases {
@@ -778,9 +838,7 @@ fn every_prefix_of_a_sealed_segment_is_archived_only_when_its_records_are_whole(
     // first boundary: a segment with no records at all is valid.
     let mut boundaries = vec![SEGMENT_HEADER_LEN];
     let mut offset = SEGMENT_HEADER_LEN;
-    while offset + RECORD_HEADER_LEN <= written_through
-        && &source[offset..offset + 4] == b"VTXN"
-    {
+    while offset + RECORD_HEADER_LEN <= written_through && &source[offset..offset + 4] == b"VTXN" {
         let payload_len =
             u32::from_be_bytes(source[offset + 17..offset + 21].try_into().unwrap()) as usize;
         offset += RECORD_HEADER_LEN + payload_len + RECORD_FOOTER_LEN;
@@ -880,12 +938,13 @@ fn a_forged_segment_record_length_is_a_clean_error_rather_than_an_allocation() {
         record[RECORD_HEADER_LEN + 4..].copy_from_slice(b"VEND");
         bytes.extend_from_slice(&record);
 
-        let archive = store.path().join(format!("archive-{payload_len}-{operation_count}"));
+        let archive = store
+            .path()
+            .join(format!("archive-{payload_len}-{operation_count}"));
         std::fs::write(wal.join(segment_name(1)), &bytes).unwrap();
         std::fs::write(wal.join(segment_name(2)), build_segment_header(2, 2)).unwrap();
-        let error = wal_archive::archive_pending(&wal, &archive).expect_err(
-            "a record declaring {payload_len} payload bytes over none must be refused",
-        );
+        let error = wal_archive::archive_pending(&wal, &archive)
+            .expect_err("a record declaring {payload_len} payload bytes over none must be refused");
         assert!(
             matches!(
                 error,
@@ -1226,7 +1285,10 @@ fn a_malformed_change_log_key_or_cursor_token_is_an_error_not_a_panic() {
         // are refusals. Either way, no panic and no overflow parsing the radix.
         match Cursor::parse_token(token) {
             Ok(cursor) => assert_eq!(cursor, Cursor::new(u64::MAX, u32::MAX)),
-            Err(error) => assert!(matches!(error, vyrn_core::Error::InvalidCursor(_)), "{error:?}"),
+            Err(error) => assert!(
+                matches!(error, vyrn_core::Error::InvalidCursor(_)),
+                "{error:?}"
+            ),
         }
     }
 }

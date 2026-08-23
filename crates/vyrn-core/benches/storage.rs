@@ -87,6 +87,21 @@ fn engine() -> (TempDir, Engine) {
     (directory, engine)
 }
 
+/// An engine with an 8 MiB write-back buffer, for the rows that measure the
+/// WAL-only commit path against the classic per-commit tree rewrite.
+fn write_back_engine() -> (TempDir, Engine) {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open_with_options(
+        directory.path(),
+        vyrn_core::EngineOptions {
+            write_back_buffer: 8 * 1024 * 1024,
+            ..vyrn_core::EngineOptions::default()
+        },
+    )
+    .unwrap();
+    (directory, engine)
+}
+
 /// An engine holding `count` keys of `size` bytes, for the read cases.
 ///
 /// Filled through batches rather than one put at a time so building a fixture
@@ -164,6 +179,56 @@ fn durable_batch(c: &mut Criterion) {
             )
         });
     }
+    group.finish();
+}
+
+/// `durable_put` with the write-back buffer on: the same acknowledged-write
+/// latency path, minus the per-commit copy-on-write tree rewrite. The gap
+/// between this row and `durable_put/128b` is exactly what the tree rewrite
+/// costs a commit; what remains here is the WAL barrier plus bookkeeping.
+fn durable_put_write_back(c: &mut Criterion) {
+    let mut group = c.benchmark_group("durable_put_write_back");
+    let size = 128;
+    let operations = writes_per_iteration(size);
+    group.throughput(Throughput::Bytes(operations * size as u64));
+    group.bench_function("128b", |bench| {
+        bench.iter_batched(
+            || (write_back_engine(), vec![7; size]),
+            |((directory, mut engine), value)| {
+                for index in 0..operations {
+                    engine.put(key(index), value.clone()).unwrap();
+                }
+                (directory, engine)
+            },
+            BatchSize::PerIteration,
+        )
+    });
+    group.finish();
+}
+
+/// `durable_batch` with the write-back buffer on: one barrier, one WAL record,
+/// and no tree pass at all until the buffer flushes.
+fn durable_batch_write_back(c: &mut Criterion) {
+    let mut group = c.benchmark_group("durable_batch_write_back");
+    let size = 128;
+    let operations = writes_per_iteration(size).min(batch_keys(size));
+    group.throughput(Throughput::Bytes(operations * size as u64));
+    group.bench_function("128b", |bench| {
+        bench.iter_batched(
+            || {
+                let value = vec![7; size];
+                let batch: Vec<BatchOperation> = (0..operations)
+                    .map(|index| BatchOperation::Put(key(index), value.clone()))
+                    .collect();
+                (write_back_engine(), batch)
+            },
+            |((directory, mut engine), batch)| {
+                engine.write_batch(batch).unwrap();
+                (directory, engine)
+            },
+            BatchSize::PerIteration,
+        )
+    });
     group.finish();
 }
 
@@ -286,7 +351,9 @@ fn range_scan(c: &mut Criterion) {
 criterion_group!(
     benches,
     durable_put,
+    durable_put_write_back,
     durable_batch,
+    durable_batch_write_back,
     overwrite,
     point_get,
     hot_read_under_writes,

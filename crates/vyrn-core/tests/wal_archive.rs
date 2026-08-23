@@ -244,7 +244,10 @@ fn heals_a_rotted_archived_segment_from_its_source() {
     // the whole archive forever.
     let before = std::fs::metadata(&victim).unwrap().modified().unwrap();
     archive_pending(&wal_directory, &archive).unwrap();
-    assert_eq!(std::fs::metadata(&victim).unwrap().modified().unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&victim).unwrap().modified().unwrap(),
+        before
+    );
 }
 
 /// In async mode `last_lsn` runs ahead of the records actually written to the
@@ -406,7 +409,9 @@ fn overlapping_ticks_converge_on_a_complete_archive() {
     // Every tick agrees on how far the archive reaches — none of them can
     // return a watermark the others did not also prove.
     assert!(
-        watermarks.iter().all(|&watermark| watermark == watermarks[0]),
+        watermarks
+            .iter()
+            .all(|&watermark| watermark == watermarks[0]),
         "concurrent ticks disagreed: {watermarks:?}"
     );
     assert_eq!(segment_ids(&archive), sealed);

@@ -77,23 +77,78 @@ type RevisionedValue = Option<(Vec<u8>, u64)>;
 /// the bytes and the callers that only need presence and revision.
 type MaybeValued = Option<(Option<Vec<u8>>, u64)>;
 
+/// Bytes that either own their buffer or read it in place from a cached page.
+///
+/// Decoding a page used to allocate an owned `Vec` for every key and every
+/// inline value it holds — a leaf of 128 B values carries dozens of entries,
+/// and a copy-on-write commit decodes several leaves and internal pages only
+/// to re-encode most of their bytes unchanged moments later. A `Paged` slice
+/// keeps the page alive through its `Arc` and reads the bytes where they lie,
+/// so a decode costs two reference-count bumps per entry instead of two heap
+/// allocations and a copy. `Owned` remains for bytes that never lived in a
+/// page: new entries from a batch's mutations, and blob-backed keys.
+#[derive(Clone, Debug)]
+enum Bytes {
+    Owned(Vec<u8>),
+    Paged {
+        page: Arc<Page>,
+        offset: u32,
+        len: u32,
+    },
+}
+
+impl Bytes {
+    fn paged(page: &Arc<Page>, offset: usize, len: usize) -> Self {
+        Bytes::Paged {
+            page: Arc::clone(page),
+            offset: offset as u32,
+            len: len as u32,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Bytes::Owned(bytes) => bytes,
+            Bytes::Paged { page, offset, len } => {
+                &page[*offset as usize..*offset as usize + *len as usize]
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Bytes::Owned(bytes) => bytes.len(),
+            Bytes::Paged { len, .. } => *len as usize,
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Bytes::Owned(bytes) => bytes,
+            Bytes::Paged { page, offset, len } => {
+                page[offset as usize..offset as usize + len as usize].to_vec()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Entry {
-    key: Vec<u8>,
+    key: Bytes,
     value: EntryValue,
     revision: u64,
 }
 
 #[derive(Clone, Debug)]
 enum EntryValue {
-    Inline(Vec<u8>),
+    Inline(Bytes),
     External(ValueRef),
 }
 
 #[derive(Clone, Debug)]
 struct NodeRef {
     page_id: u64,
-    min_key: Vec<u8>,
+    min_key: Bytes,
 }
 
 /// A single key's change within one batched tree mutation.
@@ -104,6 +159,7 @@ pub(crate) enum Mutation {
 }
 
 /// The result of applying one batch.
+#[derive(Debug)]
 pub(crate) struct BatchOutcome {
     pub(crate) root: u64,
     pub(crate) len: u64,
@@ -133,7 +189,30 @@ struct CachedPage {
 
 struct PageManager {
     file: File,
+    /// Pages this manager holds, including those still in `pending`.
     page_count: u64,
+    /// Pages actually written to the file. `page_count - flushed_count` pages
+    /// sit encoded in `pending`, awaiting one contiguous write.
+    flushed_count: u64,
+    /// Encoded pages `[flushed_count, page_count)`, in page order.
+    ///
+    /// A copy-on-write commit appends its whole root-to-leaf rewrite here and
+    /// [`PageManager::flush_appends`] hands the kernel one contiguous write for
+    /// all of it. Writing each page as its own syscall measured ~30 µs per
+    /// request of a 58 µs tree phase — the single largest cost of a commit
+    /// after its `fdatasync` — for pages that never needed to reach the file
+    /// one at a time: they carry no barrier of their own, and nothing reads
+    /// them from the file before the flush.
+    ///
+    /// The buffer only lives inside one `prepare_put` / `prepare_batch` /
+    /// `prepare_delete` call: each flushes before returning, so every page a
+    /// returned root can reach is on the file before that root can be
+    /// published, and checkpoints, backups, readers on their own descriptors,
+    /// and drop-time syncs never observe a page file behind the tree they were
+    /// handed. Behind a `Mutex` because a cache miss on a not-yet-flushed page
+    /// (evicted mid-batch under cache pressure) is served from here on the
+    /// `&self` read path.
+    pending: Mutex<Vec<u8>>,
     cache: Mutex<PageCache>,
     cache_capacity: usize,
     /// Whether pages have been appended since the last successful sync, so a
@@ -228,6 +307,8 @@ impl PageManager {
         let manager = Self {
             file,
             page_count,
+            flushed_count: page_count,
+            pending: Mutex::new(Vec::new()),
             cache: Mutex::new(PageCache {
                 pages: HashMap::new(),
                 clock: VecDeque::new(),
@@ -263,36 +344,45 @@ impl PageManager {
             });
         }
         let mut page = [0; PAGE_SIZE];
-        read_exact_at(&self.file, &mut page, page_id * PAGE_SIZE as u64)?;
+        if page_id >= self.flushed_count {
+            // Appended and not yet flushed: the page is in the buffer, not the
+            // file. No current caller reads a page id before the mutation that
+            // appended it returns — copy-on-write only reads the OLD root's
+            // pages, and every mutation flushes before its new root escapes —
+            // so this arm is defense in depth: the buffer's correctness should
+            // not rest on that argument holding forever.
+            let pending = self.pending.lock().map_err(|_| Error::Poisoned)?;
+            let start = (page_id - self.flushed_count) as usize * PAGE_SIZE;
+            page.copy_from_slice(&pending[start..start + PAGE_SIZE]);
+        } else {
+            read_exact_at(&self.file, &mut page, page_id * PAGE_SIZE as u64)?;
+        }
         validate_page(&mut page, page_id)?;
         let page = Arc::new(page);
         self.insert_cache(page_id, Arc::clone(&page))?;
         Ok(page)
     }
 
-    fn append(&mut self, mut page: Page) -> Result<u64> {
+    fn append(&mut self, page: Page) -> Result<u64> {
+        let started = std::time::Instant::now();
+        let result = self.append_inner(page);
+        crate::profile::add(&crate::profile::TREE_APPEND_NS, started);
+        result
+    }
+
+    fn append_inner(&mut self, mut page: Page) -> Result<u64> {
         crate::profile::PAGE_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let page_id = self.page_count;
         write_u64(&mut page, 8, page_id);
         finalize_page(&mut page);
-        // Write at the page-aligned end of the file, never the raw end. An
-        // append cut off mid-write (ENOSPC) leaves a fragment shorter than a
-        // page at the tail while `page_count` still counts whole pages only;
-        // landing this page past the fragment would shift every later offset,
-        // silently misaligning each subsequent page. The fragment is overwritten
-        // rather than truncated away: it is the head of exactly the page this
-        // append rewrites in full.
-        //
-        // That aligned end is `page_id * PAGE_SIZE` by construction — `page_count`
-        // is set from the page-aligned file length at open and by
-        // `refresh_page_count`, and only ever moves one page at a time from here —
-        // so the offset is computed rather than discovered. This was two `seek`
-        // syscalls (End(0), then Start of the aligned offset) before every page
-        // write, which a copy-on-write commit pays once per page it rewrites: a
-        // batch touching a few dozen pages made a hundred syscalls to learn a
-        // number it already had.
-        write_all_at(&self.file, &page, page_id * PAGE_SIZE as u64)?;
-        self.dirty = true;
+        // Buffered rather than written: the batch's pages reach the file as one
+        // contiguous write in `flush_appends`, at the page-aligned offset the
+        // in-memory counters name. See the field comment on `pending` for why,
+        // and for the invariant that keeps this safe.
+        self.pending
+            .get_mut()
+            .map_err(|_| Error::Poisoned)?
+            .extend_from_slice(&page);
         self.page_count += 1;
         // Appended pages enter UNREFERENCED, which is what `insert_cache_with`'s
         // doc comment has always claimed and what the code did not do: it passed
@@ -315,7 +405,58 @@ impl PageManager {
         Ok(page_id)
     }
 
+    /// Writes every buffered page to the file in one contiguous write.
+    ///
+    /// Written at the page-aligned end the counters name, never the raw file
+    /// end: a flush cut off mid-write (ENOSPC) leaves a fragment at the tail
+    /// while `flushed_count` still counts whole flushed pages, so the retry
+    /// overwrites the fragment — it is the head of exactly the span this flush
+    /// writes — and every later offset stays aligned. The offset is computed
+    /// rather than discovered with `seek`, which cost two syscalls per page
+    /// when appends went to the file one at a time.
+    fn flush_appends(&mut self) -> Result<()> {
+        let pending = self.pending.get_mut().map_err(|_| Error::Poisoned)?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let write_started = std::time::Instant::now();
+        write_all_at(&self.file, pending, self.flushed_count * PAGE_SIZE as u64)?;
+        crate::profile::add(&crate::profile::TREE_FLUSH_NS, write_started);
+        pending.clear();
+        self.flushed_count = self.page_count;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Drops every buffered page and reclaims their ids after a failed
+    /// mutation.
+    ///
+    /// Nothing can reference them: the mutation returned an error, so its root
+    /// was never published and its WAL record never written. Before the buffer
+    /// existed a failed batch left its pages behind on disk as permanent
+    /// orphans; discarding them here means it no longer leaves anything at
+    /// all. The ids are removed from the cache as well, or a corrupt page
+    /// naming one of them after the id is reused could hit the stale copy
+    /// instead of the bounds check. Their clock slots are left to dangle; the
+    /// eviction sweep already treats a slot whose page is gone as free.
+    fn discard_appends(&mut self) {
+        let Ok(pending) = self.pending.get_mut() else {
+            return;
+        };
+        if pending.is_empty() {
+            return;
+        }
+        pending.clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            for page_id in self.flushed_count..self.page_count {
+                cache.pages.remove(&page_id);
+            }
+        }
+        self.page_count = self.flushed_count;
+    }
+
     fn sync(&mut self) -> Result<()> {
+        self.flush_appends()?;
         if !self.dirty {
             return Ok(());
         }
@@ -329,6 +470,10 @@ impl PageManager {
     }
 
     fn refresh_page_count(&mut self) -> Result<()> {
+        // The buffer is empty between tree mutations, which is the only time a
+        // refresh runs; flushing here keeps that true by construction rather
+        // than by convention.
+        self.flush_appends()?;
         let file_len = self.file.metadata()?.len();
         if file_len % PAGE_SIZE as u64 != 0 {
             return Err(Error::CorruptPage {
@@ -337,6 +482,7 @@ impl PageManager {
             });
         }
         self.page_count = file_len / PAGE_SIZE as u64;
+        self.flushed_count = self.page_count;
         Ok(())
     }
 
@@ -531,39 +677,148 @@ impl PageTree {
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => {
-                let entries = self.decode_leaf(&page, page_id)?;
-                // Both sides are sorted, so a merge walk finds every hit in one pass.
+                // Cells are walked in place for the same reason `find_in_leaf`
+                // walks them: this used to call `decode_leaf`, which allocates a
+                // `Vec` for the key AND a `Vec` for the value of every entry in
+                // the page, and a commit's pre-state read wants presence and
+                // revision for a handful of keys — usually without the values at
+                // all. Both sides are sorted, so a merge walk finds every hit in
+                // one pass and stops once the last wanted key is resolved.
+                // Measured on the commit path (three leaves per single-key
+                // commit: the key, its tombstone, the change log): pre-state
+                // 34.6 us to 7.0 us per request, page reads 32 to 23.
+                let count = read_u32(page.as_ref(), 20) as usize;
+                if count > MAX_LEAF_ENTRIES {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: format!(
+                            "leaf claims {count} entries but a page holds at most {MAX_LEAF_ENTRIES}"
+                        ),
+                    });
+                }
+                let mut offset = HEADER_SIZE;
                 let mut cursor = 0;
-                for (index, key) in keys.iter().enumerate() {
-                    while cursor < entries.len() && &entries[cursor].key < key {
+                for _ in 0..count {
+                    if cursor == keys.len() {
+                        break;
+                    }
+                    require_page(offset, LEAF_CELL_HEADER, page_id)?;
+                    let flags = page[offset];
+                    let key_len = read_u32(page.as_ref(), offset + 1) as usize;
+                    let value_len = read_u32(page.as_ref(), offset + 5) as usize;
+                    if key_len == 0
+                        || key_len > MAX_STORED_KEY_SIZE
+                        || value_len > MAX_VALUE_SIZE
+                        || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+                    {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    let key_page = read_u64(page.as_ref(), offset + 9);
+                    let value_offset = read_u64(page.as_ref(), offset + 17);
+                    let revision = read_u64(page.as_ref(), offset + 25);
+                    offset += LEAF_CELL_HEADER;
+                    // An external key is a blob read, so it is compared by
+                    // reading it; an inline key is compared against the page
+                    // bytes with no copy at all, as in `find_in_leaf`.
+                    let external_key = flags & EXTERNAL_KEY != 0;
+                    let stored_key = if external_key {
+                        Some(self.read_blob(key_page, key_len)?)
+                    } else {
+                        require_page(offset, key_len, page_id)?;
+                        None
+                    };
+                    let cell_key: &[u8] = match &stored_key {
+                        Some(stored) => stored,
+                        None => &page[offset..offset + key_len],
+                    };
+                    if !external_key {
+                        offset += key_len;
+                    }
+                    // Wanted keys that sort before this cell are absent from the
+                    // tree; their slots stay `None`.
+                    cursor += keys[cursor..].partition_point(|key| key.as_slice() < cell_key);
+                    let hit = keys
+                        .get(cursor)
+                        .is_some_and(|key| key.as_slice() == cell_key);
+                    let value_external = flags & EXTERNAL_VALUE != 0;
+                    if !value_external {
+                        require_page(offset, value_len, page_id)?;
+                    }
+                    if hit {
+                        let value = match (want_values, value_external) {
+                            (false, _) => None,
+                            (true, true) => Some(self.values.read(&ValueRef {
+                                offset: value_offset,
+                                len: value_len as u32,
+                                revision,
+                            })?),
+                            (true, false) => Some(page[offset..offset + value_len].to_vec()),
+                        };
+                        results[cursor] = Some((value, revision));
                         cursor += 1;
                     }
-                    match entries.get(cursor) {
-                        Some(entry) if &entry.key == key => {
-                            let value = match want_values {
-                                true => Some(self.read_value(&entry.value)?),
-                                false => None,
-                            };
-                            results[index] = Some((value, entry.revision));
-                        }
-                        _ => {}
+                    if !value_external {
+                        offset += value_len;
                     }
                 }
                 Ok(())
             }
             INTERNAL => {
-                let children = self.decode_internal(&page, page_id)?;
+                // Boundaries are read from the cells in place rather than through
+                // `decode_internal`, which materialises an owned `NodeRef` — a
+                // heap key each — for every child of the page, and reads the
+                // first child's page besides, only to route a few keys. Cell `i`
+                // holds the minimum key and page id of child `i + 1`; the header
+                // holds child 0's page id, and child 0 owns everything below
+                // child 1's minimum.
+                let count = read_u32(page.as_ref(), 20) as usize;
+                if count >= MAX_INTERNAL_CHILDREN {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: format!(
+                            "internal page claims {} children but a page holds at most {MAX_INTERNAL_CHILDREN}",
+                            count + 1
+                        ),
+                    });
+                }
+                let mut child_id = read_u64(page.as_ref(), 24);
+                let mut offset = HEADER_SIZE;
                 let mut cursor = 0;
-                for (index, child) in children.iter().enumerate() {
-                    let end = match children.get(index + 1) {
-                        Some(next) => {
-                            cursor + keys[cursor..].partition_point(|key| key < &next.min_key)
-                        }
-                        None => keys.len(),
+                for _ in 0..count {
+                    require_page(offset, INTERNAL_CELL_HEADER, page_id)?;
+                    let flags = page[offset];
+                    let key_len = read_u32(page.as_ref(), offset + 1) as usize;
+                    let key_page = read_u64(page.as_ref(), offset + 5);
+                    let next_child = read_u64(page.as_ref(), offset + 13);
+                    if key_len == 0 || key_len > MAX_STORED_KEY_SIZE || flags & !EXTERNAL_KEY != 0 {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid internal cell metadata".into(),
+                        });
+                    }
+                    offset += INTERNAL_CELL_HEADER;
+                    let external_key = flags & EXTERNAL_KEY != 0;
+                    let stored_key = if external_key {
+                        Some(self.read_blob(key_page, key_len)?)
+                    } else {
+                        require_page(offset, key_len, page_id)?;
+                        None
                     };
+                    let boundary: &[u8] = match &stored_key {
+                        Some(stored) => stored,
+                        None => &page[offset..offset + key_len],
+                    };
+                    if !external_key {
+                        offset += key_len;
+                    }
+                    let end =
+                        cursor + keys[cursor..].partition_point(|key| key.as_slice() < boundary);
                     if end > cursor {
                         self.collect_many(
-                            child.page_id,
+                            child_id,
                             &keys[cursor..end],
                             &mut results[cursor..end],
                             want_values,
@@ -571,6 +826,16 @@ impl PageTree {
                         )?;
                     }
                     cursor = end;
+                    child_id = next_child;
+                }
+                if cursor < keys.len() {
+                    self.collect_many(
+                        child_id,
+                        &keys[cursor..],
+                        &mut results[cursor..],
+                        want_values,
+                        depth + 1,
+                    )?;
                 }
                 Ok(())
             }
@@ -686,13 +951,32 @@ impl PageTree {
         value: &[u8],
         revision: u64,
     ) -> Result<(u64, u64)> {
+        // Every page the returned root reaches must be on the file before the
+        // caller can publish that root — readers on their own descriptors and
+        // manifests both depend on it — so the batch's buffered pages flush
+        // here, as one write, before the root leaves this method. A failure
+        // anywhere surfaces while the mutation is still invisible, and takes
+        // its buffered pages with it.
+        let result = self
+            .prepare_put_inner(key, value, revision)
+            .and_then(|result| {
+                self.pages.flush_appends()?;
+                Ok(result)
+            });
+        if result.is_err() {
+            self.pages.discard_appends();
+        }
+        result
+    }
+
+    fn prepare_put_inner(&mut self, key: &[u8], value: &[u8], revision: u64) -> Result<(u64, u64)> {
         let value = if value.len() > INLINE_LIMIT {
             EntryValue::External(self.values.append(value, revision)?)
         } else {
-            EntryValue::Inline(value.to_vec())
+            EntryValue::Inline(Bytes::Owned(value.to_vec()))
         };
         let new_entry = Entry {
-            key: key.to_vec(),
+            key: Bytes::Owned(key.to_vec()),
             value,
             revision,
         };
@@ -735,8 +1019,22 @@ impl PageTree {
     /// single-key calls would have produced.
     pub(crate) fn prepare_batch(
         &mut self,
-        mutations: &[(Vec<u8>, Mutation)],
+        mutations: Vec<(Vec<u8>, Mutation)>,
     ) -> Result<BatchOutcome> {
+        // Same rule as `prepare_put`: the buffered pages reach the file before
+        // the outcome's root can be published, and a failed batch discards
+        // them rather than leaving orphans for the next flush to write.
+        let outcome = self.prepare_batch_inner(mutations).and_then(|outcome| {
+            self.pages.flush_appends()?;
+            Ok(outcome)
+        });
+        if outcome.is_err() {
+            self.pages.discard_appends();
+        }
+        outcome
+    }
+
+    fn prepare_batch_inner(&mut self, mutations: Vec<(Vec<u8>, Mutation)>) -> Result<BatchOutcome> {
         if mutations.is_empty() {
             return Ok(BatchOutcome {
                 root: self.root,
@@ -747,23 +1045,22 @@ impl PageTree {
         // be adjusted without re-reading the tree.
         let mut existed = vec![false; mutations.len()];
         let mut prepared = Vec::with_capacity(mutations.len());
-        for (index, (key, mutation)) in mutations.iter().enumerate() {
+        // Taken by move: keys and values pass through to the prepared list
+        // without the clone-per-operation the borrowed signature forced on
+        // every caller.
+        for (index, (key, mutation)) in mutations.into_iter().enumerate() {
             let value = match mutation {
                 Mutation::Put { value, revision } => {
                     let stored = if value.len() > INLINE_LIMIT {
-                        EntryValue::External(self.values.append(value, *revision)?)
+                        EntryValue::External(self.values.append(&value, revision)?)
                     } else {
-                        EntryValue::Inline(value.clone())
+                        EntryValue::Inline(Bytes::Owned(value))
                     };
-                    Some((stored, *revision))
+                    Some((stored, revision))
                 }
                 Mutation::Delete => None,
             };
-            prepared.push(PreparedMutation {
-                key: key.clone(),
-                value,
-                index,
-            });
+            prepared.push(PreparedMutation { key, value, index });
         }
         // Descending in key order lets one pass group each leaf's mutations
         // together; a stable sort keeps same-key mutations in arrival order.
@@ -844,8 +1141,9 @@ impl PageTree {
                     let end = match children.get(index + 1) {
                         Some(next) => {
                             cursor
-                                + mutations[cursor..]
-                                    .partition_point(|mutation| mutation.key < next.min_key)
+                                + mutations[cursor..].partition_point(|mutation| {
+                                    mutation.key.as_slice() < next.min_key.as_slice()
+                                })
                         }
                         None => mutations.len(),
                     };
@@ -878,6 +1176,19 @@ impl PageTree {
     }
 
     pub(crate) fn prepare_delete(&mut self, key: &[u8]) -> Result<Option<(u64, u64)>> {
+        // Same rule as `prepare_put`: the buffered pages reach the file before
+        // the returned root can be published, and a failure discards them.
+        let result = self.prepare_delete_inner(key).and_then(|result| {
+            self.pages.flush_appends()?;
+            Ok(result)
+        });
+        if result.is_err() {
+            self.pages.discard_appends();
+        }
+        result
+    }
+
+    fn prepare_delete_inner(&mut self, key: &[u8]) -> Result<Option<(u64, u64)>> {
         if self.root == 0 {
             return Ok(None);
         }
@@ -972,7 +1283,7 @@ impl PageTree {
                         && end.is_none_or(|end| entry.key.as_slice() < end)
                 })
                 .next_back()
-                .map(|entry| entry.key)),
+                .map(|entry| entry.key.into_vec())),
             INTERNAL => {
                 let children = self.decode_internal(&page, page_id)?;
                 for (index, child) in children.iter().enumerate().rev() {
@@ -1010,7 +1321,7 @@ impl PageTree {
         self.node_changed_since(self.root, start, end, revision, excluded_prefix, 0)
     }
 
-    fn scan_with_revisions_excluding_prefix(
+    pub(crate) fn scan_with_revisions_excluding_prefix(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -1027,8 +1338,8 @@ impl PageTree {
     fn validate_node(
         &self,
         page_id: u64,
-        lower: Option<Vec<u8>>,
-        upper: Option<Vec<u8>>,
+        lower: Option<Bytes>,
+        upper: Option<Bytes>,
         visited: &mut HashSet<u64>,
         depth: usize,
     ) -> Result<u64> {
@@ -1048,15 +1359,19 @@ impl PageTree {
                 let mut previous: Option<&[u8]> = None;
                 for entry in &entries {
                     if previous.is_some_and(|previous| previous >= entry.key.as_slice())
-                        || lower.as_ref().is_some_and(|lower| &entry.key < lower)
-                        || upper.as_ref().is_some_and(|upper| &entry.key >= upper)
+                        || lower
+                            .as_ref()
+                            .is_some_and(|lower| entry.key.as_slice() < lower.as_slice())
+                        || upper
+                            .as_ref()
+                            .is_some_and(|upper| entry.key.as_slice() >= upper.as_slice())
                     {
                         return Err(Error::CorruptPage {
                             page_id,
                             reason: "leaf keys are not strictly ordered within bounds".into(),
                         });
                     }
-                    previous = Some(&entry.key);
+                    previous = Some(entry.key.as_slice());
                 }
                 Ok(entries.len() as u64)
             }
@@ -1068,7 +1383,7 @@ impl PageTree {
                     .map(|child| child.min_key.clone())
                     .collect();
                 for pair in separators.windows(2) {
-                    if pair[0] >= pair[1] {
+                    if pair[0].as_slice() >= pair[1].as_slice() {
                         return Err(Error::CorruptPage {
                             page_id,
                             reason: "internal separators are not strictly ordered".into(),
@@ -1111,7 +1426,7 @@ impl PageTree {
             LEAF => Ok(self
                 .decode_leaf(&page, page_id)?
                 .into_iter()
-                .filter(|entry| !entry.key.starts_with(prefix))
+                .filter(|entry| !entry.key.as_slice().starts_with(prefix))
                 .count()),
             INTERNAL => {
                 let mut count = 0;
@@ -1139,7 +1454,7 @@ impl PageTree {
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => Ok(self.decode_leaf(&page, page_id)?.into_iter().any(|entry| {
-                excluded_prefix.is_none_or(|prefix| !entry.key.starts_with(prefix))
+                excluded_prefix.is_none_or(|prefix| !entry.key.as_slice().starts_with(prefix))
                     && start.is_none_or(|start| entry.key.as_slice() >= start)
                     && end.is_none_or(|end| entry.key.as_slice() < end)
                     && entry.revision > revision
@@ -1200,7 +1515,9 @@ impl PageTree {
                     if end.is_some_and(|end| entry.key.as_slice() >= end) {
                         break;
                     }
-                    if excluded_prefix.is_some_and(|prefix| entry.key.starts_with(prefix)) {
+                    if excluded_prefix
+                        .is_some_and(|prefix| entry.key.as_slice().starts_with(prefix))
+                    {
                         continue;
                     }
                     // The entry is owned here, so its inline value is MOVED into
@@ -1210,10 +1527,10 @@ impl PageTree {
                     // once here, with the first copy dropped immediately after.
                     let revision = entry.revision;
                     let value = match entry.value {
-                        EntryValue::Inline(value) => value,
+                        EntryValue::Inline(value) => value.into_vec(),
                         EntryValue::External(reference) => self.values.read(&reference)?,
                     };
-                    rows.push((entry.key, value, revision));
+                    rows.push((entry.key.into_vec(), value, revision));
                     if rows.len() == limit {
                         break;
                     }
@@ -1372,8 +1689,8 @@ impl PageTree {
     /// get it materialises every other key and value in it as well. Kept beside
     /// `decode_leaf` deliberately: the cell layout is described in one place
     /// there, and this repeats only the first cell's part of it.
-    fn first_leaf_key(&self, page: &Page, page_id: u64) -> Result<Vec<u8>> {
-        let count = read_u32(page, 20) as usize;
+    fn first_leaf_key(&self, page: &Arc<Page>, page_id: u64) -> Result<Bytes> {
+        let count = read_u32(page.as_ref(), 20) as usize;
         if count == 0 || count > MAX_LEAF_ENTRIES {
             return Err(Error::CorruptPage {
                 page_id,
@@ -1381,7 +1698,7 @@ impl PageTree {
             });
         }
         let flags = page[HEADER_SIZE];
-        let key_len = read_u32(page, HEADER_SIZE + 1) as usize;
+        let key_len = read_u32(page.as_ref(), HEADER_SIZE + 1) as usize;
         if key_len == 0
             || key_len > MAX_STORED_KEY_SIZE
             || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
@@ -1392,11 +1709,13 @@ impl PageTree {
             });
         }
         if flags & EXTERNAL_KEY != 0 {
-            return self.read_blob(read_u64(page, HEADER_SIZE + 9), key_len);
+            return Ok(Bytes::Owned(
+                self.read_blob(read_u64(page.as_ref(), HEADER_SIZE + 9), key_len)?,
+            ));
         }
         let start = HEADER_SIZE + LEAF_CELL_HEADER;
         require_page(start, key_len, page_id)?;
-        Ok(page[start..start + key_len].to_vec())
+        Ok(Bytes::paged(page, start, key_len))
     }
 
     fn read_leaf(&self, page_id: u64) -> Result<Vec<Entry>> {
@@ -1486,6 +1805,7 @@ impl PageTree {
     }
 
     fn write_leaf(&mut self, entries: &[Entry]) -> Result<NodeRef> {
+        let started = std::time::Instant::now();
         let first = entries.first().ok_or_else(|| Error::CorruptPage {
             page_id: 0,
             reason: "cannot write an empty leaf".into(),
@@ -1496,6 +1816,7 @@ impl PageTree {
         for entry in entries {
             offset = self.encode_leaf_cell(&mut page, offset, entry)?;
         }
+        crate::profile::add(&crate::profile::TREE_ENCODE_NS, started);
         let page_id = self.pages.append(page)?;
         Ok(NodeRef {
             page_id,
@@ -1504,32 +1825,39 @@ impl PageTree {
     }
 
     fn write_internal_level(&mut self, children: &[NodeRef]) -> Result<Vec<NodeRef>> {
-        let mut chunks: Vec<Vec<NodeRef>> = vec![Vec::new()];
+        // Page boundaries are index ranges into `children`, exactly as
+        // `write_leaf_level` records them into `entries` and for the same
+        // reason: chunking by moving children into per-page vectors cloned
+        // every child's min_key, and a commit that touches one child of a
+        // hundred-way level still cloned all hundred.
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
+        let mut start = 0;
         let mut used = HEADER_SIZE + 8;
         for (index, child) in children.iter().enumerate() {
-            let size = if index == 0 {
-                0
-            } else {
-                internal_cell_size(&child.min_key)
-            };
-            if used + size > PAGE_SIZE && !chunks.last().unwrap().is_empty() {
-                chunks.push(Vec::new());
-                used = HEADER_SIZE + 8;
+            // The first child of each page lives in the header rather than in a
+            // body cell, so it costs no cell space and can never overflow the
+            // page on its own; `index > start` is the "current page is not
+            // empty" guard.
+            if index > start {
+                let size = internal_cell_size(child.min_key.as_slice());
+                if used + size > PAGE_SIZE {
+                    bounds.push((start, index));
+                    start = index;
+                    used = HEADER_SIZE + 8;
+                } else {
+                    used += size;
+                }
             }
-            chunks.last_mut().unwrap().push(child.clone());
-            used += if chunks.last().unwrap().len() == 1 {
-                0
-            } else {
-                internal_cell_size(&child.min_key)
-            };
         }
-        chunks
+        bounds.push((start, children.len()));
+        bounds
             .into_iter()
-            .map(|chunk| self.write_internal(&chunk))
+            .map(|(from, to)| self.write_internal(&children[from..to]))
             .collect()
     }
 
     fn write_internal(&mut self, children: &[NodeRef]) -> Result<NodeRef> {
+        let started = std::time::Instant::now();
         let first = children.first().ok_or_else(|| Error::CorruptPage {
             page_id: 0,
             reason: "cannot write an empty internal page".into(),
@@ -1541,6 +1869,7 @@ impl PageTree {
         for child in children.iter().skip(1) {
             offset = self.encode_internal_cell(&mut page, offset, child)?;
         }
+        crate::profile::add(&crate::profile::TREE_ENCODE_NS, started);
         let page_id = self.pages.append(page)?;
         Ok(NodeRef {
             page_id,
@@ -1566,7 +1895,7 @@ impl PageTree {
         write_u32(page, offset + 1, entry.key.len() as u32);
         write_u32(page, offset + 5, value_len as u32);
         let key_page = if key_external {
-            self.write_blob(&entry.key)?.0
+            self.write_blob(entry.key.as_slice())?.0
         } else {
             0
         };
@@ -1579,18 +1908,25 @@ impl PageTree {
         write_u64(page, offset + 25, entry.revision);
         offset += LEAF_CELL_HEADER;
         if !key_external {
-            page[offset..offset + entry.key.len()].copy_from_slice(&entry.key);
+            page[offset..offset + entry.key.len()].copy_from_slice(entry.key.as_slice());
             offset += entry.key.len();
         }
         if let EntryValue::Inline(value) = &entry.value {
-            page[offset..offset + value.len()].copy_from_slice(value);
+            page[offset..offset + value.len()].copy_from_slice(value.as_slice());
             offset += value.len();
         }
         Ok(offset)
     }
 
-    fn decode_leaf(&self, page: &Page, page_id: u64) -> Result<Vec<Entry>> {
-        let count = read_u32(page, 20) as usize;
+    fn decode_leaf(&self, page: &Arc<Page>, page_id: u64) -> Result<Vec<Entry>> {
+        let started = std::time::Instant::now();
+        let result = self.decode_leaf_inner(page, page_id);
+        crate::profile::add(&crate::profile::TREE_DECODE_NS, started);
+        result
+    }
+
+    fn decode_leaf_inner(&self, page: &Arc<Page>, page_id: u64) -> Result<Vec<Entry>> {
+        let count = read_u32(page.as_ref(), 20) as usize;
         // The count is trusted only up to what the page can physically hold.
         // Beyond that it is a forged field, and it used to reach
         // `Vec::with_capacity` directly — a crafted page could ask the
@@ -1610,8 +1946,8 @@ impl PageTree {
         for _ in 0..count {
             require_page(offset, LEAF_CELL_HEADER, page_id)?;
             let flags = page[offset];
-            let key_len = read_u32(page, offset + 1) as usize;
-            let value_len = read_u32(page, offset + 5) as usize;
+            let key_len = read_u32(page.as_ref(), offset + 1) as usize;
+            let value_len = read_u32(page.as_ref(), offset + 5) as usize;
             if key_len == 0
                 || key_len > MAX_STORED_KEY_SIZE
                 || value_len > MAX_VALUE_SIZE
@@ -1622,17 +1958,17 @@ impl PageTree {
                     reason: "invalid leaf cell metadata".into(),
                 });
             }
-            let key_page = read_u64(page, offset + 9);
-            let value_offset = read_u64(page, offset + 17);
-            let revision = read_u64(page, offset + 25);
+            let key_page = read_u64(page.as_ref(), offset + 9);
+            let value_offset = read_u64(page.as_ref(), offset + 17);
+            let revision = read_u64(page.as_ref(), offset + 25);
             offset += LEAF_CELL_HEADER;
             let key = if flags & EXTERNAL_KEY != 0 {
-                self.read_blob(key_page, key_len)?
+                Bytes::Owned(self.read_blob(key_page, key_len)?)
             } else {
                 require_page(offset, key_len, page_id)?;
-                let value = page[offset..offset + key_len].to_vec();
+                let key = Bytes::paged(page, offset, key_len);
                 offset += key_len;
-                value
+                key
             };
             let value = if flags & EXTERNAL_VALUE != 0 {
                 EntryValue::External(ValueRef {
@@ -1642,7 +1978,7 @@ impl PageTree {
                 })
             } else {
                 require_page(offset, value_len, page_id)?;
-                let value = page[offset..offset + value_len].to_vec();
+                let value = Bytes::paged(page, offset, value_len);
                 offset += value_len;
                 EntryValue::Inline(value)
             };
@@ -1665,7 +2001,7 @@ impl PageTree {
         page[offset] = u8::from(external) * EXTERNAL_KEY;
         write_u32(page, offset + 1, child.min_key.len() as u32);
         let key_page = if external {
-            self.write_blob(&child.min_key)?.0
+            self.write_blob(child.min_key.as_slice())?.0
         } else {
             0
         };
@@ -1673,14 +2009,21 @@ impl PageTree {
         write_u64(page, offset + 13, child.page_id);
         offset += INTERNAL_CELL_HEADER;
         if !external {
-            page[offset..offset + child.min_key.len()].copy_from_slice(&child.min_key);
+            page[offset..offset + child.min_key.len()].copy_from_slice(child.min_key.as_slice());
             offset += child.min_key.len();
         }
         Ok(offset)
     }
 
-    fn decode_internal(&self, page: &Page, page_id: u64) -> Result<Vec<NodeRef>> {
-        let count = read_u32(page, 20) as usize;
+    fn decode_internal(&self, page: &Arc<Page>, page_id: u64) -> Result<Vec<NodeRef>> {
+        let started = std::time::Instant::now();
+        let result = self.decode_internal_inner(page, page_id);
+        crate::profile::add(&crate::profile::TREE_DECODE_NS, started);
+        result
+    }
+
+    fn decode_internal_inner(&self, page: &Arc<Page>, page_id: u64) -> Result<Vec<NodeRef>> {
+        let count = read_u32(page.as_ref(), 20) as usize;
         // `count` is the children past the first, which lives in the header.
         // The per-cell bounds below already stop the loop once the body runs
         // out, so nothing here allocates from the count — but rejecting a
@@ -1695,16 +2038,16 @@ impl PageTree {
                 ),
             });
         }
-        let first_id = read_u64(page, 24);
+        let first_id = read_u64(page.as_ref(), 24);
         let first = self.node_ref(first_id)?;
         let mut children = vec![first];
         let mut offset = HEADER_SIZE;
         for _ in 0..count {
             require_page(offset, INTERNAL_CELL_HEADER, page_id)?;
             let flags = page[offset];
-            let key_len = read_u32(page, offset + 1) as usize;
-            let key_page = read_u64(page, offset + 5);
-            let child_id = read_u64(page, offset + 13);
+            let key_len = read_u32(page.as_ref(), offset + 1) as usize;
+            let key_page = read_u64(page.as_ref(), offset + 5);
+            let child_id = read_u64(page.as_ref(), offset + 13);
             if key_len == 0 || key_len > MAX_STORED_KEY_SIZE || flags & !EXTERNAL_KEY != 0 {
                 return Err(Error::CorruptPage {
                     page_id,
@@ -1713,10 +2056,10 @@ impl PageTree {
             }
             offset += INTERNAL_CELL_HEADER;
             let min_key = if flags & EXTERNAL_KEY != 0 {
-                self.read_blob(key_page, key_len)?
+                Bytes::Owned(self.read_blob(key_page, key_len)?)
             } else {
                 require_page(offset, key_len, page_id)?;
-                let key = page[offset..offset + key_len].to_vec();
+                let key = Bytes::paged(page, offset, key_len);
                 offset += key_len;
                 key
             };
@@ -1787,13 +2130,6 @@ impl PageTree {
             });
         }
         Ok(result)
-    }
-
-    fn read_value(&self, value: &EntryValue) -> Result<Vec<u8>> {
-        match value {
-            EntryValue::Inline(value) => Ok(value.clone()),
-            EntryValue::External(reference) => self.values.read(reference),
-        }
     }
 }
 
@@ -1866,10 +2202,15 @@ fn merge_entries(
     while index < mutations.len() {
         let key = &mutations[index].key;
         // Carry over every entry that sorts before this key.
-        while entries.peek().is_some_and(|entry| &entry.key < key) {
+        while entries
+            .peek()
+            .is_some_and(|entry| entry.key.as_slice() < key.as_slice())
+        {
             merged.push(entries.next().unwrap());
         }
-        let present = entries.peek().is_some_and(|entry| &entry.key == key);
+        let present = entries
+            .peek()
+            .is_some_and(|entry| entry.key.as_slice() == key.as_slice());
         if present {
             entries.next();
         }
@@ -1883,7 +2224,7 @@ fn merge_entries(
         }
         if let Some((value, revision)) = &mutations[last].value {
             merged.push(Entry {
-                key: key.clone(),
+                key: Bytes::Owned(key.clone()),
                 value: value.clone(),
                 revision: *revision,
             });
@@ -2123,6 +2464,69 @@ mod tests {
                 "a cyclic page graph must be reported as corruption, got {error:?}"
             );
         }
+    }
+
+    /// A failed batch must not leave orphan pages behind — neither on disk nor
+    /// as allocated page ids.
+    ///
+    /// Appended pages are buffered until the mutation returns, so a batch that
+    /// fails mid-apply — here on a corrupt sibling leaf, after an earlier leaf
+    /// was already rewritten — discards what it buffered. Before the buffer
+    /// existed those pages were already on disk and stayed there as permanent
+    /// orphans; now the failure leaves the page file exactly as it found it.
+    #[test]
+    fn a_failed_batch_discards_its_buffered_pages_and_their_ids() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, len) = tree_with_internal_root(&path, &values);
+        // Locate the victim leaf with a throwaway tree, then forge it on disk;
+        // the tree under test must not have the honest copy cached.
+        let victim = {
+            let tree = PageTree::open(&path, &values, root, len).unwrap();
+            tree.find_leaf(b"key-000199", None).unwrap()
+        };
+        assert_ne!(
+            victim,
+            {
+                let tree = PageTree::open(&path, &values, root, len).unwrap();
+                tree.find_leaf(b"key-000000", None).unwrap()
+            },
+            "this test needs the two keys on different leaves"
+        );
+        forge_page(&path, victim, |page| page[4] = 99);
+        let mut tree = PageTree::open(&path, &values, root, len).unwrap();
+        let pages_before = tree.page_count();
+        // Sorted order routes the healthy leaf's rewrite first, so pages are
+        // already buffered when the descent meets the forged leaf.
+        let mutations = vec![
+            (
+                b"key-000000".to_vec(),
+                Mutation::Put {
+                    value: vec![1; 10],
+                    revision: 900,
+                },
+            ),
+            (
+                b"key-000199".to_vec(),
+                Mutation::Put {
+                    value: vec![2; 10],
+                    revision: 900,
+                },
+            ),
+        ];
+        let error = tree.prepare_batch(mutations).unwrap_err();
+        assert!(
+            matches!(error, Error::CorruptPage { .. }),
+            "the forged leaf must surface as corruption, got {error:?}"
+        );
+        assert_eq!(
+            tree.page_count(),
+            pages_before,
+            "a failed batch must not leave orphan pages or ids behind"
+        );
+        // The tree it found is the tree it leaves: untouched keys still read.
+        assert!(tree.get(b"key-000000").unwrap().is_some());
     }
 
     /// A point lookup must return the same answer whether or not it took the

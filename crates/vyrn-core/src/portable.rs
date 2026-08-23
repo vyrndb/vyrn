@@ -197,10 +197,7 @@ pub fn import(engine: &mut Engine, input: &Path) -> Result<u64> {
 /// write limits, the trailer's pair count and checksum, and that the file ends
 /// where the trailer says it does. `sink` sees only well-framed pairs, so a
 /// sink that inspects content cannot be ambushed by framing either.
-fn stream_dump(
-    input: &Path,
-    sink: &mut impl FnMut(Vec<u8>, Vec<u8>) -> Result<()>,
-) -> Result<u64> {
+fn stream_dump(input: &Path, sink: &mut impl FnMut(Vec<u8>, Vec<u8>) -> Result<()>) -> Result<u64> {
     let file = File::open(input)?;
     let mut source = BufReader::new(file);
 
@@ -298,13 +295,12 @@ fn verify_pair(key: &[u8], value: &[u8]) -> Result<()> {
     // the local mirror.)
     match document::target_from_key(key) {
         Some(target) => {
-            let parsed: serde_json::Value =
-                serde_json::from_slice(value).map_err(|error| {
-                    Error::InvalidDocument(format!(
-                        "dump stores document {}/{} as invalid JSON: {error}",
-                        target.collection, target.id
-                    ))
-                })?;
+            let parsed: serde_json::Value = serde_json::from_slice(value).map_err(|error| {
+                Error::InvalidDocument(format!(
+                    "dump stores document {}/{} as invalid JSON: {error}",
+                    target.collection, target.id
+                ))
+            })?;
             if !parsed.is_object() {
                 return Err(Error::InvalidDocument(format!(
                     "dump stores document {}/{} as a JSON {} rather than an object",

@@ -434,7 +434,10 @@ fn a_document_that_would_fail_at_read_time_is_refused_at_import() {
     let mut target = Engine::open(target_dir.path()).unwrap();
     assert_eq!(portable::import(&mut target, &dump).unwrap(), 1);
     let people = target.open_collection("people").unwrap();
-    let stored = people.get("ada").unwrap().expect("document was not planted");
+    let stored = people
+        .get("ada")
+        .unwrap()
+        .expect("document was not planted");
     assert_eq!(stored.value["born"], serde_json::json!(1815));
 }
 

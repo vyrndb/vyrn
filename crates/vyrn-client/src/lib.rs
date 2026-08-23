@@ -756,6 +756,125 @@ impl Client {
             message => Ok(message),
         }
     }
+
+    /// Runs a batch of independent operations as one pipelined burst: every
+    /// request is written before any response is awaited, so the whole batch
+    /// costs one network round trip instead of one per operation. The server
+    /// executes them in order and answers in order — the same semantics as
+    /// issuing them one at a time, minus the waiting.
+    ///
+    /// The outer `Err` is the connection failing (transport fault, timeout —
+    /// after which this client is unusable, exactly as for a single request,
+    /// because the outcome of every operation in flight is unknown). Each
+    /// inner result is that operation's own answer: one refused write does not
+    /// hide the others' outcomes.
+    pub async fn pipeline(
+        &mut self,
+        operations: Vec<PipelineOperation>,
+    ) -> Result<Vec<Result<PipelineResponse, Error>>, Error> {
+        if self.unusable {
+            return Err(Error::UnusableConnection);
+        }
+        // The same preamble as any non-transactional request: an abandoned
+        // transaction is rolled back rather than silently absorbing the batch.
+        if self.transaction_active {
+            match self.request_raw(Message::Rollback).await? {
+                Message::RolledBack => self.transaction_active = false,
+                message => return Err(unexpected(message)),
+            }
+        }
+        let mut request_ids = Vec::with_capacity(operations.len());
+        for operation in operations.iter() {
+            let message = match operation {
+                PipelineOperation::Get(key) => Message::Get { key: key.clone() },
+                PipelineOperation::Put(key, value) => Message::Put {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+                PipelineOperation::Delete(key) => Message::Delete { key: key.clone() },
+            };
+            let request_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.checked_add(1).unwrap_or(1);
+            request_ids.push(request_id);
+            // Fed, not sent: the codec buffers frames and flushes on its own
+            // backpressure boundary, so a huge batch cannot buffer unboundedly,
+            // and everything else leaves in the single flush below.
+            match timeout(
+                REQUEST_TIMEOUT,
+                self.framed.feed(Envelope::new(request_id, message)),
+            )
+            .await
+            {
+                Err(_) => {
+                    self.unusable = true;
+                    return Err(Error::Timeout);
+                }
+                Ok(Err(error)) => return Err(Error::Transport(error.to_string())),
+                Ok(Ok(())) => {}
+            }
+        }
+        match timeout(REQUEST_TIMEOUT, self.framed.flush()).await {
+            Err(_) => {
+                self.unusable = true;
+                return Err(Error::Timeout);
+            }
+            Ok(Err(error)) => return Err(Error::Transport(error.to_string())),
+            Ok(Ok(())) => {}
+        }
+        let mut results = Vec::with_capacity(operations.len());
+        for (operation, expected_id) in operations.iter().zip(request_ids) {
+            let response = match timeout(REQUEST_TIMEOUT, self.framed.next()).await {
+                // Some operations may have run; which ones is unknown, so the
+                // connection is retired exactly as for a single lost response.
+                Err(_) => {
+                    self.unusable = true;
+                    return Err(Error::Timeout);
+                }
+                Ok(None) => return Err(Error::ConnectionClosed),
+                Ok(Some(result)) => result.map_err(|error| Error::Transport(error.to_string()))?,
+            };
+            if response.version != PROTOCOL_VERSION {
+                return Err(Error::Protocol(
+                    "server used an unsupported protocol version".into(),
+                ));
+            }
+            if response.request_id != expected_id {
+                return Err(Error::Protocol("response request ID did not match".into()));
+            }
+            results.push(match (operation, response.message) {
+                (_, Message::Error { code, message }) => Err(Error::Server { code, message }),
+                (PipelineOperation::Get(_), Message::Value { value }) => {
+                    Ok(PipelineResponse::Value(value))
+                }
+                (PipelineOperation::Put(..), Message::Written) => Ok(PipelineResponse::Written),
+                (PipelineOperation::Delete(_), Message::Deleted { existed }) => {
+                    Ok(PipelineResponse::Deleted(existed))
+                }
+                (_, message) => Err(unexpected(message)),
+            });
+        }
+        Ok(results)
+    }
+}
+
+/// One operation of a [`Client::pipeline`] batch.
+#[derive(Debug, Clone)]
+pub enum PipelineOperation {
+    Get(Vec<u8>),
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+/// One operation's answer from a [`Client::pipeline`] batch, in submission
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineResponse {
+    /// A `Get`'s value, `None` when the key does not exist.
+    Value(Option<Vec<u8>>),
+    /// A `Put` was committed durably.
+    Written,
+    /// A `Delete` was committed durably; `true` when the key existed.
+    Deleted(bool),
 }
 
 impl Transaction<'_> {

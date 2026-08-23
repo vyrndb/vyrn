@@ -2,6 +2,7 @@ pub mod backup;
 pub mod change_log;
 pub mod document;
 mod mvcc;
+mod overlay;
 mod page_tree;
 pub mod portable;
 pub mod recover;
@@ -10,6 +11,7 @@ mod value_log;
 mod wal;
 pub mod wal_archive;
 
+pub use overlay::{PublishedMutation, WriteBackPublish};
 pub use wal::Wal;
 
 /// Diagnostic breakdown of the work `apply_batch` does under the engine write
@@ -36,6 +38,19 @@ pub mod profile {
     pub static PAGE_HITS: AtomicU64 = AtomicU64::new(0);
     pub static PAGE_MISSES: AtomicU64 = AtomicU64::new(0);
     pub static PAGE_APPENDS: AtomicU64 = AtomicU64::new(0);
+    // Sub-phases of `tree`, the phase that dominates a commit once the WAL
+    // barrier is amortised. This split is what located the per-page write
+    // syscalls that page-append buffering removed; it stays so the next
+    // regression in the copy-on-write path is attributable rather than one
+    // opaque number.
+    /// Time decoding leaf and internal pages into owned entries.
+    pub static TREE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time encoding entries and children into new pages.
+    pub static TREE_ENCODE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time in `PageManager::append`: checksum, buffer, cache admission.
+    pub static TREE_APPEND_NS: AtomicU64 = AtomicU64::new(0);
+    /// Time writing each batch's buffered pages to the file in one call.
+    pub static TREE_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn add(counter: &AtomicU64, started: std::time::Instant) {
         counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -55,6 +70,10 @@ pub mod profile {
             ("__page_hits", PAGE_HITS.load(Ordering::Relaxed)),
             ("__page_misses", PAGE_MISSES.load(Ordering::Relaxed)),
             ("__page_appends", PAGE_APPENDS.load(Ordering::Relaxed)),
+            ("tree_decode", TREE_DECODE_NS.load(Ordering::Relaxed)),
+            ("tree_encode", TREE_ENCODE_NS.load(Ordering::Relaxed)),
+            ("tree_append", TREE_APPEND_NS.load(Ordering::Relaxed)),
+            ("tree_flush", TREE_FLUSH_NS.load(Ordering::Relaxed)),
         ]
     }
 }
@@ -84,6 +103,23 @@ const MANIFEST_LEN: usize = 48;
 const OP_PUT: u8 = 1;
 const OP_DELETE: u8 = 2;
 const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+/// A found key's stored value and the revision that wrote it, absent when the
+/// key is gone; one row of a merged scan carries the key as well.
+type MergedValue = Option<(Vec<u8>, u64)>;
+type MergedRow = (Vec<u8>, Vec<u8>, u64);
+
+/// The root and length a write-back commit's WAL record names.
+///
+/// With write-back the tree lags the log by design, so no root the tree holds
+/// at commit time covers the record being written. Naming one anyway would let
+/// the next open adopt a tree that lacks every buffered commit. This value can
+/// never be adopted — no page file holds a page at `u64::MAX` — so an open
+/// after write-back commits always falls back to redo from the checkpoint,
+/// which reconstructs exactly the state the buffer held. The record checksum
+/// covers these fields like any others, so the sentinel is as tamper-evident
+/// as a real root.
+const WRITE_BACK_ROOT: u64 = u64::MAX;
+
 const INTERNAL_PREFIX: &[u8] = b"\0vyrn:";
 const TOMBSTONE_PREFIX: &[u8] = b"\0vyrn:tombstone:";
 const CHANGE_LOG_PREFIX: &[u8] = b"\0vyrn:changelog:";
@@ -233,6 +269,12 @@ pub enum Error {
     CorruptBackup(String),
     #[error("restore target must be empty")]
     RestoreTargetNotEmpty,
+    /// A write-back commit was published to a read handle that was not opened
+    /// for write-back replay. A wiring bug in the embedding process rather
+    /// than damage — refused because silently dropping the mutations would
+    /// leave the handle answering from a tree that permanently lags the log.
+    #[error("write-back replay mismatch: {reason}")]
+    WriteBackMismatch { reason: String },
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
@@ -297,6 +339,26 @@ pub struct EngineOptions {
     /// `None` — the default — leaves the commit path exactly as it was before
     /// replication existed: no extra clone, no extra call, nothing to fail.
     pub record_sink: Option<Arc<dyn RecordSink>>,
+    /// Write-back buffer size in bytes; `0` — the default — disables it.
+    ///
+    /// With a buffer, a commit's durability is its WAL record alone: the
+    /// mutations land in an in-memory buffer that every read merges over the
+    /// tree, and the tree absorbs the whole buffer in one amortised pass when
+    /// it crosses this size and on every checkpoint. This removes the
+    /// copy-on-write page rewrite — the dominant CPU cost of a commit — from
+    /// the write path entirely, at three costs stated plainly: reopening the
+    /// database replays the WAL from the last checkpoint instead of adopting
+    /// the newest root (bounded by checkpoint cadence); the commit that
+    /// crosses the threshold pays the whole buffer's tree pass (bounded by
+    /// this size); and the buffer itself holds up to this many bytes in
+    /// memory.
+    ///
+    /// EMBEDDED USE ONLY for now: [`ReadEngine`] handles opened on the same
+    /// directory read the tree, not the writer's buffer, so a server built on
+    /// separate read handles must leave this at `0` until those handles learn
+    /// to see the buffer. Same-`Engine` reads — everything on this type — see
+    /// every committed write immediately, exactly as without the buffer.
+    pub write_back_buffer: usize,
 }
 
 /// Receives WAL records as the engine appends them.
@@ -333,6 +395,7 @@ impl Default for EngineOptions {
             durability: DurabilityMode::Durable,
             archived_through: None,
             record_sink: None,
+            write_back_buffer: 0,
         }
     }
 }
@@ -364,11 +427,34 @@ pub struct ReadEngine {
     path: PathBuf,
     generation: u64,
     tree: PageTree,
+    /// This handle's copy of the writer's write-back buffer, `None` when the
+    /// engine it mirrors runs classic commits. Fed one durable commit at a
+    /// time through [`ReadEngine::publish_write_back`], under the same
+    /// exclusive borrow as the root refreshes, so every read on this handle
+    /// sees a commit entirely or not at all. Values are `Arc`-shared with the
+    /// writer's buffer; only keys and map nodes are this handle's own memory.
+    overlay: Option<overlay::Overlay>,
+    /// The absorb watermark this handle has already evicted through, so a
+    /// republished (stale or repeated) watermark costs nothing.
+    overlay_evicted_through: u64,
 }
 
 impl ReadEngine {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::open_inner(path.as_ref(), false)
+    }
+
+    /// Opens a read handle for an engine running write-back commits.
+    ///
+    /// Such a handle answers from its overlay merged over the tree, and MUST
+    /// be fed every commit through [`ReadEngine::publish_write_back`] — a
+    /// handle opened plainly against a write-back engine would silently serve
+    /// only what the tree has absorbed.
+    pub fn open_with_write_back(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner(path.as_ref(), true)
+    }
+
+    fn open_inner(path: &Path, write_back: bool) -> Result<Self> {
         let state = read_manifest(path)?.unwrap_or(TreeState {
             root: 0,
             len: 0,
@@ -385,7 +471,59 @@ impl ReadEngine {
             path: path.to_owned(),
             generation: state.generation,
             tree,
+            // A read handle never flushes its overlay — entries leave only by
+            // eviction — so the threshold is irrelevant.
+            overlay: write_back.then(|| overlay::Overlay::new(usize::MAX)),
+            overlay_evicted_through: 0,
         })
+    }
+
+    /// Learns one durable write-back commit: its mutations, then any overlay
+    /// eviction its absorb watermark licenses.
+    ///
+    /// Call under the same exclusive borrow as the [`ReadEngine::refresh`]
+    /// that publishes the commit's root, refresh first: eviction is only
+    /// sound once the tree this handle serves contains the evicted entries.
+    ///
+    /// Refused when this handle was not opened for write-back — dropping the
+    /// mutations instead would leave every read on this handle answering
+    /// from a tree that permanently lags the log.
+    pub fn publish_write_back(&mut self, publish: &overlay::WriteBackPublish) -> Result<()> {
+        if publish.is_empty() {
+            return Ok(());
+        }
+        let Some(overlay) = &mut self.overlay else {
+            return Err(Error::WriteBackMismatch {
+                reason: "commit published to a read handle opened without write-back replay"
+                    .into(),
+            });
+        };
+        for mutation in &publish.mutations {
+            overlay.record(
+                mutation.key.clone(),
+                mutation.value.clone(),
+                mutation.revision,
+            );
+        }
+        if let Some(absorbed) = publish.absorbed_through {
+            if absorbed > self.overlay_evicted_through {
+                overlay.evict_through(absorbed);
+                self.overlay_evicted_through = absorbed;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops overlay entries the tree behind this handle has absorbed, for
+    /// publication points that carry a watermark but no mutations — the
+    /// checkpoint task's republish. Idempotent and monotonic.
+    pub fn evict_write_back_through(&mut self, lsn: u64) {
+        if let Some(overlay) = &mut self.overlay {
+            if lsn > self.overlay_evicted_through {
+                overlay.evict_through(lsn);
+                self.overlay_evicted_through = lsn;
+            }
+        }
     }
 
     /// Publishes a newer committed root to this read handle.
@@ -420,7 +558,7 @@ impl ReadEngine {
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         validate_user_key(key)?;
-        self.tree.get(key)
+        overlay::merged_get(&self.tree, self.overlay.as_ref(), key)
     }
 
     pub fn scan(
@@ -438,8 +576,17 @@ impl ReadEngine {
         if start.zip(end).is_some_and(|(start, end)| start > end) {
             return Err(Error::InvalidRange);
         }
-        self.tree
-            .scan_excluding_prefix(start, end, limit, Some(INTERNAL_PREFIX))
+        Ok(overlay::merged_scan(
+            &self.tree,
+            self.overlay.as_ref(),
+            start,
+            end,
+            limit,
+            Some(INTERNAL_PREFIX),
+        )?
+        .into_iter()
+        .map(|(key, value, _)| (key, value))
+        .collect())
     }
 
     /// Looks up primary keys by secondary index value.
@@ -450,16 +597,24 @@ impl ReadEngine {
     pub fn lookup_index(&self, name: &[u8], value: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
         validate_index_name(name)?;
         validate_index_value(Some(value))?;
-        if self.tree.get(&index_definition_key(name))?.is_none() {
+        if overlay::merged_get(&self.tree, self.overlay.as_ref(), &index_definition_key(name))?
+            .is_none()
+        {
             return Err(Error::IndexNotFound);
         }
         let prefix = index_value_prefix(name, value);
         let end = prefix_end(&prefix);
-        self.tree
-            .scan(Some(&prefix), end.as_deref(), limit)?
-            .into_iter()
-            .map(|(key, _)| decode_index_primary(&key, &prefix))
-            .collect()
+        overlay::merged_scan(
+            &self.tree,
+            self.overlay.as_ref(),
+            Some(&prefix),
+            end.as_deref(),
+            limit,
+            None,
+        )?
+        .into_iter()
+        .map(|(key, _, _)| decode_index_primary(&key, &prefix))
+        .collect()
     }
 
     /// Reads documents from a collection by indexed field value.
@@ -492,7 +647,7 @@ impl ReadEngine {
 
     pub(crate) fn read_raw(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         validate_key(key)?;
-        self.tree.get(key)
+        overlay::merged_get(&self.tree, self.overlay.as_ref(), key)
     }
 
     pub(crate) fn scan_raw(
@@ -501,13 +656,22 @@ impl ReadEngine {
         end: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        self.tree.scan(start, end, limit)
+        Ok(
+            overlay::merged_scan(&self.tree, self.overlay.as_ref(), start, end, limit, None)?
+                .into_iter()
+                .map(|(key, value, _)| (key, value))
+                .collect(),
+        )
     }
 }
 
 pub struct Engine {
     path: PathBuf,
     tree: PageTree,
+    /// Committed mutations the tree has not absorbed yet; `None` when
+    /// write-back is disabled and every commit rewrites the tree itself.
+    /// Reads on this engine merge it over the tree — see [`overlay::Overlay`].
+    write_back: Option<overlay::Overlay>,
     /// Shared so a commit's flush can run after the write lock is released.
     wal: Arc<Wal>,
     segment_id: u64,
@@ -531,6 +695,18 @@ pub struct Engine {
     /// Change records published by the most recent commit, so subscribers can be
     /// notified without re-reading the change log.
     last_published: Vec<change_log::ChangeRecord>,
+    /// The raw mutations the most recent write-back commit put in the buffer,
+    /// staged for the server to replay onto its read handles once the commit
+    /// is durable. Always empty when write-back is off; follows the
+    /// `last_published` lifecycle otherwise (cleared on the way into every
+    /// batch, taken by the caller after a successful one).
+    write_back_publish: Vec<overlay::PublishedMutation>,
+    /// The LSN through which the tree has absorbed the write-back buffer:
+    /// every buffered entry at or below it is also behind the tree's current
+    /// root, so a read handle serving that root may drop its overlay copies.
+    /// Monotonic; equals `last_lsn` at open because recovery replays the whole
+    /// WAL into the tree itself.
+    write_back_absorbed: u64,
     /// Snapshots registered without the write lock, keyed by revision.
     ///
     /// Behind its own mutex so beginning and ending a transaction never blocks on
@@ -669,6 +845,10 @@ impl Engine {
         Ok(Self {
             path: path.to_owned(),
             tree,
+            // Recovery replayed the WAL into the tree itself, so the buffer
+            // always starts empty: the tree is the whole state at open.
+            write_back: (options.write_back_buffer > 0)
+                .then(|| overlay::Overlay::new(options.write_back_buffer)),
             wal,
             segment_id,
             last_lsn: state.lsn,
@@ -685,6 +865,8 @@ impl Engine {
             pending_wal: Vec::new(),
             failure: None,
             last_published: Vec::new(),
+            write_back_publish: Vec::new(),
+            write_back_absorbed: state.lsn,
             shared_snapshots: std::sync::Mutex::new(BTreeMap::new()),
             wal_len,
             archived_through: options.archived_through,
@@ -700,7 +882,105 @@ impl Engine {
     pub(crate) fn get_internal(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_healthy()?;
         validate_key(key)?;
-        self.tree.get(key)
+        self.tree_get(key)
+    }
+
+    // --- Write-back merged reads -------------------------------------------
+    //
+    // Every read on this engine goes through these rather than the tree
+    // directly, so a key's newest committed state is found whether the tree
+    // has absorbed it or it still sits in the write-back buffer. Tombstones,
+    // change-log records, and index entries are ordinary keys, so the layers
+    // built on them inherit the merge without knowing it exists. With
+    // write-back disabled — every replica today — each of these is exactly
+    // its tree counterpart. The merge itself lives in [`overlay`], shared
+    // with [`ReadEngine`] so the writer's view and a read handle's view are
+    // one implementation.
+
+    fn tree_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        overlay::merged_get(&self.tree, self.write_back.as_ref(), key)
+    }
+
+    fn tree_revision(&self, key: &[u8]) -> Result<Option<u64>> {
+        overlay::merged_revision(&self.tree, self.write_back.as_ref(), key)
+    }
+
+    /// [`PageTree::get_many_revisions`] with the buffer merged over it.
+    /// `keys` must be sorted and deduplicated, as the tree requires.
+    fn tree_get_many_revisions(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<u64>>> {
+        overlay::merged_get_many_revisions(&self.tree, self.write_back.as_ref(), keys)
+    }
+
+    /// [`PageTree::get_many_with_revision`] with the buffer merged over it.
+    fn tree_get_many_with_revision(&self, keys: &[Vec<u8>]) -> Result<Vec<MergedValue>> {
+        overlay::merged_get_many_with_revision(&self.tree, self.write_back.as_ref(), keys)
+    }
+
+    /// One ordered pass over the buffer and the tree — see [`overlay::merged_scan`].
+    fn tree_scan_merged(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<MergedRow>> {
+        overlay::merged_scan(
+            &self.tree,
+            self.write_back.as_ref(),
+            start,
+            end,
+            limit,
+            excluded_prefix,
+        )
+    }
+
+    fn tree_scan(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .tree_scan_merged(start, end, limit, None)?
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect())
+    }
+
+    fn tree_scan_excluding_prefix(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .tree_scan_merged(start, end, limit, excluded_prefix)?
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect())
+    }
+
+    fn tree_changed_since(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        revision: u64,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<bool> {
+        overlay::merged_changed_since(
+            &self.tree,
+            self.write_back.as_ref(),
+            start,
+            end,
+            revision,
+            excluded_prefix,
+        )
+    }
+
+    /// [`PageTree::last_key_in`] with the buffer merged over it.
+    fn tree_last_key_in(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        overlay::merged_last_key_in(&self.tree, self.write_back.as_ref(), start, end)
     }
 
     /// The revision that last wrote `key`, across the live tree and the retained
@@ -736,9 +1016,8 @@ impl Engine {
         // A live entry and a tombstone are mutually exclusive, so this is one
         // answer rather than two competing ones.
         let live = self
-            .tree
-            .revision(key)?
-            .or(self.tree.revision(&tombstone_key(key))?);
+            .tree_revision(key)?
+            .or(self.tree_revision(&tombstone_key(key))?);
         Ok(match (retained, live) {
             (Some(retained), Some(live)) => Some(retained.max(live)),
             (value, None) | (None, value) => value,
@@ -780,7 +1059,7 @@ impl Engine {
         }
         let live: Vec<Vec<u8>> = pending.into_iter().collect();
         let mut unresolved = Vec::new();
-        for (key, entry) in live.iter().zip(self.tree.get_many_revisions(&live)?) {
+        for (key, entry) in live.iter().zip(self.tree_get_many_revisions(&live)?) {
             match entry {
                 Some(current) => {
                     if current > revision {
@@ -796,8 +1075,7 @@ impl Engine {
         // A deleted key's revision lives on its tombstone.
         unresolved.sort();
         Ok(self
-            .tree
-            .get_many_revisions(&unresolved)?
+            .tree_get_many_revisions(&unresolved)?
             .into_iter()
             .flatten()
             .any(|current| current > revision))
@@ -806,8 +1084,7 @@ impl Engine {
     pub fn revisions(&self) -> Result<Vec<(Vec<u8>, u64)>> {
         self.ensure_healthy()?;
         let mut revisions: BTreeMap<_, _> = self
-            .tree
-            .scan_with_revisions(None, None, usize::MAX)?
+            .tree_scan_merged(None, None, usize::MAX, None)?
             .into_iter()
             .map(
                 |(key, _, revision)| match key.strip_prefix(TOMBSTONE_PREFIX) {
@@ -876,9 +1153,7 @@ impl Engine {
     /// the database", which is the correct answer for a registry whose contents
     /// can no longer be trusted; panicking instead took down the write pipeline
     /// for every client.
-    fn shared_snapshots(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<u64, usize>>> {
+    fn shared_snapshots(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<u64, usize>>> {
         self.shared_snapshots.lock().map_err(|_| Error::Poisoned)
     }
 
@@ -963,7 +1238,7 @@ impl Engine {
             .revision(key)?
             .is_none_or(|current| current <= revision)
         {
-            self.tree.get(key)
+            self.tree_get(key)
         } else {
             mvcc::get_at(&self.mvcc, &self.mvcc_values, key, revision)
         }
@@ -998,8 +1273,7 @@ impl Engine {
         }
         let candidate_limit = limit.saturating_add(self.mvcc.histories.len());
         let mut keys: BTreeMap<Vec<u8>, ()> = self
-            .tree
-            .scan_excluding_prefix(start, end, candidate_limit, Some(INTERNAL_PREFIX))?
+            .tree_scan_excluding_prefix(start, end, candidate_limit, Some(INTERNAL_PREFIX))?
             .into_iter()
             .map(|(key, _)| (key, ()))
             .collect();
@@ -1038,10 +1312,7 @@ impl Engine {
         revision: u64,
     ) -> Result<bool> {
         self.ensure_healthy()?;
-        if self
-            .tree
-            .changed_since(start, end, revision, Some(INTERNAL_PREFIX))?
-        {
+        if self.tree_changed_since(start, end, revision, Some(INTERNAL_PREFIX))? {
             return Ok(true);
         }
         let tombstone_start = start
@@ -1050,7 +1321,7 @@ impl Engine {
         let tombstone_end = end
             .map(tombstone_key)
             .or_else(|| prefix_end(TOMBSTONE_PREFIX));
-        self.tree.changed_since(
+        self.tree_changed_since(
             Some(&tombstone_start),
             tombstone_end.as_deref(),
             revision,
@@ -1118,9 +1389,12 @@ impl Engine {
         }
         let start = index_entry_prefix(name);
         let end = prefix_end(&start);
+        // The merged scan, not the raw tree: with write-back on, entries this
+        // index gained since the last absorb exist only in the buffer, and a
+        // drop that misses them leaves orphans for a later recreation of the
+        // same name to resurrect as stale lookup answers.
         let mut operations: Vec<_> = self
-            .tree
-            .scan(Some(&start), end.as_deref(), usize::MAX)?
+            .tree_scan(Some(&start), end.as_deref(), usize::MAX)?
             .into_iter()
             .map(|(key, _)| BatchOperation::Delete(key))
             .collect();
@@ -1142,9 +1416,10 @@ impl Engine {
         }
         let start = index_entry_prefix(name);
         let end = prefix_end(&start);
+        // Merged for the same reason as `drop_index`: a rebuild must clear
+        // entries the buffer holds, or they survive as stale index rows.
         let operations: Vec<_> = self
-            .tree
-            .scan(Some(&start), end.as_deref(), usize::MAX)?
+            .tree_scan(Some(&start), end.as_deref(), usize::MAX)?
             .into_iter()
             .map(|(key, _)| BatchOperation::Delete(key))
             .collect();
@@ -1296,8 +1571,7 @@ impl Engine {
         validate_index_value(Some(value))?;
         let prefix = index_value_prefix(name, value);
         let end = prefix_end(&prefix);
-        self.tree
-            .scan(Some(&prefix), end.as_deref(), limit)?
+        self.tree_scan(Some(&prefix), end.as_deref(), limit)?
             .into_iter()
             .map(|(key, _)| decode_index_primary(&key, &prefix))
             .collect()
@@ -1328,8 +1602,7 @@ impl Engine {
         let end = prefix_end(&prefix);
         let candidate_limit = limit.saturating_add(self.mvcc.histories.len());
         let mut entries: BTreeMap<Vec<u8>, ()> = self
-            .tree
-            .scan(Some(&prefix), end.as_deref(), candidate_limit)?
+            .tree_scan(Some(&prefix), end.as_deref(), candidate_limit)?
             .into_iter()
             .map(|(key, _)| (key, ()))
             .collect();
@@ -1361,7 +1634,7 @@ impl Engine {
             .revision(key)?
             .is_none_or(|current| current <= revision)
         {
-            self.tree.get(key)
+            self.tree_get(key)
         } else {
             mvcc::get_at(&self.mvcc, &self.mvcc_values, key, revision)
         }
@@ -1493,7 +1766,7 @@ impl Engine {
         let existing: BTreeMap<Vec<u8>, Option<u64>> = wanted
             .iter()
             .cloned()
-            .zip(self.tree.get_many_revisions(&wanted)?)
+            .zip(self.tree_get_many_revisions(&wanted)?)
             .collect();
         let mut previous = BTreeMap::new();
         if oldest_snapshot.is_some() {
@@ -1514,7 +1787,7 @@ impl Engine {
             for (key, entry) in pre_image
                 .iter()
                 .cloned()
-                .zip(self.tree.get_many_with_revision(&pre_image)?)
+                .zip(self.tree_get_many_with_revision(&pre_image)?)
             {
                 previous.insert(
                     key,
@@ -1646,46 +1919,107 @@ impl Engine {
             }
         }
         profile::add(&profile::MVCC_NS, phase);
-        let phase = std::time::Instant::now();
-        let outcome = match self.tree.prepare_batch(&mutations) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.abandon_staged_changes();
-                return Err(error);
-            }
-        };
-        profile::add(&profile::TREE_NS, phase);
-        // Past this line the batch is visible, so only the WAL-stage error path
-        // below may answer for it.
-        self.tree.publish(outcome.root, outcome.len);
-        self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
-        let phase = std::time::Instant::now();
         // A deferred barrier only appends here; the caller flushes once it has
         // released the write lock, and must not acknowledge before it returns.
         let deferred = barrier == Barrier::Deferred && self.durability == DurabilityMode::Durable;
-        let committed = match barrier {
-            Barrier::Immediate => self
-                .commit_batch(&pending, self.tree.root_id(), self.tree.len())
-                .map(|()| None),
-            Barrier::Deferred => self
-                .append_batch(&pending, self.tree.root_id(), self.tree.len())
-                // In async mode the record is buffered rather than written, so
-                // there is no barrier for the caller to wait on.
-                .map(|lsn| deferred.then_some(lsn)),
-        };
-        profile::add(&profile::WAL_NS, phase);
-        let lsn = match committed {
-            Ok(lsn) => lsn,
-            Err(error) => {
-                // The tree is copy-on-write, so the pre-batch root is still
-                // intact and republishing it withdraws every mutation the batch
-                // made. It does not undo the WAL record if one landed — hence
-                // the poison below.
-                self.tree.publish(original_root, original_len);
-                self.user_len = original_user_len;
-                self.abandon_staged_changes();
-                self.poisoned = true;
-                return Err(error);
+        let lsn = if self.write_back.is_some() {
+            // WRITE-BACK: durability is the WAL record alone, and the tree is
+            // not touched — the mutations land in the buffer, which every read
+            // on this engine merges over the tree, and the tree absorbs the
+            // buffer in one amortised pass at the flush below or at a
+            // checkpoint. The WAL is written FIRST: until it succeeds nothing
+            // is visible, so an append failure needs no rollback. The record
+            // names WRITE_BACK_ROOT rather than the tree's stale root, so an
+            // open can never adopt a tree that lacks the buffered commits and
+            // instead replays the WAL from the checkpoint — the redo path that
+            // has always covered pages that failed to survive.
+            let phase = std::time::Instant::now();
+            let committed = match barrier {
+                Barrier::Immediate => self
+                    .commit_batch(&pending, WRITE_BACK_ROOT, WRITE_BACK_ROOT)
+                    .map(|()| None),
+                Barrier::Deferred => self
+                    .append_batch(&pending, WRITE_BACK_ROOT, WRITE_BACK_ROOT)
+                    .map(|lsn| deferred.then_some(lsn)),
+            };
+            profile::add(&profile::WAL_NS, phase);
+            let lsn = match committed {
+                Ok(lsn) => lsn,
+                Err(error) => {
+                    // Nothing is visible yet, but the record may sit torn at
+                    // the segment's tail while `wal_len` already points past
+                    // it; a further append would land beyond the tear and be
+                    // lost to recovery, so the engine stops here — the same
+                    // convention as the classic path below.
+                    self.abandon_staged_changes();
+                    self.poisoned = true;
+                    return Err(error);
+                }
+            };
+            let phase = std::time::Instant::now();
+            let buffer = self.write_back.as_mut().expect("checked above");
+            for (key, mutation) in mutations {
+                // Staged alongside the buffer entry so the server can replay
+                // this commit onto its read handles once it is durable. The
+                // value is one shared allocation between the buffer, this
+                // staging, and every read handle it reaches.
+                let (value, entry_revision) = match mutation {
+                    page_tree::Mutation::Put { value, revision } => {
+                        (Some(Arc::new(value)), revision)
+                    }
+                    // Every mutation of a batch commits at one LSN, which is
+                    // `revision` — the same stamp its puts carry.
+                    page_tree::Mutation::Delete => (None, revision),
+                };
+                self.write_back_publish.push(overlay::PublishedMutation {
+                    key: key.clone(),
+                    value: value.clone(),
+                    revision: entry_revision,
+                });
+                buffer.record(key, value, entry_revision);
+            }
+            self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
+            profile::add(&profile::TREE_NS, phase);
+            lsn
+        } else {
+            let phase = std::time::Instant::now();
+            let outcome = match self.tree.prepare_batch(mutations) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.abandon_staged_changes();
+                    return Err(error);
+                }
+            };
+            profile::add(&profile::TREE_NS, phase);
+            // Past this line the batch is visible, so only the WAL-stage error
+            // path below may answer for it.
+            self.tree.publish(outcome.root, outcome.len);
+            self.user_len = self.user_len.saturating_add_signed(user_delta as isize);
+            let phase = std::time::Instant::now();
+            let committed = match barrier {
+                Barrier::Immediate => self
+                    .commit_batch(&pending, self.tree.root_id(), self.tree.len())
+                    .map(|()| None),
+                Barrier::Deferred => self
+                    .append_batch(&pending, self.tree.root_id(), self.tree.len())
+                    // In async mode the record is buffered rather than written,
+                    // so there is no barrier for the caller to wait on.
+                    .map(|lsn| deferred.then_some(lsn)),
+            };
+            profile::add(&profile::WAL_NS, phase);
+            match committed {
+                Ok(lsn) => lsn,
+                Err(error) => {
+                    // The tree is copy-on-write, so the pre-batch root is still
+                    // intact and republishing it withdraws every mutation the
+                    // batch made. It does not undo the WAL record if one landed
+                    // — hence the poison below.
+                    self.tree.publish(original_root, original_len);
+                    self.user_len = original_user_len;
+                    self.abandon_staged_changes();
+                    self.poisoned = true;
+                    return Err(error);
+                }
             }
         };
         // History maintenance runs after `commit_batch` has fsynced, so a
@@ -1702,9 +2036,7 @@ impl Engine {
                          the engine refuses further work until it is reopened",
                         self.last_lsn
                     );
-                    return Err(Error::CommittedThenPoisoned {
-                        lsn: self.last_lsn,
-                    });
+                    return Err(Error::CommittedThenPoisoned { lsn: self.last_lsn });
                 }
             }
             // No snapshot was open, so this commit displaced its keys' previous
@@ -1714,9 +2046,92 @@ impl Engine {
             // refused. Infallible, so it needs none of the poisoning above.
             None => self.publish_coverage(),
         }
+        // The commit that crosses the buffer's threshold pays the buffer's
+        // whole tree pass; that is the write-back trade, stated on the option.
+        // A flush failure fails no commit: everything above is durable in the
+        // WAL and visible through the buffer, which stays intact, so the flush
+        // simply retries on a later commit or checkpoint.
+        if self
+            .write_back
+            .as_ref()
+            .is_some_and(overlay::Overlay::should_flush)
+        {
+            if let Err(error) = self.flush_write_back() {
+                eprintln!(
+                    "vyrn: write-back flush failed ({error}); the buffered commits are \
+                     durable in the WAL and the flush will be retried"
+                );
+            }
+        }
         // Hide results for the change records appended by with_change_log.
         results.truncate(requested);
         Ok((results, lsn))
+    }
+
+    /// Applies the whole write-back buffer to the tree in one amortised pass.
+    ///
+    /// Each buffered entry keeps the revision its commit stamped, so
+    /// `revision()` and snapshot reads answer identically before and after the
+    /// tree absorbs it. The buffer is cleared only after the tree publishes;
+    /// on failure it is untouched and every read keeps merging it, so a failed
+    /// flush loses nothing and can simply run again.
+    fn flush_write_back(&mut self) -> Result<()> {
+        let Some(buffer) = &self.write_back else {
+            return Ok(());
+        };
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let mutations: Vec<(Vec<u8>, page_tree::Mutation)> = buffer
+            .entries
+            .iter()
+            .map(|(key, entry)| {
+                let mutation = match entry.value.as_deref() {
+                    Some(value) => page_tree::Mutation::Put {
+                        value: value.clone(),
+                        revision: entry.revision,
+                    },
+                    None => page_tree::Mutation::Delete,
+                };
+                (key.clone(), mutation)
+            })
+            .collect();
+        let outcome = self.tree.prepare_batch(mutations)?;
+        self.tree.publish(outcome.root, outcome.len);
+        self.write_back.as_mut().expect("checked above").clear();
+        // Everything buffered so far carried a revision at or below the
+        // current LSN, and all of it just reached the tree, so read handles
+        // serving the root published above may drop their overlay entries
+        // through here.
+        self.write_back_absorbed = self.last_lsn;
+        Ok(())
+    }
+
+    /// Takes what the most recent write-back commit asks read handles to
+    /// learn: its raw mutations, plus the absorb watermark that licenses
+    /// overlay eviction. Empty (`absorbed_through: None`) when write-back is
+    /// off, so callers need no mode check of their own.
+    ///
+    /// Must be read under the same exclusive access as the commit that staged
+    /// it — the next batch clears the staging on its way in, exactly like
+    /// [`Engine::last_published`].
+    pub fn take_write_back_publish(&mut self) -> overlay::WriteBackPublish {
+        if self.write_back.is_none() {
+            return overlay::WriteBackPublish::default();
+        }
+        overlay::WriteBackPublish {
+            mutations: std::mem::take(&mut self.write_back_publish),
+            absorbed_through: Some(self.write_back_absorbed),
+        }
+    }
+
+    /// The LSN through which the tree has absorbed the write-back buffer;
+    /// `None` when write-back is off. Read handles serving the engine's
+    /// current root may evict overlay entries at or below it.
+    pub fn write_back_absorbed_through(&self) -> Option<u64> {
+        self.write_back
+            .as_ref()
+            .map(|_| self.write_back_absorbed)
     }
 
     /// Discards the change records `with_change_log` staged for a batch that
@@ -1752,6 +2167,10 @@ impl Engine {
     /// there by the call in progress, or the call published nothing.
     fn reset_published(&mut self) {
         self.last_published = Vec::new();
+        // The write-back staging describes the same commit and has the same
+        // hazard: left behind, a failed or empty batch would replay the
+        // PREVIOUS commit's mutations onto every read handle a second time.
+        self.write_back_publish = Vec::new();
     }
 
     /// Records a committed batch's historical versions in the MVCC state.
@@ -1799,8 +2218,7 @@ impl Engine {
         if start.zip(end).is_some_and(|(start, end)| start > end) {
             return Err(Error::InvalidRange);
         }
-        self.tree
-            .scan_excluding_prefix(start, end, limit, Some(INTERNAL_PREFIX))
+        self.tree_scan_excluding_prefix(start, end, limit, Some(INTERNAL_PREFIX))
     }
 
     /// Appends a durable change record for every user mutation in `operations`.
@@ -1830,7 +2248,7 @@ impl Engine {
                 BatchOperation::Delete(key) => {
                     let present = match live.get(key.as_slice()) {
                         Some(present) => *present,
-                        None => self.tree.get(key)?.is_some(),
+                        None => self.tree_get(key)?.is_some(),
                     };
                     if present && is_published_key(key) {
                         entries.push((key.as_slice(), None));
@@ -1899,7 +2317,7 @@ impl Engine {
         // `usize::MAX` is a legitimate "give me everything" limit, and adding to
         // it panicked in debug and silently scanned nothing in release.
         let scan_limit = limit.saturating_add(1);
-        for (key, value) in self.tree.scan(Some(&start), end.as_deref(), scan_limit)? {
+        for (key, value) in self.tree_scan(Some(&start), end.as_deref(), scan_limit)? {
             let sequence = change_log_sequence(&key)?;
             for record in change_log::decode_batch(sequence, &value)? {
                 if cursor != change_log::Cursor::start() && record.cursor() <= cursor {
@@ -1937,7 +2355,7 @@ impl Engine {
         // Seek the greatest key under the prefix. Scanning the whole log here
         // would make every commit cost O(total changes).
         let end = prefix_end(CHANGE_LOG_PREFIX);
-        let Some(key) = self.tree.last_key_in(CHANGE_LOG_PREFIX, end.as_deref())? else {
+        let Some(key) = self.tree_last_key_in(CHANGE_LOG_PREFIX, end.as_deref())? else {
             // An empty log is not necessarily a log that never had records: a
             // trim that consumed every retained commit leaves the prefix empty
             // AND a retention floor above `Cursor::start()`. Returning the
@@ -1966,7 +2384,7 @@ impl Engine {
 
     /// The oldest cursor still retained; anything earlier has been trimmed.
     pub fn change_log_start(&self) -> Result<change_log::Cursor> {
-        match self.tree.get(CHANGE_LOG_START_KEY)? {
+        match self.tree_get(CHANGE_LOG_START_KEY)? {
             Some(value) => change_log::Cursor::from_suffix(&value),
             None => Ok(change_log::Cursor::start()),
         }
@@ -2035,7 +2453,7 @@ impl Engine {
         if start.zip(end).is_some_and(|(start, end)| start > end) {
             return Err(Error::InvalidRange);
         }
-        self.tree.scan(start, end, limit)
+        self.tree_scan(start, end, limit)
     }
 
     pub fn sync(&mut self) -> Result<()> {
@@ -2049,8 +2467,10 @@ impl Engine {
             // `appended_lsn` on the very first append, so a concurrent
             // `sync_through` could declare every buffered record durable while
             // most of them had not even been handed to the kernel.
-            let flushed = pending.into_iter().enumerate().try_for_each(
-                |(index, (lsn, record))| {
+            let flushed = pending
+                .into_iter()
+                .enumerate()
+                .try_for_each(|(index, (lsn, record))| {
                     // Offered from the second record on only, so an injected
                     // failure lands after one record has already left the
                     // buffer — the shape of an ENOSPC mid-drain.
@@ -2058,8 +2478,7 @@ impl Engine {
                         self.inject(FailurePoint::BetweenBufferedAppends)?;
                     }
                     self.wal.append(&record, lsn)
-                },
-            );
+                });
             if let Err(error) = flushed {
                 // Whatever was drained is gone from the buffer and the records
                 // behind it were never issued; neither can be put back. Keeping
@@ -2087,6 +2506,11 @@ impl Engine {
     pub fn checkpoint(&mut self) -> Result<()> {
         self.ensure_healthy()?;
         self.sync()?;
+        // The tree absorbs the write-back buffer before anything below reads
+        // or copies it: the manifest this checkpoint publishes must name a
+        // root that holds every commit, because segment cleanup then deletes
+        // the WAL records that were those commits' only other copy.
+        self.flush_write_back()?;
         self.tree.validate()?;
         // The next generation is derived from the published manifest rather than
         // read back from this counter alone. Both belt and braces, because each
@@ -2286,6 +2710,15 @@ impl Engine {
     /// needs but does not re-validate them.
     pub fn apply_replicated_record(&mut self, record: &[u8]) -> Result<u64> {
         self.ensure_healthy()?;
+        // A replica applies records straight to its tree; routing them through
+        // a write-back buffer instead has never been exercised, and silently
+        // mixing the two disciplines on one node is how drift starts. Refused
+        // until replicas learn the buffer deliberately.
+        if self.write_back.is_some() {
+            return Err(Error::InvalidReplicatedRecord {
+                reason: "write-back buffering is not supported on a replica".into(),
+            });
+        }
 
         let lsn = read_u64(record, 5);
         let operation_count = read_u32(record, 13) as usize;
@@ -3654,7 +4087,9 @@ mod tests {
         assert_eq!(engine.sequence(), 4);
         // The repair renamed its replacement into place; nothing temporary
         // remains to confuse the next open.
-        assert!(!wal_directory.join(format!("{}.tmp", segment_name(2))).exists());
+        assert!(!wal_directory
+            .join(format!("{}.tmp", segment_name(2)))
+            .exists());
     }
 
     #[test]
@@ -4004,7 +4439,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let mut engine = Engine::open(directory.path()).unwrap();
         engine.create_index(b"email".to_vec(), true).unwrap();
-        engine.put(b"published".to_vec(), b"value".to_vec()).unwrap();
+        engine
+            .put(b"published".to_vec(), b"value".to_vec())
+            .unwrap();
         assert_eq!(engine.last_published().len(), 1);
 
         // An empty batch returns before `with_change_log` runs.
@@ -4015,7 +4452,9 @@ mod tests {
         );
 
         // A batch rejected for a reserved key never reaches `apply_batch`.
-        engine.put(b"published".to_vec(), b"again".to_vec()).unwrap();
+        engine
+            .put(b"published".to_vec(), b"again".to_vec())
+            .unwrap();
         assert_eq!(engine.last_published().len(), 1);
         let error = engine
             .write_batch(vec![BatchOperation::Put(
@@ -4062,7 +4501,9 @@ mod tests {
 
         // A batch whose only operation is a no-op delete publishes nothing
         // either, and that too must clear what came before.
-        engine.put(b"published".to_vec(), b"third".to_vec()).unwrap();
+        engine
+            .put(b"published".to_vec(), b"third".to_vec())
+            .unwrap();
         assert_eq!(engine.last_published().len(), 1);
         engine.delete(b"never-existed").unwrap();
         assert!(engine.last_published().is_empty());
@@ -4164,7 +4605,10 @@ mod tests {
             b"\0vyrn:changelog:x".to_vec(),
         ] {
             assert!(
-                matches!(engine.create_index(name.clone(), false), Err(Error::ReservedKey)),
+                matches!(
+                    engine.create_index(name.clone(), false),
+                    Err(Error::ReservedKey)
+                ),
                 "index name {name:?} reached the reserved keyspace"
             );
             assert!(matches!(
@@ -4220,10 +4664,7 @@ mod tests {
             let mut engine = Engine::open(directory.path()).unwrap();
             for index in 0..WRITES {
                 engine
-                    .put(
-                        format!("k{index}").into_bytes(),
-                        vec![b'x'; VALUE_LEN],
-                    )
+                    .put(format!("k{index}").into_bytes(), vec![b'x'; VALUE_LEN])
                     .unwrap();
             }
         }

@@ -1,6 +1,4 @@
-use crate::{
-    index_entry_prefix, BatchOperation, Engine, Error, IndexUpdate, Result, MAX_KEY_SIZE,
-};
+use crate::{index_entry_prefix, BatchOperation, Engine, Error, IndexUpdate, Result, MAX_KEY_SIZE};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -230,7 +228,10 @@ impl Collection<'_> {
             let index = index_name(&self.name, field)?;
             let start = index_entry_prefix(&index);
             let end = prefix_end(&start);
-            for (entry, _) in self.engine.scan_internal(Some(&start), end.as_deref(), usize::MAX)? {
+            for (entry, _) in self
+                .engine
+                .scan_internal(Some(&start), end.as_deref(), usize::MAX)?
+            {
                 if index_entry_points_at(&entry, &start, primary_key) {
                     operations.push(BatchOperation::Delete(entry));
                 }
@@ -671,16 +672,25 @@ mod tests {
         {
             let mut users = engine.collection("users", &indexes()).unwrap();
             users
-                .put("one", &json!({"email": "one@example.com", "role": "member"}))
+                .put(
+                    "one",
+                    &json!({"email": "one@example.com", "role": "member"}),
+                )
                 .unwrap();
             users
-                .put("two", &json!({"email": "two@example.com", "role": "member"}))
+                .put(
+                    "two",
+                    &json!({"email": "two@example.com", "role": "member"}),
+                )
                 .unwrap();
         }
         corrupt(&mut engine, "users", "one");
 
         let mut users = engine.collection("users", &indexes()).unwrap();
-        assert!(users.get("one").is_err(), "reads must still report the damage");
+        assert!(
+            users.get("one").is_err(),
+            "reads must still report the damage"
+        );
 
         // Deletion used to demand that the previous value decode, which made a
         // corrupt document undeletable forever.
@@ -705,7 +715,10 @@ mod tests {
 
         // And the document is writable again.
         users
-            .put("one", &json!({"email": "reborn@example.com", "role": "admin"}))
+            .put(
+                "one",
+                &json!({"email": "reborn@example.com", "role": "admin"}),
+            )
             .unwrap();
         assert_eq!(
             users.get("one").unwrap().unwrap().value["email"],
@@ -720,7 +733,10 @@ mod tests {
         {
             let mut users = engine.collection("users", &indexes()).unwrap();
             users
-                .put("one", &json!({"email": "one@example.com", "role": "member"}))
+                .put(
+                    "one",
+                    &json!({"email": "one@example.com", "role": "member"}),
+                )
                 .unwrap();
         }
         corrupt(&mut engine, "users", "one");
@@ -752,7 +768,10 @@ mod tests {
         drop(users);
         let mut users = engine.collection("users", &indexes()).unwrap();
         users
-            .put("two", &json!({"email": "one@example.com", "role": "member"}))
+            .put(
+                "two",
+                &json!({"email": "one@example.com", "role": "member"}),
+            )
             .unwrap();
         assert_eq!(
             users.find("email", &json!("one@example.com"), 10).unwrap()[0].id,

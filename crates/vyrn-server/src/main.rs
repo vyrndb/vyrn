@@ -4,7 +4,7 @@ mod replication;
 use anyhow::{bail, Context, Result};
 use argon2::{password_hash::PasswordHashString, Argon2, PasswordVerifier};
 use clap::Parser;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -107,6 +107,21 @@ struct Args {
     write_queue_capacity: usize,
     #[arg(long, env = "VYRN_DURABILITY", default_value = "durable")]
     durability: String,
+    /// Write-back buffer size in bytes; 0 disables it.
+    ///
+    /// With a buffer, a durable commit is its WAL record alone: mutations sit
+    /// in memory, every read merges them over the tree, and the tree absorbs
+    /// the whole buffer in one amortised pass at this threshold and on every
+    /// checkpoint. Cuts the engine CPU beside the commit fsync by an order of
+    /// magnitude at batch shapes (see docs/benchmarks.md). The trade: reopening
+    /// after a crash replays the WAL from the last checkpoint instead of
+    /// adopting the newest root, and up to this many bytes of committed state
+    /// live only in memory (they are always durable in the WAL).
+    ///
+    /// Refused on a replica: its log must stay byte-identical to the
+    /// primary's, and replica apply does not route through the buffer.
+    #[arg(long, env = "VYRN_WRITE_BACK_BYTES", default_value_t = 0)]
+    write_back_bytes: usize,
     #[arg(long, env = "VYRN_ASYNC_SYNC_MS", default_value_t = 5)]
     async_sync_ms: u64,
     #[arg(long, env = "VYRN_TRANSACTION_TIMEOUT_SECONDS", default_value_t = 30)]
@@ -992,6 +1007,10 @@ struct PendingFlush {
     /// Clients of requests that committed alone rather than joining the batch.
     answers: Vec<DeferredAnswer>,
     published: Vec<change_log::ChangeRecord>,
+    /// What this commit asks the read handles' overlay copies to learn —
+    /// its raw mutations plus the absorb watermark. Empty when write-back is
+    /// off, in which case the root refresh below is the whole publication.
+    write_back: vyrn_core::WriteBackPublish,
     generation: u64,
     root: u64,
     len: u64,
@@ -1069,6 +1088,12 @@ struct ServerState {
     write_budget: Arc<Semaphore>,
     changes: Arc<ChangeRing>,
     read_queues: Vec<std::sync::mpsc::SyncSender<ReadRequest>>,
+    /// The read handles themselves, for the point-read fast path: a `try_read`
+    /// on one of these answers a Get on the connection task, skipping the
+    /// queue hop, both thread wakeups, and the response channel. The queue
+    /// path remains for scans, multi-gets, documents, and any moment a handle
+    /// is exclusively held (a publish or refresh in progress).
+    readers: Arc<Vec<RwLock<ReadEngine>>>,
     next_reader: AtomicU64,
     engine: Arc<RwLock<Engine>>,
     /// This node's WAL directory, consulted on a replica join to learn the oldest
@@ -1193,12 +1218,20 @@ async fn main() -> Result<()> {
         None
     };
 
+    if args.write_back_bytes > 0 && args.replica_of.is_some() {
+        anyhow::bail!(
+            "--write-back-bytes cannot be used on a replica: replica apply writes \
+             the primary's records straight to the tree and does not route through \
+             a write-back buffer"
+        );
+    }
     let engine = Engine::open_with_options(
         &args.data,
         EngineOptions {
             durability,
             archived_through: archived_through.clone(),
             record_sink,
+            write_back_buffer: args.write_back_bytes,
             ..EngineOptions::default()
         },
     )
@@ -1212,7 +1245,16 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::default());
     let readers = Arc::new(
         (0..args.read_handles)
-            .map(|_| ReadEngine::open(&args.data).map(RwLock::new))
+            .map(|_| {
+                // A handle for a write-back engine must be told so: it keeps
+                // its own overlay copy, fed by the flush stage, and a plain
+                // handle would silently serve only what the tree has absorbed.
+                if args.write_back_bytes > 0 {
+                    ReadEngine::open_with_write_back(&args.data).map(RwLock::new)
+                } else {
+                    ReadEngine::open(&args.data).map(RwLock::new)
+                }
+            })
             .collect::<vyrn_core::Result<Vec<_>>>()?,
     );
     // A read handle opens from the checkpoint manifest, which is the last root
@@ -1322,6 +1364,7 @@ async fn main() -> Result<()> {
         write_budget: Arc::new(Semaphore::new(WRITE_QUEUE_MAX_BYTES)),
         changes: change_sender,
         read_queues,
+        readers: Arc::clone(&readers),
         next_reader: AtomicU64::new(0),
         engine: Arc::clone(&engine),
         wal_directory: args.data.join("wal"),
@@ -1709,21 +1752,41 @@ async fn run_session(
     transaction: &mut Option<ConnectionTransaction>,
 ) -> Result<()> {
     let mut connection_error = None;
+    /* PIPELINING: a request decoded during the previous iteration's drain
+     * check, carried here so it is served before the connection waits on the
+     * socket again. While one of these is in hand, responses are FED into the
+     * codec's write buffer rather than flushed — a client that keeps several
+     * requests in flight gets all of their answers in one write, so the
+     * per-request syscall pair becomes a per-burst one. A client that sends
+     * one request at a time never has a queued frame, takes the flush on
+     * every iteration, and behaves exactly as before. */
+    let mut queued_frame: Option<Envelope> = None;
+    let mut unflushed = 0usize;
     loop {
-        let request_timeout = transaction
-            .as_ref()
-            .map_or(CLIENT_IDLE_TIMEOUT, |transaction| {
-                state
-                    .transaction_timeout
-                    .saturating_sub(transaction.started.elapsed())
-                    .min(CLIENT_IDLE_TIMEOUT)
-            });
-        let request = match next_message(&mut framed, request_timeout).await {
-            Ok(Some(request)) => request,
-            Ok(None) => break,
-            Err(error) => {
-                connection_error = Some(error);
-                break;
+        let request = if let Some(request) = queued_frame.take() {
+            request
+        } else {
+            // The burst is over: everything answered so far leaves in one
+            // write before the connection goes back to waiting.
+            if unflushed > 0 {
+                flush_frames(&mut framed).await?;
+                unflushed = 0;
+            }
+            let request_timeout = transaction
+                .as_ref()
+                .map_or(CLIENT_IDLE_TIMEOUT, |transaction| {
+                    state
+                        .transaction_timeout
+                        .saturating_sub(transaction.started.elapsed())
+                        .min(CLIENT_IDLE_TIMEOUT)
+                });
+            match next_message(&mut framed, request_timeout).await {
+                Ok(Some(request)) => request,
+                Ok(None) => break,
+                Err(error) => {
+                    connection_error = Some(error);
+                    break;
+                }
             }
         };
         let request_id = request.request_id;
@@ -2011,7 +2074,29 @@ async fn run_session(
                 }
             }
         };
-        send_frame(&mut framed, Envelope::new(request_id, response)).await?;
+        feed_frame(&mut framed, Envelope::new(request_id, response)).await?;
+        unflushed += 1;
+        /* One non-blocking poll of the stream: decodes a frame the read
+         * buffer already holds (or that a ready socket yields) without
+         * waiting for one. `None` means nothing is immediately there — the
+         * next iteration flushes and parks in `next_message` as before. */
+        queued_frame = match framed.next().now_or_never() {
+            Some(Some(Ok(request))) => Some(request),
+            Some(Some(Err(error))) => {
+                connection_error = Some(error.into());
+                break;
+            }
+            // Peer closed after its last request; its answers still go out
+            // through the flush below.
+            Some(None) => break,
+            None => None,
+        };
+    }
+    /* Answers owed for requests served before the peer closed or broke the
+     * stream. Best effort: the write's own failure must not mask the error
+     * that ended the session. */
+    if unflushed > 0 {
+        let _ = flush_frames(&mut framed).await;
     }
     match connection_error {
         Some(error) => Err(error),
@@ -2941,6 +3026,30 @@ fn read_failure_message(failure: ReadFailure) -> Message {
 }
 
 async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
+    /* THE FAST PATH: answer here, on the connection task.
+     *
+     * A point read against a warm cache is about a microsecond of work, and
+     * the queue path wraps it in two cross-thread wakeups, a bounded-channel
+     * send, and a oneshot allocation — the engine does under 1% of a served
+     * Get; this plumbing was most of the rest. A shared `try_read` never
+     * waits: it succeeds alongside other reads (including a scan holding the
+     * same handle's guard on its worker thread — reads don't exclude each
+     * other) and fails only while a publish or refresh holds the handle
+     * exclusively, which is exactly when queueing behind it is correct.
+     *
+     * Held across the descent, deliberately: the guard is what keeps the
+     * root from moving mid-read, the same invariant the worker thread relies
+     * on. A cache-miss descent does a handful of positional page reads
+     * inline; that is bounded and small, unlike a scan, which is why scans
+     * and multi-gets stay on the workers with their deadline machinery. */
+    {
+        if let Ok(reader) = state.readers[next_reader(state)].try_read() {
+            return match reader.get(&key) {
+                Ok(value) => Message::Value { value },
+                Err(error) => storage_error_message(error),
+            };
+        }
+    }
     let (response, receiver) = oneshot::channel();
     if let Err(error) =
         state.read_queues[next_reader(state)].try_send(ReadRequest::Get { key, response })
@@ -3486,11 +3595,17 @@ fn start_mvcc_gc(
                     // exists until the loop finishes.
                     let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
                     let (new_generation, root, len) = engine.committed_root();
+                    // A checkpoint absorbed the write-back buffer into the
+                    // tree, so the readers' overlay copies may drop everything
+                    // the compacted root now carries. Refresh first: eviction
+                    // is only sound on a handle already serving that root.
+                    let absorbed = engine.write_back_absorbed_through();
                     for reader in readers.iter() {
-                        reader
-                            .write()
-                            .map_err(|_| StorageError::Poisoned)?
-                            .refresh(new_generation, root, len)?;
+                        let mut reader = reader.write().map_err(|_| StorageError::Poisoned)?;
+                        reader.refresh(new_generation, root, len)?;
+                        if let Some(absorbed) = absorbed {
+                            reader.evict_write_back_through(absorbed);
+                        }
                     }
                     Ok::<_, StorageError>(())
                 })
@@ -3729,13 +3844,21 @@ async fn run_write_pipeline(
                         Ok(_) => engine.last_published().to_vec(),
                         Err(_) => Vec::new(),
                     };
+                    // Same rule as the change records: taken only on success,
+                    // or a failed document write would replay the PREVIOUS
+                    // commit's mutations onto every read handle a second time.
+                    let write_back = match &outcome {
+                        Ok(_) => engine.take_write_back_publish(),
+                        Err(_) => vyrn_core::WriteBackPublish::default(),
+                    };
                     let (generation, root, len) = engine.committed_root();
-                    Ok::<_, StorageError>((outcome, published, generation, root, len))
+                    Ok::<_, StorageError>((outcome, published, write_back, generation, root, len))
                 })
                 .await;
-                let (message, published, generation, root, len) = match result {
-                    Ok(Ok((outcome, published, generation, root, len))) => match outcome {
-                        Ok((message, _)) => (message, published, generation, root, len),
+                let (message, published, write_back, generation, root, len) = match result {
+                    Ok(Ok((outcome, published, write_back, generation, root, len))) => match outcome
+                    {
+                        Ok((message, _)) => (message, published, write_back, generation, root, len),
                         /* Nothing committed, so nothing is owed to the ordered
                          * publication point and the client is answered here.
                          * Rendered through `storage_error_message` so the code the
@@ -3773,6 +3896,7 @@ async fn run_write_pipeline(
                         results: Vec::new(),
                         answers: vec![DeferredAnswer { response, message }],
                         published,
+                        write_back,
                         generation,
                         root,
                         len,
@@ -3798,20 +3922,35 @@ async fn run_write_pipeline(
                 let engine = Arc::clone(&engine);
                 let result = task::spawn_blocking(move || {
                     let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-                    Ok::<_, StorageError>(engine.create_index(name, unique))
+                    let outcome = engine.create_index(name, unique);
+                    // Taken only on success, like a document write's change
+                    // records: a refused index change committed nothing and
+                    // must publish nothing.
+                    let write_back = match &outcome {
+                        Ok(()) => engine.take_write_back_publish(),
+                        Err(_) => vyrn_core::WriteBackPublish::default(),
+                    };
+                    let (generation, root, len) = engine.committed_root();
+                    Ok::<_, StorageError>((outcome, write_back, generation, root, len))
                 })
                 .await;
-                finish_index_change(&config, response, result);
+                finish_index_change(&config, &flushes, response, result).await;
                 continue;
             }
             WriteRequest::DropIndex { name, response } => {
                 let engine = Arc::clone(&engine);
                 let result = task::spawn_blocking(move || {
                     let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
-                    Ok::<_, StorageError>(engine.drop_index(&name))
+                    let outcome = engine.drop_index(&name);
+                    let write_back = match &outcome {
+                        Ok(()) => engine.take_write_back_publish(),
+                        Err(_) => vyrn_core::WriteBackPublish::default(),
+                    };
+                    let (generation, root, len) = engine.committed_root();
+                    Ok::<_, StorageError>((outcome, write_back, generation, root, len))
                 })
                 .await;
-                finish_index_change(&config, response, result);
+                finish_index_change(&config, &flushes, response, result).await;
                 continue;
             }
             // Data requests: batched below.
@@ -4073,6 +4212,7 @@ async fn run_write_pipeline(
             // The engine records what it published, so no change-log scan is
             // needed on the commit path.
             let published = engine.last_published().to_vec();
+            let write_back = engine.take_write_back_publish();
             let (generation, root, len) = engine.committed_root();
             Ok::<_, StorageError>((
                 PendingFlush {
@@ -4083,6 +4223,7 @@ async fn run_write_pipeline(
                     // batched commit answers through `requests`.
                     answers: Vec::new(),
                     published,
+                    write_back,
                     generation,
                     root,
                     len,
@@ -4139,18 +4280,61 @@ async fn run_write_pipeline(
 /// Shared by both index arms of the write loop so the two cannot drift: the
 /// earlier version handled them in one blocking task and needed an
 /// `unreachable!()` arm to name the variant it had already matched on.
-fn finish_index_change(
+/// What an index change's blocking task hands back: the outcome, plus the
+/// write-back publication and committed root captured under the same lock,
+/// so a successful change can be replayed onto the read handles in order.
+type IndexChangeOutcome = (
+    vyrn_core::Result<()>,
+    vyrn_core::WriteBackPublish,
+    u64,
+    u64,
+    u64,
+);
+
+async fn finish_index_change(
     config: &WriteWorkerConfig,
+    flushes: &mpsc::Sender<PendingFlush>,
     response: oneshot::Sender<vyrn_core::Result<()>>,
     result: std::result::Result<
-        std::result::Result<vyrn_core::Result<()>, StorageError>,
+        std::result::Result<IndexChangeOutcome, StorageError>,
         task::JoinError,
     >,
 ) {
     match result {
-        Ok(Ok(outcome)) => {
+        Ok(Ok((outcome, write_back, generation, root, len))) => {
             if let Err(error) = &outcome {
                 record_storage_error(&config.metrics, "index change", error);
+            }
+            /* A successful index change committed mutations the read handles'
+             * overlay copies have to learn, exactly like a batch's — so they
+             * travel the same ordered path, the flush queue. Classic mode
+             * skips this (the publication is empty) and keeps its existing
+             * behaviour: readers adopt the new root at the next commit.
+             * Queued BEFORE the client is answered, mirroring publish-then-
+             * answer everywhere else. Already durable — index changes take an
+             * immediate barrier — hence `lsn: None`. */
+            if outcome.is_ok() && !write_back.is_empty() {
+                config.in_flight.fetch_add(1, Ordering::AcqRel);
+                if flushes
+                    .send(PendingFlush {
+                        lsn: None,
+                        requests: Vec::new(),
+                        results: Vec::new(),
+                        answers: Vec::new(),
+                        published: Vec::new(),
+                        write_back,
+                        generation,
+                        root,
+                        len,
+                        queued: Instant::now(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    config.in_flight.fetch_sub(1, Ordering::AcqRel);
+                    let _ = response.send(Err(StorageError::Poisoned));
+                    return;
+                }
             }
             let _ = response.send(outcome);
         }
@@ -4411,6 +4595,7 @@ fn publish_commit(config: &FlushWorkerConfig, flush: PendingFlush) -> bool {
         results,
         answers,
         published,
+        write_back,
         generation,
         root,
         len,
@@ -4431,6 +4616,18 @@ fn publish_commit(config: &FlushWorkerConfig, flush: PendingFlush) -> bool {
         match reader.write() {
             Ok(mut reader) => {
                 if let Err(error) = reader.refresh(generation, root, len) {
+                    refresh_error = Some(error);
+                    break;
+                }
+                /* The write-back half of the publication, under the SAME
+                 * guard as the refresh so a read on this handle sees the
+                 * commit entirely or not at all. Root first, mutations
+                 * second, matters: the publication's absorb watermark may
+                 * evict overlay entries, which is only sound once the tree
+                 * this handle serves provably contains them. A failure here
+                 * is as fatal as a refresh failure — a handle that missed a
+                 * commit's mutations would lag the log forever. */
+                if let Err(error) = reader.publish_write_back(&write_back) {
                     refresh_error = Some(error);
                     break;
                 }
@@ -4974,6 +5171,36 @@ async fn send_frame(
         Ok(result) => Ok(result?),
         Err(_) => bail!(
             "peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"
+        ),
+    }
+}
+
+/// Buffers one frame in the codec without flushing, for pipelined bursts whose
+/// answers leave in one write.
+///
+/// Not free of I/O: once the codec's write buffer crosses its backpressure
+/// boundary, `feed` flushes before accepting more, which is what bounds the
+/// memory a burst of large responses can hold. That flush can wedge on a peer
+/// that stopped reading, so it wears the same timeout as [`send_frame`], for
+/// the same reason.
+async fn feed_frame(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    envelope: Envelope,
+) -> Result<()> {
+    match timeout(RESPONSE_WRITE_TIMEOUT, framed.feed(envelope)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => bail!(
+            "peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"
+        ),
+    }
+}
+
+/// Writes out everything [`feed_frame`] buffered, ending a pipelined burst.
+async fn flush_frames(framed: &mut Framed<BoxedTransport, VyrnCodec>) -> Result<()> {
+    match timeout(RESPONSE_WRITE_TIMEOUT, framed.flush()).await {
+        Ok(result) => Ok(result?),
+        Err(_) => bail!(
+            "peer stopped reading; response flush exceeded {RESPONSE_WRITE_TIMEOUT:?}"
         ),
     }
 }

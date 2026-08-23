@@ -279,9 +279,7 @@ fn a_batch_of_individually_legal_values_commits() {
     // size of the BATCH rather than of any value in it, so this overshoots by
     // roughly the per-entry framing.
     let operations: Vec<_> = (0..16u64)
-        .map(|index| {
-            BatchOperation::Put(index.to_be_bytes().to_vec(), vec![7; 1 << 20])
-        })
+        .map(|index| BatchOperation::Put(index.to_be_bytes().to_vec(), vec![7; 1 << 20]))
         .collect();
     let result = engine.write_batch(operations);
     assert!(

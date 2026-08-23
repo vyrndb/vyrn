@@ -116,7 +116,9 @@ fn a_checkpoint_that_fails_after_publishing_leaves_the_next_one_safe() {
             );
             // The next checkpoint targets generation 2 and must succeed without
             // touching the live generation 1 files.
-            engine.checkpoint().expect("second checkpoint after a failed one");
+            engine
+                .checkpoint()
+                .expect("second checkpoint after a failed one");
             assert_eq!(engine.stats().unwrap().checkpoint_generation, 2);
             engine.put(b"b".to_vec(), b"later".to_vec()).unwrap();
         }
@@ -149,7 +151,10 @@ fn a_failed_value_preparation_leaves_nothing_visible_or_logged() {
             BatchOperation::Put(b"ghost".to_vec(), b"uncommitted".to_vec()),
             BatchOperation::Put(b"seed".to_vec(), b"replaced".to_vec()),
         ]);
-        assert!(outcome.is_err(), "the injected preparation failure must surface");
+        assert!(
+            outcome.is_err(),
+            "the injected preparation failure must surface"
+        );
         assert_eq!(
             engine.get(b"ghost").unwrap(),
             None,
@@ -200,7 +205,10 @@ fn an_error_after_the_commit_reports_the_write_as_durable_and_stops_the_engine()
         "a post-commit failure must say the write is durable, got {error:?}"
     );
     assert!(
-        matches!(engine.put(b"other".to_vec(), b"x".to_vec()), Err(Error::Poisoned)),
+        matches!(
+            engine.put(b"other".to_vec(), b"x".to_vec()),
+            Err(Error::Poisoned)
+        ),
         "a poisoned engine must refuse further writes"
     );
     assert!(
@@ -254,7 +262,11 @@ fn buffered_async_records_are_drained_with_their_own_lsns_and_survive_a_sync() {
         assert_eq!(engine.sequence(), 3);
     }
     let engine = Engine::open(directory.path()).unwrap();
-    assert_eq!(engine.sequence(), 3, "every buffered record replays exactly once");
+    assert_eq!(
+        engine.sequence(),
+        3,
+        "every buffered record replays exactly once"
+    );
     assert_eq!(engine.get(b"k1").unwrap(), None);
     assert_eq!(engine.get(b"k2").unwrap(), Some(b"two".to_vec()));
     assert_eq!(engine.get(b"k3").unwrap(), Some(b"three".to_vec()));
@@ -276,16 +288,16 @@ fn a_flush_failure_mid_drain_poisons_rather_than_losing_records_quietly() {
     .unwrap();
     for (key, value) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
         engine
-            .write_batch_deferred(vec![BatchOperation::Put(
-                key.to_vec(),
-                value.to_vec(),
-            )])
+            .write_batch_deferred(vec![BatchOperation::Put(key.to_vec(), value.to_vec())])
             .unwrap();
     }
     engine.set_failure_injector(Some(FailureInjector::once(
         FailurePoint::BetweenBufferedAppends,
     )));
-    assert!(engine.sync().is_err(), "the injected flush failure must surface");
+    assert!(
+        engine.sync().is_err(),
+        "the injected flush failure must surface"
+    );
     assert!(
         matches!(engine.write_batch(vec![]), Err(Error::Poisoned)),
         "an engine that lost drained records must refuse further work"

@@ -163,16 +163,197 @@ so the value read never fires), removing an entry clone in `write_leaf_level`
 a commit into phases and report deterministic page counts; they are what found the
 real one.
 
-### Remaining: write amplification
+### Fixed: one write per commit instead of one per page, and a pre-state read
+that decodes nothing
 
-`apply`'s largest component is now `page_append` — **3.5 pages, 14 KiB written per
-128-byte durable write**, about 112× amplification, measured deterministically.
-Copy-on-write cannot amortise this the way an in-place engine does: PostgreSQL
+Three changes, measured on Windows (a host where syscalls and allocation are
+dearer than on the Linux host above, so the shares differ but the structure is
+the same). The instrument was a new split of the `tree` phase —
+`tree_decode` / `tree_encode` / `tree_append` / `tree_flush`, printed by
+`apply-profile` — which is what located each of these; it stays in
+`vyrn_core::profile` so the next regression in the copy-on-write path is
+attributable rather than one opaque number.
+
+**Page-append buffering.** `PageManager::append` wrote each copy-on-write page
+with its own positional write. The pure syscall time measured ~30 µs of a 58 µs
+tree phase at the 32-client batch shape — the largest single cost of a commit
+after its `fdatasync`, paid for pages that carry no barrier of their own and
+that nothing reads from the file before the commit publishes. Pages now
+accumulate in a buffer and reach the file as **one contiguous write per
+mutation**, flushed before the new root can escape, so every invariant about
+what is on disk when a root is publishable is unchanged. Paired runs, same
+session, 32 clients × 128 B against a 200,000-key tree:
+
+    tree            58.0 us -> 30.2 us per request
+    apply total     81.1 us -> 50.0 us per request
+    page writes     3.5 syscalls/request -> 1 write/batch
+
+A failed mutation now discards its buffered pages and their ids, so it leaves
+the page file exactly as it found it — before the buffer, a failed batch's
+pages were already on disk and stayed there as permanent orphans.
+
+**The pre-state read decoded whole leaves.** `collect_many` — the descent that
+reads each key's presence and revision before a batch applies — called
+`decode_leaf`, allocating a key `Vec` and a value `Vec` for every entry of
+every touched leaf to answer for a handful of keys, usually without wanting
+values at all. A single-key commit touches three leaves in pre-state (the key,
+its tombstone, the change log), which is ~600 allocations per commit for
+nothing. It now walks cells in place, the same shape as `find_in_leaf`'s
+documented fix. Paired runs, single-key commits:
+
+    prestate        34.6 us -> 7.0 us per request
+    page reads      32.0 -> 23.0 per request (deterministic)
+
+**`write_internal_level` cloned the whole level.** Chunking children into
+per-page vectors cloned every child's `min_key` even when a commit touched one
+child of a hundred-way level. It now records page boundaries as index ranges,
+exactly as `write_leaf_level` already did and for the reason its comment gives.
+Too small to isolate in a timing on this host; taken on the strength of the
+precedent.
+
+### Fixed (opt-in): write-back buffering removes the tree from the commit path
+
+The persistence-strategy change the section below has been predicting: with
+`EngineOptions::write_back_buffer` set, a commit's durability is its WAL record
+alone. The mutations land in an in-memory buffer that every read on the engine
+merges over the tree — tombstones, change-log records, and index entries are
+ordinary keys, so every layer inherits the merge — and the tree absorbs the
+whole buffer in one amortised `prepare_batch` when the buffer crosses its byte
+threshold and on every checkpoint. Recovery needed no new mechanism: a
+write-back record names a root that can never be adopted (`WRITE_BACK_ROOT`),
+so an open falls back to the redo-from-checkpoint path that has always covered
+pages that failed to survive; a kill without a checkpoint reconstructs the
+whole buffer from the log. Reverting that sentinel to the stale tree root makes
+the recovery tests fail with silent data loss, which is exactly the hazard it
+exists to close.
+
+Measured on the same Windows host, same probe, 200,000-key tree, 128 B values:
+
+    32-client batches   apply 20.5 us/request, of which 15.5 us is the shared
+                        fdatasync; engine CPU ~5 us/request against ~70 us at
+                        the start of this round (14x), pages 0.1/request
+    single-key commits  engine CPU ~16 us/request beside the fdatasync,
+                        against ~200 us at the start of this round (12x),
+                        pages 0.0/request between flushes
+
+A 600-step randomized model test drives a write-back engine and a classic
+engine through the identical workload across several threshold flushes and
+compares every read, scan, length, change-detection and change-log answer.
+
+The trade, stated plainly: reopening replays the WAL from the last checkpoint
+instead of adopting the newest root (bounded by checkpoint cadence); the commit
+that crosses the threshold pays the buffer's whole tree pass (bounded by the
+buffer size); and the buffer holds up to its size in memory. ~~Embedded use
+only for now~~ — the server learned the buffer in the round below and enables
+it with `--write-back-bytes`.
+
+### Fixed: the server's read handles learned the write-back buffer
+
+The queued follow-up from the round above, which is what lets `vyrn-server`
+turn write-back on. Every `ReadEngine` now carries its own copy of the buffer
+— an overlay fed one durable commit at a time — and every read on a handle
+merges it over the tree through the same shared implementation the engine
+itself uses (`overlay::merged_*`), so the two views cannot drift.
+
+The publication rides the machinery that already existed rather than adding
+any: the flush stage already took each reader's write lock per batch to
+refresh the root, so `PendingFlush` now carries the commit's raw mutations
+(`Engine::take_write_back_publish`, captured under the engine lock exactly
+like `last_published`) and the same loop applies them under the same guard —
+root first, then mutations, then any eviction the absorb watermark licenses.
+Values are `Arc`-shared between the engine's buffer and every reader's copy,
+so feeding N readers costs N map inserts per mutation and no value bytes.
+Ordering is the flush queue's: one writer, one publication point, commit
+order. Nothing is applied before the commit's `fdatasync`, so the
+durable-then-publish rule is unchanged.
+
+The absorb hand-off is watermark-based and per-entry, not clear-all, because
+the checkpoint task publishes concurrently with the flush stage: an eviction
+may only drop entries at or below the LSN the reader's tree provably contains,
+so a commit that reached a reader after a checkpoint absorbed — but before the
+checkpoint task's republish — survives it. The reader-parity model test drives
+exactly that interleaving, plus 500 mixed steps across many threshold absorbs,
+against a classic reader fed only refreshes; a read-your-write probe on every
+step is what catches an eviction running even three LSNs ahead (a sampled
+probe provably does not — the first version of the test passed that mutation).
+
+Two things fell out of building it:
+
+- **`drop_index` missed buffered entries** (pre-existing, embedded write-back
+  only): it enumerated the doomed index's entries with a raw tree scan, so
+  entries still in the buffer survived the drop, and recreating an index of
+  the same name resurrected them as stale lookup answers — first from the
+  buffer, then permanently once absorbed. Same defect in
+  `clear_index_entries`. Both now use the merged scan; mutation-verified.
+- **Index creates and drops now publish through the flush stage** (they
+  commit alone with an immediate barrier and used to answer directly), so a
+  new index's definition reaches the read handles without waiting for the
+  next unrelated commit. In classic mode their publication is empty and the
+  old behaviour is untouched.
+
+End-to-end coverage: `tests/correctness.rs` runs the shipped server with
+`VYRN_WRITE_BACK_BYTES=4096`, checks read-your-write on every one of 300
+writes, deletes, documents, index visibility, then kills the process and
+verifies the WAL alone brings everything back. Reverting the reader
+publication makes it fail at the third read.
+
+No served-path timings are quoted here on purpose: they need the Linux paired
+harness (`compare-builds-linux.sh`), and this host's numbers do not travel.
+The deterministic engine-side facts from the round above are what this change
+transports to the server: ~5 µs of engine CPU beside the shared fsync at the
+32-client shape and 0.1 pages per request, against 38.5 µs and 3.5 pages
+classic.
+
+### Fixed: point reads answered on the connection task
+
+A point read against a warm cache is about a microsecond of engine work, and
+the served path wrapped it in a bounded-channel send, two cross-thread
+wakeups, and a oneshot allocation — the reader-thread hop was most of a served
+Get that isn't network. `submit_get` now takes a shared `try_read` on a read
+handle and answers inline on the connection task. A shared read lock succeeds
+alongside anything but a publish — including a scan holding the same handle's
+guard on its worker thread, so point reads no longer wait behind scans at all
+— and when it does fail (a publish or refresh holds the handle exclusively),
+the request falls back to the queue path unchanged. Scans, multi-gets, and
+document reads stay on the worker threads with their chunking and deadline
+machinery; a cache-miss descent inline is a handful of positional page reads,
+which is bounded and small in a way a scan is not.
+
+### Fixed: the protocol pipelines
+
+The session loop was read-one, answer-one, flush-one: every request paid two
+socket syscalls and a full round trip, which is why a served read was ~190 µs
+around 1 µs of storage work. Two halves, both order-preserving:
+
+- **Server**: after answering a request, the session drains every further
+  request the read buffer already holds (a non-blocking poll, so a lockstep
+  client is served exactly as before), feeding responses into the codec's
+  write buffer; the flush happens once, when the burst is exhausted. The
+  codec's own backpressure boundary bounds what a burst of large responses
+  can hold in memory, and the wedged-peer write timeout wraps the feed and
+  the flush exactly as it wrapped `send`.
+- **Client**: `Client::pipeline` submits a batch of independent get/put/delete
+  operations in one write and collects their answers in order — one round
+  trip for the batch, per-operation results, and a refused operation consumes
+  its own slot without derailing the rest. Semantics are identical to issuing
+  the operations one at a time; the integration test pins that with a
+  put→get→delete→get chain on one key inside a single burst.
+
+The TypeScript SDK has not grown the pipeline API yet; the server side
+benefits any client that writes several frames before reading.
+
+### Remaining: write amplification (classic path)
+
+With write-back off, every 128-byte durable write still allocates and writes
+**3.5 pages, 14 KiB** — about 112× amplification, measured deterministically.
+The page-append buffering above removed the per-page syscalls, not the bytes:
+copy-on-write cannot amortise them the way an in-place engine does. PostgreSQL
 dirties one shared buffer and lets the checkpointer write it once for many
-commits, whereas every Vyrn commit must allocate and write a new leaf plus every
-internal page up to the root. It is also why a soak accumulates on-disk volume
-quickly. Reducing it is a change of persistence strategy, not a tuning exercise,
-and it is the reason concurrent durable writes still trail PostgreSQL.
+commits, whereas every classic Vyrn commit must allocate and write a new leaf
+plus every internal page up to the root. It is also why a soak accumulates
+on-disk volume quickly. Write-back buffering is that change of persistence
+strategy; the server's readers learned the buffer in the section above, so
+`--write-back-bytes` now carries it to the served path.
 
 ## Measured 2026-07-26 (WSL2, 32 cores, 15 GB RAM, ext4)
 

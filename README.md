@@ -224,6 +224,16 @@ CLI / Rust client
 
 The B+ tree is the primary runtime storage path: writes copy only the affected path and atomically publish a new root. Small fields remain inside leaf pages instead of consuming dedicated blobs. Checkpoints compact unreachable page generations. The core `write_batch` API groups multiple ordered mutations behind one page flush and one WAL flush. The server feeds it through a bounded single-writer queue that collects up to 64 writes over a default 200 µs window. Point reads and scans use positional I/O through the persistent tree and its bounded concurrent page cache rather than duplicating every live value in a server-side map. An `RwLock` permits concurrent readers while commits and checkpoints retain exclusive access.
 
+With `--write-back-bytes` set, a durable commit is its WAL record alone: mutations sit in a buffer that every read merges over the tree — the server's read handles included, fed one durable commit at a time through the flush stage — and the tree absorbs the whole buffer in one amortised pass at the threshold and on every checkpoint. This removes the copy-on-write page rewrite from the commit path (measured engine CPU beside the fsync: ~5 µs per request at batch shapes, against ~70 µs without; see docs/benchmarks.md). The trades, stated plainly: reopening replays the WAL from the last checkpoint instead of adopting the newest root, and up to the buffer's size in committed state lives only in memory between absorbs (always durable in the WAL). Refused on replicas.
+
+Point reads are answered on the connection task when the read handle is free — a shared `try_read`, so they no longer queue behind scans or pay two thread hand-offs — and fall back to the dedicated reader threads whenever a publish holds the handle. The wire protocol pipelines: the server drains every request already buffered before flushing, so responses to a burst leave in one write, and `Client::pipeline` submits a batch of independent operations in one round trip with per-operation answers.
+
+## Embedded or served
+
+`vyrn-core` is an ordinary Rust library, and linking it directly — the way SQLite is used — is a supported deployment, not a debugging trick. Everything in this README that does not involve a socket works identically: durable commits, transactions and snapshots, collections, indexes, backups, PITR. What changes is the cost of a request: an embedded point read against a warm cache measures about a microsecond, and a batched durable write costs tens of microseconds of engine work beside its shared fsync — there is no protocol, no scheduling, and no network between the call and the tree.
+
+The rule that decides between the modes: **one process owns a data directory at a time** (enforced by the data-directory lock). Embed the crate when the database belongs to one application and lives in its process; run `vyrnd` when several processes or machines need the same data, and connect over the network exactly as documented above. The storage format is the same, so a directory created embedded can be served later and vice versa — stop the one owner, start the other.
+
 ## Document collections
 
 Documents are JSON objects addressed by a collection name and a stable string ID. Declare a collection's equality indexes once; Vyrn then keeps the document and its index entries in one atomic commit.
