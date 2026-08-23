@@ -304,6 +304,62 @@ transports to the server: ~5 µs of engine CPU beside the shared fsync at the
 32-client shape and 0.1 pages per request, against 38.5 µs and 3.5 pages
 classic.
 
+### Fixed: reading a spilled value cost two syscalls and a checksum pass, every time
+
+Values over the 1 KiB inline limit live in the value log, and reading one
+back paid, per read: a `metadata` syscall (a bounds check against the file
+length), one or two `pread`s, a CRC pass over the value, and an allocation.
+Every store this engine is compared against answers a hot large-value read
+from an in-process cache with a memcpy. That difference is exactly the shape
+of the rows vyrn was losing: point reads and scans of 4 KiB and 64 KiB
+values, while 128 B rows — inline, never touching the log — were winning.
+
+Three changes, measured with criterion against a saved baseline in one
+session on this host (reads do not suffer the fsync noise that makes write
+timings untrustworthy here, and the baseline comparison is paired by
+construction):
+
+- **The per-read `metadata` syscall is a cached length.** It existed for a
+  real reason — several handles share one log file (the engine's plus one per
+  read handle), and only the writer sees its own appends — so the cache
+  refreshes from the file once when a reference points past it and is
+  monotonic from there. A reader pays one `metadata` per growth epoch it
+  discovers instead of one per read; a mutation that removed the refresh
+  makes the cross-handle test fail.
+- **Scans resolve a leaf's values in one batch.** `read_many` sorts a leaf's
+  spilled references, coalesces exactly-adjacent records into single
+  positioned reads (capped at 1 MiB per read), and validates each record
+  individually — the same framing, CRC, and reference-metadata checks as the
+  single-read path, pinned by a corruption test inside a coalesced run. Keys
+  written in order sit in the log in order, so a range scan's thousand
+  values are typically a handful of preads instead of a thousand.
+- **A byte-budgeted cache of validated values** (`VYRN_VALUE_CACHE_BYTES`,
+  default 64 MiB per handle, 0 disables): a hit is a map lookup and one
+  memcpy, skipping the syscall AND the checksum pass. Second-chance clock,
+  same replacement design as the page cache and for the same reason — one
+  cold sweep must not evict the hot set. Sound because the log is
+  append-only under a live handle and every generation change reopens it;
+  entries carry the reference's revision and length, so a forged reference
+  sharing an offset falls through to the file read, which refuses it.
+
+Paired numbers (criterion `--baseline`, this host):
+
+    point_get/4kib     12.1 us ->  2.7 us   (4.4x)
+    point_get/64kib    ~49 us  ->  5.3 us   (9.3x)
+    point_get/1mib     750 us  ->  341 us   (2.2x)
+    scan_1000/4kib     11.16 ms -> 442 us   (25x, hot; 3.35x of it is the
+                                             coalescing alone, measured before
+                                             the cache landed — that is the
+                                             cold-scan factor)
+    point_get/128b     unchanged (inline values never touch the log)
+    scan_1000/128b     +2.5% (the per-row placeholder branch; accepted, the
+                              row was already the winning one)
+
+The honest split: the coalescing and the length cache help every read, cold
+or hot; the value cache's full factors apply to working sets that fit its
+budget, which is also precisely the regime the comparison stores' own caches
+were serving in.
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and

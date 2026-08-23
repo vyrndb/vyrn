@@ -1,9 +1,11 @@
 use crate::{Error, Result, MAX_VALUE_SIZE};
 use crc32fast::Hasher;
 use std::{
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::{Arc, Mutex},
 };
 
 const MAGIC: &[u8; 4] = b"VVAL";
@@ -26,6 +28,113 @@ const FOOTER_LEN: usize = 8;
 /// than a tuned one.
 const COPY_RATHER_THAN_SEEK: usize = 32 * 1024;
 
+/// Upper bound on one coalesced read in [`ValueLog::read_many`], so a run of
+/// large adjacent values cannot demand an arbitrarily large buffer.
+const MAX_COALESCED_READ: usize = 1024 * 1024;
+
+/// Default byte budget for one handle's validated-value cache.
+///
+/// `VYRN_VALUE_CACHE_BYTES` overrides it; `0` disables the cache. The budget
+/// is PER HANDLE — the engine and every read handle keep their own — so a
+/// server with the default sixteen read handles can hold up to seventeen
+/// times this much in hot values. The default is deliberately far below what
+/// comparable embedded stores reserve (sled defaults to a gigabyte): the OS
+/// page cache already keeps the bytes warm, and what this cache removes is
+/// the per-read syscall and checksum pass, which do not need a large budget
+/// to disappear for a hot working set.
+const DEFAULT_VALUE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+fn cache_budget() -> usize {
+    std::env::var("VYRN_VALUE_CACHE_BYTES")
+        .ok()
+        .and_then(|bytes| bytes.parse().ok())
+        .unwrap_or(DEFAULT_VALUE_CACHE_BYTES)
+}
+
+/// A validated value, cached so a hot read pays neither the `pread` nor the
+/// checksum pass again.
+///
+/// The revision and length are kept so a hit can prove it answers for the
+/// same record the reference names — a reference forged or rotted to point
+/// mid-file must fall through to the file read, whose framing checks refuse
+/// it, rather than be answered by whatever true record shares the offset.
+struct CachedValue {
+    value: Arc<Vec<u8>>,
+    revision: u64,
+    /// Second-chance bit: a hit protects the entry for one eviction pass.
+    referenced: bool,
+}
+
+/// A byte-budgeted second-chance clock over validated values, keyed by record
+/// offset — the same replacement design as the page cache, for the same
+/// reason: a scan sweeping the log once must not evict the point-read hot set.
+struct ValueCache {
+    entries: HashMap<u64, CachedValue>,
+    clock: VecDeque<u64>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl ValueCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&mut self, offset: u64, revision: u64, len: u32) -> Option<Arc<Vec<u8>>> {
+        let entry = self.entries.get_mut(&offset)?;
+        if entry.revision != revision || entry.value.len() != len as usize {
+            return None;
+        }
+        entry.referenced = true;
+        Some(Arc::clone(&entry.value))
+    }
+
+    fn insert(&mut self, offset: u64, revision: u64, value: Arc<Vec<u8>>) {
+        // A value that would occupy a large fraction of the budget evicts the
+        // whole hot set to cache one thing; it stays uncached and keeps
+        // paying the file read, which at that size is bandwidth-bound anyway.
+        if self.budget == 0 || value.len() > self.budget / 8 {
+            return;
+        }
+        while self.bytes + value.len() > self.budget {
+            let Some(victim) = self.clock.pop_front() else {
+                break;
+            };
+            match self.entries.get_mut(&victim) {
+                Some(entry) if entry.referenced => {
+                    entry.referenced = false;
+                    self.clock.push_back(victim);
+                }
+                Some(_) => {
+                    let removed = self.entries.remove(&victim).expect("checked above");
+                    self.bytes -= removed.value.len();
+                }
+                // Already replaced; its clock slot is stale.
+                None => {}
+            }
+        }
+        let len = value.len();
+        if let Some(previous) = self.entries.insert(
+            offset,
+            CachedValue {
+                value,
+                revision,
+                referenced: false,
+            },
+        ) {
+            self.bytes -= previous.value.len();
+        } else {
+            self.clock.push_back(offset);
+        }
+        self.bytes += len;
+    }
+}
+
 #[cfg(test)]
 pub(crate) const fn record_overhead() -> usize {
     HEADER_LEN + FOOTER_LEN
@@ -45,6 +154,29 @@ pub(crate) struct ValueLog {
     /// Values below the inline limit never reach this log, so most commits leave
     /// it untouched and must not pay for an `fsync` of an unchanged file.
     dirty: bool,
+    /// The file length as far as this handle knows, so a read's bounds check
+    /// does not cost a `metadata` syscall — which it used to pay on EVERY
+    /// read, doubling the syscalls of every value-log hit.
+    ///
+    /// "As far as this handle knows" is load-bearing: several handles share
+    /// one file (the engine's, plus one per read handle), and only the
+    /// engine's sees its own appends. The file is append-only while open —
+    /// the sole truncation is tail repair inside `open`, before any sharing —
+    /// so this only ever needs to move FORWARD: a read past the cached length
+    /// refreshes it from the file once and re-checks, and a reference is only
+    /// refused as out of bounds against the refreshed answer. A reader
+    /// therefore pays one `metadata` per growth epoch it discovers instead of
+    /// one per read. Monotonic under `fetch_max`, and relaxed ordering is
+    /// enough: the value is a bounds hint, never a synchronization point —
+    /// the tree only hands out a reference after its record is fully written.
+    len: std::sync::atomic::AtomicU64,
+    /// Validated values by record offset, so a hot read costs a map lookup
+    /// and one memcpy instead of a syscall plus a checksum pass. Sound
+    /// because the log is append-only while open: an offset's bytes never
+    /// change under a live handle, so a validated value stays true for the
+    /// handle's lifetime. Behind its own mutex — reads take `&self` and run
+    /// concurrently under shared locks above.
+    cache: Mutex<ValueCache>,
 }
 
 impl ValueLog {
@@ -56,8 +188,52 @@ impl ValueLog {
             .write(true)
             .open(path)?;
         recover_tail(&mut file)?;
-        file.seek(SeekFrom::End(0))?;
-        Ok(Self { file, dirty: false })
+        let len = file.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            file,
+            dirty: false,
+            len: std::sync::atomic::AtomicU64::new(len),
+            cache: Mutex::new(ValueCache::new(cache_budget())),
+        })
+    }
+
+    /// Answers from the cache, or `None` on a miss (a poisoned cache counts
+    /// as a miss — losing the cache must never lose the read).
+    fn cached(&self, reference: &ValueRef) -> Option<Vec<u8>> {
+        let mut cache = self.cache.lock().ok()?;
+        cache
+            .get(reference.offset, reference.revision, reference.len)
+            .map(|value| (*value).clone())
+    }
+
+    /// Remembers a just-validated value for future hits.
+    fn remember(&self, reference: &ValueRef, value: &[u8]) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(
+                reference.offset,
+                reference.revision,
+                Arc::new(value.to_vec()),
+            );
+        }
+    }
+
+    /// Checks that `[offset, offset + total_len)` lies inside the file,
+    /// refreshing the cached length once if it appears not to — the reference
+    /// may simply be newer than this handle's last look at the file.
+    fn check_bounds(&self, offset: u64, total_len: usize) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let Some(end) = offset.checked_add(total_len as u64) else {
+            return Err(corrupt_value(offset, "value reference is out of bounds"));
+        };
+        if end <= self.len.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let fresh = self.file.metadata()?.len();
+        self.len.fetch_max(fresh, Ordering::Relaxed);
+        if end <= fresh {
+            return Ok(());
+        }
+        Err(corrupt_value(offset, "value reference is out of bounds"))
     }
 
     /// Appends `value` as one record and returns where it landed.
@@ -95,6 +271,8 @@ impl ValueLog {
         debug_assert_eq!(record.len(), total_len);
         self.file.write_all(&record)?;
         self.dirty = true;
+        self.len
+            .fetch_max(offset + total_len as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(ValueRef {
             offset,
             len,
@@ -103,21 +281,14 @@ impl ValueLog {
     }
 
     pub(crate) fn read(&self, reference: &ValueRef) -> Result<Vec<u8>> {
-        let file_len = self.file.metadata()?.len();
+        if let Some(value) = self.cached(reference) {
+            return Ok(value);
+        }
         let total_len = HEADER_LEN
             .checked_add(reference.len as usize)
             .and_then(|length| length.checked_add(FOOTER_LEN))
             .ok_or_else(|| corrupt_value(reference.offset, "value record length overflow"))?;
-        if reference
-            .offset
-            .checked_add(total_len as u64)
-            .is_none_or(|end| end > file_len)
-        {
-            return Err(corrupt_value(
-                reference.offset,
-                "value reference is out of bounds",
-            ));
-        }
+        self.check_bounds(reference.offset, total_len)?;
         // Two ways to get the value out, chosen by which cost dominates.
         //
         // The whole framed record used to be read into one buffer and the value
@@ -176,7 +347,111 @@ impl ValueLog {
                 "value reference metadata mismatch",
             ));
         }
+        self.remember(reference, &value);
         Ok(value)
+    }
+
+    /// Reads many values, coalescing physically adjacent records into single
+    /// positioned reads.
+    ///
+    /// A scan resolves its rows' values in key order, and keys written in
+    /// order sit in this log in that same order — so a thousand-row scan of
+    /// spilled values is typically a handful of contiguous byte ranges, which
+    /// this reads with a handful of syscalls instead of one (or two) per row.
+    /// Records that do not abut anything are read exactly as [`ValueLog::read`]
+    /// would have read them, so nothing is lost on a scattered batch.
+    ///
+    /// Verification is per record and identical to the single-read path: the
+    /// same framing, the same CRC over the same bytes, the same reference
+    /// metadata check. Coalescing changes how bytes reach memory, never what
+    /// is accepted.
+    pub(crate) fn read_many(&self, references: &[ValueRef]) -> Result<Vec<Vec<u8>>> {
+        if references.len() < 2 {
+            return references.iter().map(|r| self.read(r)).collect();
+        }
+        let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(references.len());
+        results.resize_with(references.len(), || None);
+        // The cache first; only the misses go to the file.
+        let mut order: Vec<usize> = Vec::with_capacity(references.len());
+        for (slot, reference) in references.iter().enumerate() {
+            match self.cached(reference) {
+                Some(value) => results[slot] = Some(value),
+                None => order.push(slot),
+            }
+        }
+        // Physical order over the misses, remembering each one's output slot.
+        order.sort_unstable_by_key(|&index| references[index].offset);
+        let mut run: Vec<usize> = Vec::new();
+        let mut run_bytes = 0usize;
+        let mut run_end = 0u64;
+        for &slot in &order {
+            let reference = &references[slot];
+            let total = HEADER_LEN
+                .checked_add(reference.len as usize)
+                .and_then(|length| length.checked_add(FOOTER_LEN))
+                .ok_or_else(|| corrupt_value(reference.offset, "value record length overflow"))?;
+            // A run extends only through EXACT adjacency: a gap would mean
+            // reading bytes no reference asked for, and an overlap would mean
+            // the references disagree about the file — both are served
+            // one-by-one, where each read validates on its own terms.
+            let extends = !run.is_empty()
+                && reference.offset == run_end
+                && run_bytes + total <= MAX_COALESCED_READ;
+            if !extends && !run.is_empty() {
+                self.read_run(references, &run, &mut results)?;
+                run.clear();
+                run_bytes = 0;
+            }
+            run.push(slot);
+            run_bytes += total;
+            run_end = reference.offset + total as u64;
+        }
+        if !run.is_empty() {
+            self.read_run(references, &run, &mut results)?;
+        }
+        Ok(results
+            .into_iter()
+            .map(|value| value.expect("every reference lands in exactly one run"))
+            .collect())
+    }
+
+    /// Reads one physically contiguous run of records and fills each one's
+    /// output slot. A run of one falls back to [`ValueLog::read`], keeping
+    /// that path's copy-versus-seek choice for lone large values.
+    fn read_run(
+        &self,
+        references: &[ValueRef],
+        slots: &[usize],
+        results: &mut [Option<Vec<u8>>],
+    ) -> Result<()> {
+        if let [slot] = slots {
+            results[*slot] = Some(self.read(&references[*slot])?);
+            return Ok(());
+        }
+        let start = references[slots[0]].offset;
+        let mut run_len = 0usize;
+        for &slot in slots {
+            run_len += HEADER_LEN + references[slot].len as usize + FOOTER_LEN;
+        }
+        self.check_bounds(start, run_len)?;
+        let mut buffer = vec![0; run_len];
+        read_exact_at(&self.file, &mut buffer, start)?;
+        let mut cursor = 0usize;
+        for &slot in slots {
+            let reference = &references[slot];
+            let record_len = HEADER_LEN + reference.len as usize + FOOTER_LEN;
+            let record = &buffer[cursor..cursor + record_len];
+            let offset = start + cursor as u64;
+            validate_record(record, offset)?;
+            if read_u64(record, 5) != reference.revision || read_u32(record, 13) != reference.len {
+                return Err(corrupt_value(offset, "value reference metadata mismatch"));
+            }
+            let value = record[HEADER_LEN..record_len - FOOTER_LEN].to_vec();
+            self.remember(reference, &value);
+            results[slot] = Some(value);
+            cursor += record_len;
+        }
+        Ok(())
     }
 
     /// Flushes appended values, skipping the barrier when nothing was written.
@@ -392,6 +667,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `read_many` must return exactly what `read` returns, whatever the
+    /// physical layout: one contiguous run, runs split by gaps, references
+    /// out of offset order, and a duplicated reference. The answers come back
+    /// in ARGUMENT order, not file order — that is the contract the scan
+    /// relies on when it fills its rows.
+    #[test]
+    fn read_many_matches_read_for_every_layout() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("values.vlog");
+        let mut log = ValueLog::open(&path).unwrap();
+        let mut references = Vec::new();
+        for index in 0..20u64 {
+            // Mixed sizes so runs cross the copy-versus-seek threshold too.
+            let size = if index % 5 == 4 {
+                COPY_RATHER_THAN_SEEK + 3
+            } else {
+                512 + index as usize
+            };
+            let value: Vec<u8> = (0..size).map(|byte| (byte as u64 + index) as u8).collect();
+            references.push((log.append(&value, index + 1).unwrap(), value));
+        }
+        log.sync().unwrap();
+        let layouts: Vec<Vec<usize>> = vec![
+            (0..20).collect(),                        // one contiguous run
+            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18],  // gaps: no two adjacent
+            vec![7, 3, 11, 3, 0, 19, 12],             // unsorted, one duplicate
+            vec![5],                                  // single
+        ];
+        for layout in layouts {
+            let batch: Vec<ValueRef> = layout
+                .iter()
+                .map(|&index| references[index].0.clone())
+                .collect();
+            // Twice: the first pass reads the file (and populates the cache),
+            // the second answers from the cache. Both must return the same
+            // bytes in the same argument order.
+            for pass in ["cold", "warm"] {
+                let values = log.read_many(&batch).unwrap();
+                assert_eq!(values.len(), layout.len());
+                for (position, &index) in layout.iter().enumerate() {
+                    assert_eq!(
+                        values[position], references[index].1,
+                        "{pass} read_many returned the wrong value at position \
+                         {position} for reference {index}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A flip inside a coalesced run must be reported as corruption, exactly
+    /// as the single-record path reports it — coalescing changes how bytes
+    /// reach memory, never what is accepted.
+    #[test]
+    fn a_flip_inside_a_coalesced_run_is_detected() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("values.vlog");
+        let mut references = Vec::new();
+        {
+            let mut log = ValueLog::open(&path).unwrap();
+            for index in 0..3u64 {
+                references.push(log.append(&vec![7; 4096], index + 1).unwrap());
+            }
+            log.sync().unwrap();
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        // The middle record's value, so the flip sits inside the run.
+        let middle = references[1].offset as usize + HEADER_LEN + 100;
+        bytes[middle] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+        // Opening validates the log too; read through the reference either way.
+        let detected = match ValueLog::open(&path) {
+            Err(_) => true,
+            Ok(log) => log.read_many(&references).is_err(),
+        };
+        assert!(
+            detected,
+            "a flipped byte inside a coalesced run was returned as data"
+        );
+    }
+
+    /// A handle must serve values appended through ANOTHER handle after it
+    /// opened. The engine and every read handle share one file this way, and
+    /// the cached length exists to remove a per-read `metadata` syscall — it
+    /// must refresh when a reference points past it, or every reader would
+    /// refuse everything committed after it opened.
+    #[test]
+    fn a_reader_handle_sees_values_appended_after_it_opened() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("values.vlog");
+        let mut writer = ValueLog::open(&path).unwrap();
+        writer.append(&vec![1; 2048], 1).unwrap();
+        writer.sync().unwrap();
+        let reader = ValueLog::open(&path).unwrap();
+        // Appended AFTER the reader opened, so the reader's cached length
+        // does not cover it.
+        let late = writer.append(&vec![9; 2048], 2).unwrap();
+        writer.sync().unwrap();
+        assert_eq!(
+            reader.read(&late).unwrap(),
+            vec![9; 2048],
+            "a reference newer than the handle's cached length must be served"
+        );
+        // And a genuinely out-of-bounds reference is still refused.
+        let bogus = ValueRef {
+            offset: late.offset + 1_000_000,
+            len: 16,
+            revision: 3,
+        };
+        assert!(reader.read(&bogus).is_err());
     }
 
     /// Both read paths must return the value that was written.

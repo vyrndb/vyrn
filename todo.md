@@ -126,6 +126,18 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       tests green ×2, clippy `-D warnings` clean. Bytes-level write amplification (14 KiB per 128 B
       write) still stands — that one is the persistence-strategy change, still queued.
 
+- [x] **PERF round 5 (value-log reads)** — the rows vyrn lost to sled/redb were exactly the
+      spilled-value rows (>1 KiB inline limit); every such read paid a `metadata` syscall, 1–2
+      preads, and a CRC pass. Three fixes, criterion-paired on this host: cached file length with
+      cross-handle refresh-on-overrun (mutation-verified — the metadata call WAS the multi-handle
+      coherence, readers must still see the writer's appends), per-leaf `read_many` coalescing of
+      exactly-adjacent records (validation per record unchanged, corruption-in-run test), and a
+      64 MiB/handle second-chance cache of validated values keyed by offset+revision+len
+      (`VYRN_VALUE_CACHE_BYTES`, 0 disables; sound because the log is append-only under a live
+      handle and generation changes reopen it). point_get 4 KiB 4.4×, 64 KiB 9.3×, 1 MiB 2.2×,
+      scan_1000 4 KiB 25× hot / 3.35× cold; 128 B rows untouched (never in the log);
+      scan_1000/128b −2.5% accepted. Full write-up in docs/benchmarks.md.
+
 ## ⬜ Queued
 
 - [ ] **Measure PERF round 4 on the Linux host, paired.** Three separate pairings with

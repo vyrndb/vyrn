@@ -1508,6 +1508,16 @@ impl PageTree {
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => {
+                // Spilled values are resolved for the whole leaf at once
+                // rather than one `values.read` per row: a scan visits
+                // entries in key order, keys written in order sit in the
+                // value log in that order, so a leaf's worth of values is
+                // typically one contiguous byte range `read_many` fetches
+                // with one syscall instead of dozens. Rows get a placeholder
+                // now and their bytes after the batch read; `pending` holds
+                // absolute indices into `rows`, so this stays correct across
+                // the leaves of one scan.
+                let mut pending: Vec<(usize, ValueRef)> = Vec::new();
                 for entry in self.decode_leaf(&page, page_id)? {
                     if start.is_some_and(|start| entry.key.as_slice() < start) {
                         continue;
@@ -1528,11 +1538,25 @@ impl PageTree {
                     let revision = entry.revision;
                     let value = match entry.value {
                         EntryValue::Inline(value) => value.into_vec(),
-                        EntryValue::External(reference) => self.values.read(&reference)?,
+                        EntryValue::External(reference) => {
+                            pending.push((rows.len(), reference));
+                            Vec::new()
+                        }
                     };
                     rows.push((entry.key.into_vec(), value, revision));
                     if rows.len() == limit {
                         break;
+                    }
+                }
+                if !pending.is_empty() {
+                    let references: Vec<ValueRef> = pending
+                        .iter()
+                        .map(|(_, reference)| reference.clone())
+                        .collect();
+                    for ((slot, _), value) in
+                        pending.iter().zip(self.values.read_many(&references)?)
+                    {
+                        rows[*slot].1 = value;
                     }
                 }
             }
