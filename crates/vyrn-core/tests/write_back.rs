@@ -107,6 +107,22 @@ fn a_write_back_engine_answers_identically_to_a_classic_engine() {
                 buffered.scan(Some(&start), None, limit).unwrap(),
                 "scan diverged at step {step}"
             );
+            // The visitor scan must see the same rows as the copying scan,
+            // on both engines: classic exercises the borrowed-slice walk,
+            // buffered exercises the merge fallback.
+            for engine in [&classic, &buffered] {
+                let mut visited = Vec::new();
+                engine
+                    .scan_each(Some(&start), None, limit, &mut |key, value| {
+                        visited.push((key.to_vec(), value.to_vec()));
+                    })
+                    .unwrap();
+                assert_eq!(
+                    visited,
+                    engine.scan(Some(&start), None, limit).unwrap(),
+                    "scan_each diverged from scan at step {step}"
+                );
+            }
             // The zero-copy scan must return the same rows as the copying
             // one, on both engines, buffered and absorbed state alike.
             for engine in [&classic, &buffered] {
@@ -115,7 +131,7 @@ fn a_write_back_engine_answers_identically_to_a_classic_engine() {
                         .scan_shared(Some(&start), None, limit)
                         .unwrap()
                         .into_iter()
-                        .map(|(key, value)| (key, value.to_vec()))
+                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
                         .collect::<Vec<_>>(),
                     engine.scan(Some(&start), None, limit).unwrap(),
                     "scan_shared diverged from scan at step {step}"
@@ -397,7 +413,7 @@ fn a_published_read_handle_answers_identically_to_a_classic_one() {
                     .scan_shared(Some(&start), None, limit)
                     .unwrap()
                     .into_iter()
-                    .map(|(key, value)| (key, value.to_vec()))
+                    .map(|(key, value)| (key.to_vec(), value.to_vec()))
                     .collect::<Vec<_>>(),
                 buffered_reader.scan(Some(&start), None, limit).unwrap(),
                 "reader scan_shared diverged from scan at step {step}"

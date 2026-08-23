@@ -147,12 +147,21 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       self-initialising rule untouched). Standalone 3-engine harness in `../vyrn-compare`
       (sled + redb, zero-copy APIs all around, sled flushed per put in its durable row): vyrn #1
       on point_get 128 B, both scans, durable_put 128 B/4 KiB. docs/benchmarks.md has the table.
-- [ ] **The four contested benchmark rows.** point_get 4 KiB/64 KiB lose to redb's mmap guards:
-      the levers are a per-page cell-offset index (leaf lookups binary-search instead of walking
-      ~40 variable-length cells) and the page cache's per-level mutex. batch_put 128 B loses to
-      redb ~1.2x: per-op allocation diet on the write-back batch path (change-record staging and
-      WAL encode each clone every value). durable_put 64 KiB trails flushed sled ~1.15x,
-      consistent across runs but inside this host's fsync noise; measure on Linux before chasing.
+- [x] **PERF round 7 (scan floor)** — scan rows stopped allocating: `scan_shared` rows carry
+      shared keys AND values (the per-row key `Vec` was a third of a 128 B row's cost), the scan
+      walks leaf cells in place instead of decoding whole leaves, and `scan_each` (generic
+      visitor, borrowed slices, nothing built) is the new fastest range read — all three
+      equivalence-tested against `scan` in the model suite, merge fallback covered by the
+      buffered engine. scan_1000 4 KiB 9.6–9.7M rows/s (#1, 2.3× redb), 128 B ~9.9M (#1 by a
+      nose, trading ±5% with redb's guards run to run).
+- [ ] **The remaining contested rows share one fix: slot-directory pages.** The ~100 ns/row scan
+      floor and the point_get 4 KiB/64 KiB losses to redb's mmap guards are both the per-cell
+      parse of variable-length cells: a page format with a fixed-width cell-offset directory
+      gives leaf lookups binary search and scans branchless emission. Format-version bump —
+      design it, don't bolt it on. Also still open: batch_put vs redb ~1.2x (per-op allocation
+      diet: change-record staging and WAL encode each clone every value), durable_put 64 KiB vs
+      flushed sled ~1.15x (consistent but fsync-noise adjacent; confirm on Linux first), and the
+      page cache's per-level mutex on the descent.
 
 ## ⬜ Queued
 

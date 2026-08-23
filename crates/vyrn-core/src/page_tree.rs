@@ -70,8 +70,9 @@ fn cache_pages() -> usize {
 
 type Page = [u8; PAGE_SIZE];
 type VersionedRow = (Vec<u8>, Vec<u8>, u64);
-/// A scan row whose value has not been copied out of its backing storage.
-pub(crate) type SharedRow = (Vec<u8>, SharedTreeValue, u64);
+/// A scan row copied out of nothing: its key and its value both still live
+/// in their backing storage.
+pub(crate) type SharedRow = (Bytes, SharedTreeValue, u64);
 /// A key's stored value and the revision that wrote it, absent when the key is gone.
 type RevisionedValue = Option<(Vec<u8>, u64)>;
 /// A found key's revision and its value, where the value is present only when
@@ -1400,7 +1401,7 @@ impl PageTree {
         Ok(self
             .scan_shared_with_revisions(start, end, limit, excluded_prefix)?
             .into_iter()
-            .map(|(key, value, revision)| (key, value.into_vec(), revision))
+            .map(|(key, value, revision)| (key.into_vec(), value.into_vec(), revision))
             .collect())
     }
 
@@ -1573,6 +1574,215 @@ impl PageTree {
         }
     }
 
+    /// The visitor scan: every row is handed to `visit` as two borrowed
+    /// slices and NOTHING is built — no row structs, no reference counts, no
+    /// vector. This is the fastest way through a range this tree has; the
+    /// materialising scans exist for callers that need the rows to outlive
+    /// the walk.
+    ///
+    /// Rows are visited in key order. A leaf whose range holds spilled values
+    /// buffers from the first one onward so the batch value-log read is kept
+    /// (one syscall per contiguous run, exactly as the materialising scan
+    /// does), then emits the buffered tail in order — the all-inline leaf,
+    /// which is every leaf of a small-value workload, never buffers at all.
+    pub(crate) fn scan_visit<F: FnMut(&[u8], &[u8])>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+        visit: &mut F,
+    ) -> Result<()> {
+        if self.root == 0 || limit == 0 {
+            return Ok(());
+        }
+        let mut emitted = 0usize;
+        self.scan_visit_node(self.root, start, end, limit, excluded_prefix, &mut emitted, visit, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_visit_node<F: FnMut(&[u8], &[u8])>(
+        &self,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+        emitted: &mut usize,
+        visit: &mut F,
+        depth: usize,
+    ) -> Result<()> {
+        if depth >= MAX_TREE_DEPTH {
+            return Err(excessive_depth(page_id));
+        }
+        if *emitted >= limit {
+            return Ok(());
+        }
+        let page = self.pages.read(page_id)?;
+        match page[5] {
+            LEAF => {
+                let leaf: &Page = &page;
+                let count = read_u32(leaf, 20) as usize;
+                if count > MAX_LEAF_ENTRIES {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: format!(
+                            "leaf claims {count} entries but a page holds at most \
+                             {MAX_LEAF_ENTRIES}"
+                        ),
+                    });
+                }
+                /* Rows owed after the first spilled value in range: emitting
+                 * eagerly past it would answer out of key order once its
+                 * bytes arrive. `None` until then, so the all-inline walk
+                 * touches no heap at all. Each entry is (key, value): the
+                 * key by page range or blob, the value by page range or
+                 * value-log reference. */
+                enum Src {
+                    Page { offset: usize, len: usize },
+                    Blob(Vec<u8>),
+                }
+                let mut deferred: Option<Vec<(Src, std::result::Result<Src, ValueRef>)>> = None;
+                let mut offset = HEADER_SIZE;
+                for _ in 0..count {
+                    require_page(offset, LEAF_CELL_HEADER, page_id)?;
+                    let flags = leaf[offset];
+                    let key_len = read_u32(leaf, offset + 1) as usize;
+                    let value_len = read_u32(leaf, offset + 5) as usize;
+                    if key_len == 0
+                        || key_len > MAX_STORED_KEY_SIZE
+                        || value_len > MAX_VALUE_SIZE
+                        || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+                    {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    let key_page = read_u64(leaf, offset + 9);
+                    let value_offset = read_u64(leaf, offset + 17);
+                    let revision = read_u64(leaf, offset + 25);
+                    offset += LEAF_CELL_HEADER;
+                    let external_key = flags & EXTERNAL_KEY != 0;
+                    let blob_key = if external_key {
+                        Some(self.read_blob(key_page, key_len)?)
+                    } else {
+                        require_page(offset, key_len, page_id)?;
+                        None
+                    };
+                    let key_start = offset;
+                    if !external_key {
+                        offset += key_len;
+                    }
+                    let value_external = flags & EXTERNAL_VALUE != 0;
+                    if !value_external {
+                        require_page(offset, value_len, page_id)?;
+                    }
+                    let value_start = offset;
+                    if !value_external {
+                        offset += value_len;
+                    }
+                    let cell_key: &[u8] = match &blob_key {
+                        Some(key) => key,
+                        None => &leaf[key_start..key_start + key_len],
+                    };
+                    if start.is_some_and(|start| cell_key < start) {
+                        continue;
+                    }
+                    if end.is_some_and(|end| cell_key >= end) {
+                        break;
+                    }
+                    if excluded_prefix.is_some_and(|prefix| cell_key.starts_with(prefix)) {
+                        continue;
+                    }
+                    // Still all-inline: hand the slices out right here.
+                    // Otherwise — first spilled value, or anything after
+                    // one — the row is owed until the batch read below.
+                    if deferred.is_none() && !value_external {
+                        visit(cell_key, &leaf[value_start..value_start + value_len]);
+                    } else {
+                        let key_src = match blob_key {
+                            Some(key) => Src::Blob(key),
+                            None => Src::Page {
+                                offset: key_start,
+                                len: key_len,
+                            },
+                        };
+                        let value_src = if value_external {
+                            Err(ValueRef {
+                                offset: value_offset,
+                                len: value_len as u32,
+                                revision,
+                            })
+                        } else {
+                            Ok(Src::Page {
+                                offset: value_start,
+                                len: value_len,
+                            })
+                        };
+                        deferred
+                            .get_or_insert_with(Vec::new)
+                            .push((key_src, value_src));
+                    }
+                    *emitted += 1;
+                    if *emitted == limit {
+                        break;
+                    }
+                }
+                if let Some(deferred) = deferred {
+                    let references: Vec<ValueRef> = deferred
+                        .iter()
+                        .filter_map(|(_, value)| value.as_ref().err().cloned())
+                        .collect();
+                    let mut resolved = self.values.read_many(&references)?.into_iter();
+                    for (key, value) in &deferred {
+                        let key: &[u8] = match key {
+                            Src::Page { offset, len } => &leaf[*offset..*offset + *len],
+                            Src::Blob(bytes) => bytes,
+                        };
+                        match value {
+                            Ok(Src::Page { offset, len }) => {
+                                visit(key, &leaf[*offset..*offset + *len])
+                            }
+                            Ok(Src::Blob(_)) => unreachable!("values are never blobs"),
+                            Err(_) => {
+                                let value =
+                                    resolved.next().expect("one resolved value per reference");
+                                visit(key, &value);
+                            }
+                        }
+                    }
+                }
+            }
+            INTERNAL => {
+                let children = self.decode_internal(&page, page_id)?;
+                for (index, child) in children.iter().enumerate() {
+                    let child_end = children.get(index + 1).map(|next| next.min_key.as_slice());
+                    if start.is_some_and(|start| child_end.is_some_and(|end| end <= start))
+                        || end.is_some_and(|end| child.min_key.as_slice() >= end)
+                    {
+                        continue;
+                    }
+                    self.scan_visit_node(
+                        child.page_id,
+                        start,
+                        end,
+                        limit,
+                        excluded_prefix,
+                        emitted,
+                        visit,
+                        depth + 1,
+                    )?;
+                    if *emitted >= limit {
+                        break;
+                    }
+                }
+            }
+            page_type => return Err(unexpected_type(page_id, page_type)),
+        }
+        Ok(())
+    }
+
     /// One argument past clippy's comfort: the trailing `depth` is the descent
     /// bound every walker carries, and folding the scan's four filters into a
     /// struct to shave it would obscure a signature that mirrors its callers.
@@ -1596,44 +1806,106 @@ impl PageTree {
         let page = self.pages.read(page_id)?;
         match page[5] {
             LEAF => {
-                // Spilled values are resolved for the whole leaf at once
-                // rather than one `values.read` per row: a scan visits
-                // entries in key order, keys written in order sit in the
-                // value log in that order, so a leaf's worth of values is
-                // typically one contiguous byte range `read_many` fetches
-                // with one syscall instead of dozens. Rows get a placeholder
-                // now and their bytes after the batch read; `pending` holds
-                // absolute indices into `rows`, so this stays correct across
-                // the leaves of one scan.
+                /* Cells are walked IN PLACE, the same parse as `find_in_leaf`,
+                 * and a row is two reference-count bumps: its key and its
+                 * inline value are slices of this page, kept alive by the
+                 * `Arc`. This loop used to decode the whole leaf into owned
+                 * entries and then copy every emitted key into a fresh `Vec`
+                 * — at 128 B rows the key allocation alone was a third of the
+                 * per-row cost of a scan.
+                 *
+                 * Spilled values are still resolved for the whole leaf at
+                 * once: a scan visits entries in key order, keys written in
+                 * order sit in the value log in that order, so a leaf's worth
+                 * of values is typically one contiguous byte range
+                 * `read_many` fetches with one syscall instead of dozens.
+                 * Rows get a placeholder now and their bytes after the batch
+                 * read; `pending` holds absolute indices into `rows`, so this
+                 * stays correct across the leaves of one scan. */
+                let leaf: &Page = &page;
+                let count = read_u32(leaf, 20) as usize;
+                if count > MAX_LEAF_ENTRIES {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: format!(
+                            "leaf claims {count} entries but a page holds at most \
+                             {MAX_LEAF_ENTRIES}"
+                        ),
+                    });
+                }
                 let mut pending: Vec<(usize, ValueRef)> = Vec::new();
-                for entry in self.decode_leaf(&page, page_id)? {
-                    if start.is_some_and(|start| entry.key.as_slice() < start) {
+                let mut offset = HEADER_SIZE;
+                for _ in 0..count {
+                    require_page(offset, LEAF_CELL_HEADER, page_id)?;
+                    let flags = leaf[offset];
+                    let key_len = read_u32(leaf, offset + 1) as usize;
+                    let value_len = read_u32(leaf, offset + 5) as usize;
+                    if key_len == 0
+                        || key_len > MAX_STORED_KEY_SIZE
+                        || value_len > MAX_VALUE_SIZE
+                        || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+                    {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    let key_page = read_u64(leaf, offset + 9);
+                    let value_offset = read_u64(leaf, offset + 17);
+                    let revision = read_u64(leaf, offset + 25);
+                    offset += LEAF_CELL_HEADER;
+                    let external_key = flags & EXTERNAL_KEY != 0;
+                    let blob_key = if external_key {
+                        Some(self.read_blob(key_page, key_len)?)
+                    } else {
+                        require_page(offset, key_len, page_id)?;
+                        None
+                    };
+                    let key_start = offset;
+                    if !external_key {
+                        offset += key_len;
+                    }
+                    let value_external = flags & EXTERNAL_VALUE != 0;
+                    if !value_external {
+                        require_page(offset, value_len, page_id)?;
+                    }
+                    let value_start = offset;
+                    if !value_external {
+                        offset += value_len;
+                    }
+                    // Offsets are fully advanced above, so a filtered cell can
+                    // be skipped from here without corrupting the walk.
+                    let cell_key: &[u8] = match &blob_key {
+                        Some(key) => key,
+                        None => &leaf[key_start..key_start + key_len],
+                    };
+                    if start.is_some_and(|start| cell_key < start) {
                         continue;
                     }
-                    if end.is_some_and(|end| entry.key.as_slice() >= end) {
+                    if end.is_some_and(|end| cell_key >= end) {
                         break;
                     }
-                    if excluded_prefix
-                        .is_some_and(|prefix| entry.key.as_slice().starts_with(prefix))
-                    {
+                    if excluded_prefix.is_some_and(|prefix| cell_key.starts_with(prefix)) {
                         continue;
                     }
-                    // The entry is owned here, so its inline value is MOVED into
-                    // the row rather than cloned out of it. `read_value` takes a
-                    // reference and has to clone, which meant every row of every
-                    // scan allocated its value twice: once in `decode_leaf` and
-                    // once here, with the first copy dropped immediately after.
-                    let revision = entry.revision;
-                    let value = match entry.value {
-                        // Still inside its page, which the row's `Bytes` keeps
-                        // alive — no copy at any size.
-                        EntryValue::Inline(value) => SharedTreeValue::Paged(value),
-                        EntryValue::External(reference) => {
-                            pending.push((rows.len(), reference));
-                            SharedTreeValue::Paged(Bytes::Owned(Vec::new()))
-                        }
+                    let key = match blob_key {
+                        Some(key) => Bytes::Owned(key),
+                        None => Bytes::paged(&page, key_start, key_len),
                     };
-                    rows.push((entry.key.into_vec(), value, revision));
+                    let value = if value_external {
+                        pending.push((
+                            rows.len(),
+                            ValueRef {
+                                offset: value_offset,
+                                len: value_len as u32,
+                                revision,
+                            },
+                        ));
+                        SharedTreeValue::Paged(Bytes::Owned(Vec::new()))
+                    } else {
+                        SharedTreeValue::Paged(Bytes::paged(&page, value_start, value_len))
+                    };
+                    rows.push((key, value, revision));
                     if rows.len() == limit {
                         break;
                     }

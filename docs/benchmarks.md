@@ -388,15 +388,21 @@ durable row — its default is a 500 ms background flush, which is the number
 naive durability comparisons quote):
 
     #1 for vyrn      point_get 128 B (~2.0–2.3 M/s, 1.3–2.4x over both),
-                     scan_1000 128 B (~8.7–9.8 M rows/s),
-                     scan_1000 4 KiB (~4.7–5.4 M rows/s, 1.4x over redb),
+                     scan_1000 128 B (~9.9 M rows/s, trading ±5% with redb's
+                     guards run to run), scan_1000 4 KiB (~9.7 M rows/s, 2.3x
+                     over redb — scan rows allocate nothing since the shared
+                     keys and the in-place cell walk, and `scan_each` hands
+                     out borrowed slices with no rows built at all),
                      durable_put 128 B and 4 KiB (at the shared fsync floor,
-                     tied with or ahead of flushed sled; redb behind)
-    still behind     point_get 4 KiB and 64 KiB (redb's mmap guard wins —
-                     the levers left are a per-page cell-offset index so leaf
-                     lookups binary-search instead of walking, and the page
-                     cache's per-level mutex), batch_put 128 B (redb ~1.2x —
-                     per-op allocation diet), durable_put 64 KiB (sled ~1.15x,
+                     ahead of flushed sled; redb behind)
+    still behind     point_get 4 KiB and 64 KiB (redb's mmap guard wins).
+                     The scan floor (~100 ns/row) and these point_get rows
+                     are the same cost — the per-cell parse of
+                     variable-length cells — and share the same fix: a page
+                     format with a fixed-width cell-offset directory (binary
+                     search in leaves, branchless scan emission). Format
+                     bump, queued. Also batch_put 128 B (redb ~1.2x — per-op
+                     allocation diet) and durable_put 64 KiB (sled ~1.15x,
                      inside this host's fsync noise band but consistent)
 
 Write rows on this host vary ±10–15% run to run; the read rows are stable and

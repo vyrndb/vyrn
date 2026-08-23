@@ -40,6 +40,16 @@ impl SharedBytes {
         Self(SharedRepr::Tree(value))
     }
 
+    pub(crate) fn tree_key(key: page_tree::Bytes) -> Self {
+        Self(SharedRepr::Tree(page_tree::SharedTreeValue::Paged(key)))
+    }
+
+    pub(crate) fn owned(bytes: Vec<u8>) -> Self {
+        Self(SharedRepr::Tree(page_tree::SharedTreeValue::Paged(
+            page_tree::Bytes::Owned(bytes),
+        )))
+    }
+
     fn buffered(value: Arc<Vec<u8>>) -> Self {
         Self(SharedRepr::Buffered(value))
     }
@@ -623,13 +633,51 @@ impl ReadEngine {
         overlay::merged_get_shared(&self.tree, self.overlay.as_ref(), key)
     }
 
+    /// [`Engine::scan_each`] on a read handle: borrowed-slice rows, nothing
+    /// built, valid only inside the callback.
+    pub fn scan_each<F: FnMut(&[u8], &[u8])>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        visit: &mut F,
+    ) -> Result<()> {
+        if let Some(key) = start {
+            validate_user_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_user_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        match &self.overlay {
+            Some(buffer) if !buffer.is_empty() => {
+                for (key, value, _) in overlay::merged_scan_shared(
+                    &self.tree,
+                    self.overlay.as_ref(),
+                    start,
+                    end,
+                    limit,
+                    Some(INTERNAL_PREFIX),
+                )? {
+                    visit(&key, &value);
+                }
+                Ok(())
+            }
+            _ => self
+                .tree
+                .scan_visit(start, end, limit, Some(INTERNAL_PREFIX), visit),
+        }
+    }
+
     /// [`ReadEngine::scan`] without copying values out — see [`SharedBytes`].
     pub fn scan_shared(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, SharedBytes)>> {
+    ) -> Result<Vec<(SharedBytes, SharedBytes)>> {
         if let Some(key) = start {
             validate_user_key(key)?;
         }
@@ -984,13 +1032,57 @@ impl Engine {
         overlay::merged_get_shared(&self.tree, self.write_back.as_ref(), key)
     }
 
+    /// The fastest scan there is: every row reaches `visit` as two borrowed
+    /// slices, in key order, and nothing is built — no vector, no row
+    /// structs, no reference counts. The slices are valid only inside the
+    /// callback; when rows must outlive the walk, use [`Engine::scan`] or
+    /// [`Engine::scan_shared`].
+    pub fn scan_each<F: FnMut(&[u8], &[u8])>(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        visit: &mut F,
+    ) -> Result<()> {
+        self.ensure_healthy()?;
+        if let Some(key) = start {
+            validate_user_key(key)?;
+        }
+        if let Some(key) = end {
+            validate_user_key(key)?;
+        }
+        if start.zip(end).is_some_and(|(start, end)| start > end) {
+            return Err(Error::InvalidRange);
+        }
+        match &self.write_back {
+            // Buffered state has to merge, which needs the rows in hand; the
+            // buffer is empty between absorbs, so this is the rare shape.
+            Some(buffer) if !buffer.is_empty() => {
+                for (key, value, _) in overlay::merged_scan_shared(
+                    &self.tree,
+                    self.write_back.as_ref(),
+                    start,
+                    end,
+                    limit,
+                    Some(INTERNAL_PREFIX),
+                )? {
+                    visit(&key, &value);
+                }
+                Ok(())
+            }
+            _ => self
+                .tree
+                .scan_visit(start, end, limit, Some(INTERNAL_PREFIX), visit),
+        }
+    }
+
     /// [`Engine::scan`] without copying values out — see [`SharedBytes`].
     pub fn scan_shared(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, SharedBytes)>> {
+    ) -> Result<Vec<(SharedBytes, SharedBytes)>> {
         self.ensure_healthy()?;
         if let Some(key) = start {
             validate_user_key(key)?;
