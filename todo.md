@@ -33,12 +33,15 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       → loopback default, README v6 + milestone fixes, .gitignore credential files, compose
       resource limits/log rotation, CHANGELOG stub
 
-## 🔶 In flight — damaged by rate-limit/infra kills, must be finished or redone
+## ✅ Done — second round (all pushed)
 
-- [ ] **C1** `lib.rs` criticals — *mostly applied* (checkpoint_generation commit point,
-      apply_batch atomicity Case A/B, active-segment stop-at-first-invalid replay, sync()
-      per-record LSNs + poison, startup segment-gap temp+rename). Needs: audit vs list, finish
-      missing pieces, zero warnings, full core tests green.
+- [x] **C1** `lib.rs` criticals — **audited rather than rewritten**: all five turned out to be
+      already applied and documented, so there was nothing to finish. checkpoint_generation commit
+      point (`lib.rs:1898`, counter moves immediately after `write_manifest`), apply_batch staging
+      order (`:1466`, historical values staged before `publish` so every failure happens while the
+      mutation is invisible), torn-tail replay with splice detection (`:2524`), per-record sync
+      LSNs + poison (`:1852`), segment-gap temp+rename (`:2389`, was `remove_file` then create,
+      where a kill between the two bricked the database permanently).
 - [x] **D1** server hardening — **DONE**. `main.rs` was truncated to 1346 of 3784 lines
       (298 errors); restored by splicing HEAD's head onto the surviving hardened tail, then
       repairing two mid-edit casualties (a `.replace("eded","ed")` botched typo-fix inside a
@@ -59,30 +62,86 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       *Not covered by a test:* the shutdown final sync needs a graceful SIGTERM, which Windows
       cannot send to a child from `std`; deferred to `scripts/crash-soak.sh` (E3). Reviewed, not
       tested — noted in the test file too.
-- [ ] **E3** adversarial parsing suites — *not started* (three infra deaths). Create
-      `crates/vyrn-core/tests/adversarial_parsing.rs` (document/portable/archive parsers:
-      arbitrary bytes, truncation walks, forged u32::MAX counts → clean errors) and
-      `scripts/crash-soak.sh` (kill -9 loop asserting acknowledged writes survive).
+- [x] **E3** adversarial parsing — 20 tests in `crates/vyrn-core/tests/adversarial_parsing.rs`
+      across 7 parsers × arbitrary bytes / truncation walks / forged counts, plus
+      `scripts/crash-soak.sh`. Two real defects, both reachable from a directory an operator
+      assembles by hand: `verify_archive` panicked on an entry claiming `last_lsn = u64::MAX` —
+      an abort inside the one command you run *because* you suspect archive damage — and
+      `recover_to` hung asking for 1.8×10^19 heap strings on a forged segment gap. Both
+      mutation-verified. Every other parser held; re-proved rather than re-fixed.
+
+- [x] **C2** MVCC history coverage watermark — `covered_through` distinct from `gc_floor`,
+      published on exactly the commits that retain nothing, which is the case the floor cannot see;
+      reads *and registrations* below coverage refused with `SnapshotTooOld`. `revision()` and
+      `any_changed_since` now take the **max** of history and tree: a retained version is a lower
+      bound, never an authority, and treating it as one let two transactions that overwrote each
+      other both pass validation. 6 tests in `tests/mvcc_coverage.rs`.
+- [x] **C3** lib.rs medium batch — all seven, each mutation-verified. Unique-index moves and swaps
+      now legal (keyed by index+value+primary key, so a genuine third holder still violates),
+      `last_published` reset on entry, `limit == 0`, `Cursor::start()` clamp, registry expects →
+      `Poisoned`, replay/live filter parity (replay was nearly doubling the revision value log on
+      every recovery — 21590 vs 10640 bytes, measured), `validate_index_name` namespace with the
+      document layer's own prefix exempt.
+- [x] **D2** server correctness — publication happens only in `publish_commit`, and `readers` +
+      `changes` were **removed** from `WriteWorkerConfig`, so the reorder is unrepresentable rather
+      than merely fixed. Batch validation now includes plain ops, both sides of an index move,
+      index-update primary keys, and range phantoms. Chunked scans with admission between chunks
+      (the read guard is held across chunks deliberately — releasing it would trade a stall for a
+      torn read), `--statement-deadline-ms`, and an honest dead-reader message.
+- [x] **D3** replication gap recovery — **not** via `recover_to`: it calls `Engine::open`, so it
+      cannot run on a replica that already holds the data-directory lock. Instead `decide_join`
+      gained `Rebuild` — the primary streams from its oldest held LSN and the replica closes the
+      gap from the WAL archive, reusing the streaming verify→append→sync→publish path. No new
+      protocol message (`ReplicaStream` already meant "records start here"). Replaces a refusal
+      that left a merely-lagging replica permanently broken while a `min-acks 1` primary blocked
+      writes waiting for the quorum that replica was supposed to provide.
+- [x] **E1/E1b** logging — new dependency-free `vyrn-log` crate, extracted from vyrn-client so the
+      *server* need not depend on the *client* to write a log line. All three binaries converted;
+      zero `eprintln!`/`println!` left in `main.rs`. `record_storage_error` names the failing
+      operation, which is what finally makes production.md's promise true; `withdraw_readiness`
+      names the task that died at 11 sites; auth distinguishes throttled from rejected, a
+      distinction the client deliberately cannot see; checkpoints report duration and trigger; a
+      timed-out drain no longer looks identical to a clean one. Redaction fixed a real leak — an
+      unencoded `/` in a password defeated every URL parser. Nothing logs a credential: asserted,
+      and verified by leaking one on purpose.
+- [x] **PERF** — point read 21.6 µs → 1.08 µs. `find_leaf` decoded every internal page, and each
+      decode walked a child's whole leftmost spine to recover a key the caller already had
+      (7000 → 4000 page reads per 1000 gets); `get_with_revision` decoded an entire leaf to keep
+      one value; the WAL pre-filled runway *underneath* large records and then overwrote it; the
+      value log copied large values twice in each direction. `benches/storage.rs` 3 → 19 cases,
+      because three could not substantiate any claim about this engine's throughput.
+- [x] **Final sweep** — 308 tests across 44 binaries, 0 failures, 0 warnings; clippy
+      `-D warnings` clean workspace-wide; TypeScript build and 22/22 SDK tests green.
 
 ## ⬜ Queued
 
-- [ ] **C2** MVCC history coverage watermark (lib.rs + mvcc.rs): track covered-through LSN
-      distinct from gc_floor; reject reads below coverage (`SnapshotTooOld`); stop stale history
-      shadowing tree revision in `revision()`/`changed_since()`; regression tests from reviewer
-      repro recipes (vanishing keys, present-as-past, missed conflicts).
-- [ ] **C3** lib.rs medium batch: unique-index same-batch claims (moves/swaps legal),
-      `last_published` scoping, `limit == 0` scans, `Cursor::start()` clamp, snapshot-registry
-      expects → Poisoned, replay/live version-filter parity, `validate_index_name` namespace.
-- [ ] **D2** server correctness: single ordered change-broadcast point (no reorder/drop under
-      mixed doc+KV load), batch conflict validation includes plain ops + index keys, slow-scan
-      stall mitigation, dead-reader error message, per-statement deadline.
-- [ ] **D3** replication gap recovery: wire `recover_to` into replica join so a lagging replica
-      rebuilds from base backup instead of failing; extend replication tests.
-- [ ] **E1** logging/tracing: structured logs with timestamps/levels; storage errors actually
-      logged (production.md promises this), auth failures, lifecycle events, checkpoint/backup
-      outcomes; gateway logs upstream detail.
-- [ ] **Final sweep**: full workspace tests + clippy `-D warnings` + TS build, plus fresh
-      adversarial re-review of the entire diff.
+- [ ] **A batch of individually-legal values fails with `ValueTooLarge`.** Found by the perf work
+      and deliberately left alone there, because `lib.rs` belonged to another task at the time.
+      `with_change_log` encodes a whole batch's published keys and values into ONE tree value,
+      which `validate_value` then checks against the 16 MiB `MAX_VALUE_SIZE` — so the cap scales
+      with *batch* size rather than value size, and sixteen 1 MiB puts abort a commit even though
+      each is a sixteenth of the limit. The error also names the wrong cause. Repro:
+      `engine.write_batch((0..16).map(|i| Put(i.to_be_bytes().to_vec(), vec![7; 1<<20])).collect())`.
+      Either split the record across `changelog:<seq>:<part>` keys, or raise the cap for what is
+      engine-internal data; either way the error should name the change record.
+      **Delete `batch_keys()` from `benches/storage.rs` when this lands** — it exists only to work
+      around this, and is marked as such.
+- [ ] **`DOCUMENT_INDEX_PREFIX` duplicates `document::INDEX_PREFIX`** (`lib.rs:3296`) instead of
+      sharing it, because document.rs was owned elsewhere while that check was written. A test
+      fails if the two spellings drift; collapse them next time that file is open.
+- [ ] **Run `scripts/crash-soak.sh` on Linux.** Written, `bash -n` clean, and every env var and
+      CLI flag it uses was verified to exist — but never executed, because it is Linux-only by
+      design and this host is Windows. Its `shutdown` mode is also the only coverage that exists
+      for the shutdown-sync fix, which has no Rust test for the same reason.
+- [ ] **Prove the change-broadcast ordering.** The D2 fix is structurally enforced — the write
+      worker no longer *holds* a broadcast handle — but its test passes against the unfixed server
+      too: three workload designs failed to open the reorder window on this machine, because both
+      paths fsync and the flush stage's starts first. Needs a slower disk, a fault injector, or a
+      deterministic scheduler before it demonstrates anything.
+- [ ] **`vyrn_checkpoints_total` counts the wrong event** — incremented where a checkpoint is
+      *scheduled*, on the write path, not where it runs in the maintenance task, so the counter and
+      the work can disagree. Noted in production.md; the new `vyrnd.checkpoint` log record, which
+      carries the duration and the trigger, is the reliable signal in the meantime.
 
 ## 🔽 Deferred — reviewed, deliberately out of fleet scope (do not lose these)
 
@@ -103,14 +162,19 @@ Platform/ops limitations (document, don't code):
 - `sync_directory` is a no-op off Unix — Windows directory-entry durability is unproven
 - `production.md` exit gates still need RUNNING on real Linux hardware: multi-hour
   larger-than-memory soak, restore + PITR drill (crash-soak.sh gives you the tool)
-- CI gaps: no coverage measurement, no benchmark-regression gate, `benches/storage.rs`
-  (3 cases) doesn't substantiate the headline benchmark figures, no docker build job
+- CI gaps: no coverage measurement, no benchmark-regression gate, no docker build job.
+  `benches/storage.rs` is no longer part of this — it went 3 → 19 cases in the perf round and now
+  covers four value sizes across point read, single write, batched write, overwrite, scans, and
+  cache pressure. What is still missing is a *gate*: nothing fails when a number regresses
 
 Small items parked (fix opportunistically):
-- Page-cache admission: `append()` admits pages referenced, contradicting the function's
-  doc comment claiming unreferenced (COW bursts can evict read-hot pages)
+- ~~Page-cache admission~~ **fixed in the perf round**: `append()` now admits unreferenced, as its
+  doc comment always claimed. Misses under cache pressure 27 → 14; no timing change, because the
+  commit's fsync dominates that case
 - Snapshot tokens are bare `u64` from two parallel registries — mismatched release silently
-  pins revisions forever; an RAII guard would make it unrepresentable
+  pins revisions forever; an RAII guard would make it unrepresentable. Partly mitigated: the
+  release is now unavoidable on every connection exit path, and
+  `vyrn_active_transaction_snapshots` makes a leak visible instead of silent
 - `write_indexed` trusts caller-supplied `old_value`/`new_value`; wrong input silently
   corrupts the index with no detection
 - `recover_to` merge/trim runs without the data-dir lock (narrow concurrent-backup window)
@@ -118,7 +182,9 @@ Small items parked (fix opportunistically):
   half-implemented — body scan skips, header read is strict)
 - Gateway has no per-route rate limiting (connection cap only); connection-slot squatting
   by authenticated idle clients has no per-IP fairness
-- Dead reader thread reports "queue is full" instead of "reader stopped"
+- ~~Dead reader thread reports "queue is full"~~ **fixed in D2**: a disconnected reader now says
+  "storage reader stopped; this node cannot serve reads until it is restarted". Untested — a
+  reader thread cannot be killed from a test without poisoning a lock
 - Deps not hoisted to `[workspace.dependencies]` (rand_core, tokio-postgres, criterion…)
 - Rust client clamps over-limit `limit` silently; TS SDK throws — same input, different
   behavior per SDK (deliberate, but worth documenting)
@@ -128,3 +194,18 @@ Small items parked (fix opportunistically):
 File ownership per task; never touch teammates' files; regression test per fix; no commits
 (commit split belongs to the owner); compile after each edit in `main.rs`; retry on transient
 teammate noise instead of fixing foreign files; honest test numbers in every report.
+
+Two rules earned the hard way, worth keeping:
+
+**A regression test is not done until it has failed.** Revert the fix, watch the test fail, restore
+it. Two tests in this round would otherwise have been worthless: a snapshot-pin leak test built on
+`vyrn_mvcc_versions_collected_total` passed either way, because history is only retained for
+versions a live snapshot needs, so with no open transaction the counter sits at zero whether or not
+the pin leaked — it needed a new gauge that observes the pin directly. And a metric helper that
+matched on a bare string prefix silently returned the wrong series for any metric whose name
+prefixed another.
+
+**Never run a tree-wide git operation while agents are working.** `git stash`, `git checkout -- .`,
+`reset --hard` — any of them yanks in-progress edits out from under a running task. To check that a
+staged subset stands alone, inspect the other diffs for new public items it might depend on, or
+build it in a separate worktree; do not mutate the shared tree.
