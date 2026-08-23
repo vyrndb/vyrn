@@ -115,15 +115,30 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
 
 ## ⬜ Queued
 
-- [ ] **A batch of individually-legal values fails with `ValueTooLarge`.** Found by the perf work
-      and deliberately left alone there, because `lib.rs` belonged to another task at the time.
-      `with_change_log` encodes a whole batch's published keys and values into ONE tree value,
-      which `validate_value` then checks against the 16 MiB `MAX_VALUE_SIZE` — so the cap scales
-      with *batch* size rather than value size, and sixteen 1 MiB puts abort a commit even though
-      each is a sixteenth of the limit. The error also names the wrong cause. Repro:
-      `engine.write_batch((0..16).map(|i| Put(i.to_be_bytes().to_vec(), vec![7; 1<<20])).collect())`.
-      Either split the record across `changelog:<seq>:<part>` keys, or raise the cap for what is
-      engine-internal data; either way the error should name the change record.
+- [ ] **Split the change record so a commit is not charged for its own bookkeeping.** Reported as
+      a batch-only problem; it is worse than that. Measured: a *single* put of exactly
+      `MAX_VALUE_SIZE` is refused, and `MAX_VALUE_SIZE - 21` is the largest value that commits with
+      an 8-byte key. Every commit appends one internal record encoding its published keys and
+      values, and that record is validated against the same ceiling as the caller's values, so its
+      framing (4 count bytes, 9 per entry, plus each key) is charged to a budget it does not appear
+      in. The advertised 16 MiB limit is therefore unreachable by anyone, and the ceiling scales
+      with *batch* size as well — sixteen 1 MiB puts are refused. The error names the value, which
+      is misleading: nothing the caller passed was too large.
+      **Raising the cap is not the fix.** The WAL payload validator (`lib.rs:3098`) independently
+      rejects an operation over `MAX_VALUE_SIZE` during replay, so a commit that succeeded would
+      fail its own recovery. The record has to split across keys.
+      Splitting is feasible — `change_log_key` is prefix + `sequence.to_be_bytes()`, so a part
+      suffix preserves commit-then-part sort order — but it touches cursor semantics at five sites
+      that each assume one key is one commit: `read_changes` (`lib.rs:1903`, whose `scan_limit + 1`
+      counts commits), `published_cursor` (`:1953`, which reads the last key's record count for the
+      cursor index), the retained count (`:1983`), `trim_changes` (`:1999`, which must not drop
+      part 0 while part 1 is undelivered), and `change_log_sequence`'s 8-byte suffix assertion.
+      `ChangeRecord.index` is per-commit, so indices must stay continuous across parts or every
+      cursor a subscriber holds becomes wrong.
+      *Landed already:* both failures are recorded as `#[ignore]`d tests in
+      `tests/change_log.rs` (run with `--ignored`), a passing test pins the current ceiling so the
+      documented overhead cannot go stale, and `docs/production.md` plus the README now state the
+      real limit instead of the one nobody can reach.
       **Delete `batch_keys()` from `benches/storage.rs` when this lands** — it exists only to work
       around this, and is marked as such.
 - [ ] **`DOCUMENT_INDEX_PREFIX` duplicates `document::INDEX_PREFIX`** (`lib.rs:3296`) instead of

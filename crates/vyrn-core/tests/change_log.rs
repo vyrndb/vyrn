@@ -229,6 +229,93 @@ fn a_delete_that_hits_nothing_is_not_published() {
     );
 }
 
+/* THE CHANGE RECORD SHARES THE CALLER'S VALUE BUDGET, and these two tests are
+ * the shape of that. Both are `#[ignore]`d because they fail today: they record
+ * a known defect executably rather than only in prose, so the fix is verified by
+ * removing an attribute instead of by writing the test from scratch after the
+ * fact. Run them with `cargo test -p vyrn-core --test change_log -- --ignored`.
+ *
+ * Every commit appends one extra put whose value is `encode_batch` of every
+ * published key and value in the batch. That blob is validated against the same
+ * `MAX_VALUE_SIZE` the caller's own values were checked against, so the record's
+ * framing — four count bytes, nine per entry, plus each key — is charged to the
+ * caller's budget without being visible in it.
+ *
+ * The fix needs the record split across several keys, which touches cursor
+ * semantics at five read sites (`read_changes`, `published_cursor`, the retained
+ * count, `trim_changes`, and the eight-byte suffix `change_log_sequence`
+ * demands), and per-commit indices have to stay continuous across the parts or
+ * every cursor a subscriber holds becomes wrong. Raising the cap for this one
+ * value is NOT the fix: the WAL payload validator independently rejects an
+ * operation over `MAX_VALUE_SIZE` during replay, so a commit that succeeded
+ * would fail its own recovery. See `todo.md`.
+ */
+
+#[test]
+#[ignore = "known defect: the change record is charged to the caller's value budget"]
+fn a_single_value_of_the_documented_maximum_size_commits() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+
+    /* Not a batch problem, and this is the case that shows it: ONE put of
+     * exactly the advertised maximum. It fails by 21 bytes — the record's own
+     * count field, its per-entry header, and this key — so the limit the README
+     * and `MAX_VALUE_SIZE` both name is unreachable by any caller. Measured:
+     * `MAX_VALUE_SIZE - 21` is the largest value that actually commits. */
+    let result = engine.put(b"k".to_vec(), vec![7; vyrn_core::MAX_VALUE_SIZE]);
+    assert!(
+        result.is_ok(),
+        "a value of exactly MAX_VALUE_SIZE must commit: {result:?}"
+    );
+}
+
+#[test]
+#[ignore = "known defect: the change record is charged to the caller's value budget"]
+fn a_batch_of_individually_legal_values_commits() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+
+    // Sixteen values, each a sixteenth of the limit. The cap scales with the
+    // size of the BATCH rather than of any value in it, so this overshoots by
+    // roughly the per-entry framing.
+    let operations: Vec<_> = (0..16u64)
+        .map(|index| {
+            BatchOperation::Put(index.to_be_bytes().to_vec(), vec![7; 1 << 20])
+        })
+        .collect();
+    let result = engine.write_batch(operations);
+    assert!(
+        result.is_ok(),
+        "a batch of individually legal values must commit: {result:?}"
+    );
+}
+
+#[test]
+fn the_largest_committable_value_is_documented_accurately() {
+    let directory = tempdir().unwrap();
+    let mut engine = Engine::open(directory.path()).unwrap();
+
+    /* Guards the number in the docs against drift while the defect above stands.
+     * If a change to the record's framing moves this ceiling, this fails and the
+     * documented figure gets corrected with it rather than quietly going stale.
+     * The overhead is: 4 bytes of entry count, 9 bytes of entry header, and the
+     * key itself — 8 bytes here. */
+    const OVERHEAD: usize = 4 + 9 + 8;
+    let mut engine_ok = |size: usize| {
+        engine
+            .put(0u64.to_be_bytes().to_vec(), vec![7; size])
+            .is_ok()
+    };
+    assert!(
+        engine_ok(vyrn_core::MAX_VALUE_SIZE - OVERHEAD),
+        "MAX_VALUE_SIZE minus the change-record overhead must commit"
+    );
+    assert!(
+        !engine_ok(vyrn_core::MAX_VALUE_SIZE - OVERHEAD + 1),
+        "one byte more than that must not, or the documented overhead is wrong"
+    );
+}
+
 #[test]
 fn latest_cursor_subscribes_to_future_changes_only() {
     let directory = tempdir().unwrap();

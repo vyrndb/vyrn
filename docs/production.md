@@ -141,6 +141,16 @@ When readiness becomes false:
 
 These are reviewed, understood, and deliberately not fixed in `0.1.0-dev`. Each one can affect a production deployment, so plan around them rather than discovering them during an incident.
 
+### The largest value you can actually write is under 16 MiB
+
+`MAX_VALUE_SIZE` is 16 MiB and both the README and the protocol describe values up to that size. A value of exactly that size is refused with `ValueTooLarge`.
+
+Every commit appends one extra internal record describing the changes it published, and that record is validated against the same 16 MiB ceiling as the values the caller supplied. Its framing — four bytes of entry count, nine bytes per entry, plus a copy of each key — therefore comes out of the caller's budget without appearing in it. With an 8-byte key, the largest value that commits is `MAX_VALUE_SIZE - 21`.
+
+The same accounting makes the ceiling scale with the size of a *batch* rather than of any value in it, so sixteen 1 MiB puts in one `write_batch` are refused even though each is a sixteenth of the limit. The reported error names the value, which is misleading: nothing the caller passed was too large.
+
+Plan around it by keeping values a few kilobytes below 16 MiB, and by keeping the total payload of a single batch under that too. Raising the constant is not the fix — the WAL validator independently enforces the same bound during replay, so a commit that succeeded would fail its own recovery. The fix is to split the change record across several keys, which changes cursor semantics and is tracked in `todo.md`; `crates/vyrn-core/tests/change_log.rs` carries both failing cases as `#[ignore]`d tests, runnable with `--ignored`.
+
 ### One shared credential, and no audit trail
 
 The server authenticates a single username and password against one Argon2id verifier. There are no per-principal accounts, no per-key or per-collection authorization, no revocation short of rotating the one credential and restarting, and no record of which client did what — the log records that authentication failed and from which address, never who succeeded at what.

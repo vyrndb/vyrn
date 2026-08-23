@@ -11,7 +11,8 @@ Vyrn is a correctness-first database built in Rust from its storage format upwar
 - Active-window historical MVCC value/tombstone chains, snapshot reads at a revision, and immediate release after the oldest active transaction advances
 - Transactional byte-oriented unique and non-unique secondary indexes stored under the same committed tree root
 - Compact binary protocol v6 with bounded decoding, batched multi-get, and predictable support for 16 MiB values
-- Opaque binary keys up to 64 KiB and values up to 16 MiB
+- Opaque binary keys up to 64 KiB and values up to 16 MiB, less the change record's framing — see
+  the known limitation in [docs/production.md](docs/production.md#known-limitations)
 - Segmented transaction WAL with sequence numbers, committed root generations, CRC32 checksums, record footers, and `sync_data` before acknowledgement
 - Records written into a preallocated zero-filled runway, so a commit's barrier has no file extension to journal
 - Recovery that publishes only complete committed roots and truncates only the incomplete tail of the active segment
