@@ -3285,15 +3285,12 @@ fn validate_user_operation(operation: &BatchOperation) -> Result<()> {
 
 /// The one region of the reserved keyspace an index name may occupy.
 ///
-/// Document collections name their indexes `\0vyrn:doc-index:<collection><field>`
-/// (`document::INDEX_PREFIX`), so the internal prefix cannot simply be refused
-/// outright — the document layer routes its own index names through the same
-/// `create_index` entry point a user calls. Duplicated here rather than shared
-/// because making the document constant reachable means editing that module; the
-/// two are pinned together by
-/// `a_document_collection_index_name_survives_validation`, which builds a real
-/// collection and fails the moment the spellings drift apart.
-const DOCUMENT_INDEX_PREFIX: &[u8] = b"\0vyrn:doc-index:";
+/// Document collections name their indexes `\0vyrn:doc-index:<collection><field>`,
+/// so the internal prefix cannot simply be refused outright — the document layer
+/// routes its own index names through the same `create_index` entry point a user
+/// calls. Taken from `document` rather than restated here: a second copy of a
+/// prefix is a divergence waiting for someone to change one of them.
+use document::INDEX_PREFIX as DOCUMENT_INDEX_PREFIX;
 
 /// Checks that an index name is usable and stays inside the keyspace it is
 /// allowed to address.
@@ -4183,9 +4180,9 @@ mod tests {
     ///
     /// They live under `\0vyrn:doc-index:`, inside the reserved prefix, and reach
     /// `create_index` through the same entry point a user calls — so the namespace
-    /// check has to exempt exactly that space. This pins the two spellings
-    /// together: `DOCUMENT_INDEX_PREFIX` is duplicated from `document::INDEX_PREFIX`,
-    /// and this test fails the moment they drift apart.
+    /// check has to exempt exactly that space. The exemption now reads the
+    /// document layer's own constant, so this covers the routing rather than
+    /// guarding against two copies of a prefix drifting apart.
     #[test]
     fn a_document_collection_index_name_survives_validation() {
         let directory = tempdir().unwrap();

@@ -9,7 +9,15 @@ use std::collections::BTreeMap;
 /// publish document mutations while hiding Vyrn's other internal keys.
 pub(crate) const DOCUMENT_KEY_PREFIX: &[u8] = b"\0vyrn:doc:";
 const DOCUMENT_PREFIX: &[u8] = DOCUMENT_KEY_PREFIX;
-const INDEX_PREFIX: &[u8] = b"\0vyrn:doc-index:";
+
+/// Prefix shared by every index this layer creates.
+///
+/// Visible to the crate because `validate_index_name` has to exempt exactly this
+/// space: the internal prefix is otherwise refused outright, and the document
+/// layer routes its own index names through the same `create_index` a user calls.
+/// It was briefly duplicated over there, pinned only by a test that would fail if
+/// the two spellings drifted; one definition needs no such pin.
+pub(crate) const INDEX_PREFIX: &[u8] = b"\0vyrn:doc-index:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexDefinition {

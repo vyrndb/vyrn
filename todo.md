@@ -141,9 +141,10 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       real limit instead of the one nobody can reach.
       **Delete `batch_keys()` from `benches/storage.rs` when this lands** — it exists only to work
       around this, and is marked as such.
-- [ ] **`DOCUMENT_INDEX_PREFIX` duplicates `document::INDEX_PREFIX`** (`lib.rs:3296`) instead of
-      sharing it, because document.rs was owned elsewhere while that check was written. A test
-      fails if the two spellings drift; collapse them next time that file is open.
+- [x] **`DOCUMENT_INDEX_PREFIX` no longer duplicates `document::INDEX_PREFIX`** — the exemption in
+      `validate_index_name` imports the document layer's constant instead of restating it, so the
+      test that pinned the two spellings together now covers the routing rather than guarding
+      against drift.
 - [ ] **Run `scripts/crash-soak.sh` on Linux.** Written, `bash -n` clean, and every env var and
       CLI flag it uses was verified to exist — but never executed, because it is Linux-only by
       design and this host is Windows. Its `shutdown` mode is also the only coverage that exists
