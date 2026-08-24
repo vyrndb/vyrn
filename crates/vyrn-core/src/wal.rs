@@ -126,8 +126,11 @@ impl Writer {
             .clamp(self.runway, MAX_RUNWAY.max(self.runway));
         let target = self.zeroed.saturating_add(step);
         let zeros = vec![0; (target - self.zeroed) as usize];
+        let fill_started = std::time::Instant::now();
         write_all_at(&self.file, &zeros, self.zeroed)?;
         self.file.sync_data()?;
+        crate::profile::add(&crate::profile::WAL_FILL_NS, fill_started);
+        crate::profile::WAL_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         {
             self.zero_filled += zeros.len() as u64;
@@ -169,7 +172,11 @@ impl Wal {
         let mut writer = self.writer.lock().map_err(|_| crate::Error::Poisoned)?;
         writer.reserve(record.len() as u64)?;
         let offset = writer.offset;
+        let write_started = std::time::Instant::now();
         write_all_at(&writer.file, record, offset)?;
+        crate::profile::add(&crate::profile::WAL_WRITE_NS, write_started);
+        crate::profile::WAL_BYTES
+            .fetch_add(record.len() as u64, std::sync::atomic::Ordering::Relaxed);
         writer.offset = offset + record.len() as u64;
         // A record that `reserve` declined to pre-fill has just initialised those
         // blocks itself. The frontier MUST move with it: `reserve` writes its
@@ -202,7 +209,9 @@ impl Wal {
         // Read before flushing, never after: a record appended once the flush is
         // already running may not be included in it.
         let covered = self.appended_lsn.load(Ordering::Acquire);
+        let sync_started = std::time::Instant::now();
         syncer.sync_data()?;
+        crate::profile::add(&crate::profile::WAL_SYNC_NS, sync_started);
         self.synced_lsn.fetch_max(covered, Ordering::AcqRel);
         Ok(())
     }

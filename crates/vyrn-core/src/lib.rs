@@ -131,6 +131,22 @@ pub mod profile {
     pub static TREE_APPEND_NS: AtomicU64 = AtomicU64::new(0);
     /// Time writing each batch's buffered pages to the file in one call.
     pub static TREE_FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+    // Sub-phases of `wal`, split because a host with a cheap barrier (Linux
+    // NVMe, containers) exposes per-commit costs the Windows fsync hides:
+    // when the sync is ~50 us instead of ~500, whatever else the WAL path
+    // pays per record becomes the gap to a leaner engine. Encode is the
+    // record serialisation, fill is the runway's zero-extension (with its
+    // own fdatasync), write is the record's write syscalls, sync is the
+    // barrier itself.
+    pub static WAL_ENCODE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAL_FILL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAL_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static WAL_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+    /// How many runway zero-extensions ran, each with its own barrier.
+    /// Deterministic, so it travels between hosts like the page counts.
+    pub static WAL_FILLS: AtomicU64 = AtomicU64::new(0);
+    /// Record bytes handed to the kernel, pre-fill excluded. Deterministic.
+    pub static WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
     pub(crate) fn add(counter: &AtomicU64, started: std::time::Instant) {
         counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -154,6 +170,12 @@ pub mod profile {
             ("tree_encode", TREE_ENCODE_NS.load(Ordering::Relaxed)),
             ("tree_append", TREE_APPEND_NS.load(Ordering::Relaxed)),
             ("tree_flush", TREE_FLUSH_NS.load(Ordering::Relaxed)),
+            ("wal_encode", WAL_ENCODE_NS.load(Ordering::Relaxed)),
+            ("wal_fill", WAL_FILL_NS.load(Ordering::Relaxed)),
+            ("wal_write", WAL_WRITE_NS.load(Ordering::Relaxed)),
+            ("wal_sync", WAL_SYNC_NS.load(Ordering::Relaxed)),
+            ("__wal_fills", WAL_FILLS.load(Ordering::Relaxed)),
+            ("__wal_bytes", WAL_BYTES.load(Ordering::Relaxed)),
         ]
     }
 }
@@ -3216,7 +3238,9 @@ impl Engine {
             .last_lsn
             .checked_add(1)
             .ok_or_else(|| Error::Io(io::Error::other("WAL sequence number exhausted")))?;
+        let encode_started = std::time::Instant::now();
         let record = encode_record(lsn, operations, root, len)?;
+        profile::add(&profile::WAL_ENCODE_NS, encode_started);
         // Tracked in memory rather than stat'ing the WAL on every commit. A
         // buffered async record is already counted here when it is pushed onto
         // `pending_wal`, so adding those lengths again would double-count them

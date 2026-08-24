@@ -129,6 +129,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             delta(sub) as f64 / requests as f64 / 1000.0,
         );
     }
+    for sub in ["wal_encode", "wal_fill", "wal_write", "wal_sync"] {
+        println!(
+            "  {:<12} {:>9.2} us  (inside wal)",
+            sub,
+            delta(sub) as f64 / requests as f64 / 1000.0,
+        );
+    }
+    println!(
+        "  wal: {:.2} KiB/request handed to the kernel, {:.3} runway fills/request \
+         (each with its own barrier)",
+        delta("__wal_bytes") as f64 / requests as f64 / 1024.0,
+        delta("__wal_fills") as f64 / requests as f64,
+    );
     let hits = delta("__page_hits");
     let misses = delta("__page_misses");
     let appends = delta("__page_appends");
