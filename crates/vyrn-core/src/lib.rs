@@ -195,6 +195,24 @@ use thiserror::Error;
 const SEGMENT_MAGIC: &[u8; 4] = b"VSEG";
 const RECORD_MAGIC: &[u8; 4] = b"VTXN";
 const RECORD_END: &[u8; 4] = b"VEND";
+/// WAL record format version this build writes.
+///
+/// Version 5 fills the four bytes version 4 reserved as zeros at
+/// [`RECORD_HEADER_CRC_AT`] with a checksum of the header's own fields — the
+/// lengths and counts the frame walk must trust BEFORE the payload checksum
+/// can run. Without it, one flipped bit in `payload_len` made a complete
+/// record read as a torn tail and silently truncated the log (the exemption
+/// tests/corruption.rs used to carry). Version-4 records stay readable:
+/// their reserved slot is zero and their headers are trusted as they always
+/// were. Downgrade is not supported — an older build refuses version-5
+/// records — so replicas must run the same or a newer build than their
+/// primary, as docs/compatibility.md states.
+const RECORD_VERSION: u8 = 5;
+/// Records written before the header checksum existed.
+const LEGACY_RECORD_VERSION: u8 = 4;
+/// Where the header's self-checksum lives: the last four header bytes,
+/// covering everything before them.
+const RECORD_HEADER_CRC_AT: usize = 41;
 const MANIFEST_MAGIC: &[u8; 4] = b"VMAN";
 const VERSION: u8 = 4;
 const SEGMENT_HEADER_LEN: usize = 32;
@@ -3644,7 +3662,7 @@ fn replay_segment(
         }
         let mut record_header = [0; RECORD_HEADER_LEN];
         file.read_exact(&mut record_header)?;
-        if &record_header[0..4] != RECORD_MAGIC || record_header[4] != VERSION {
+        if &record_header[0..4] != RECORD_MAGIC || !record_version_known(&record_header) {
             // An all-zero header is the signature of a head page that never
             // reached the disk, not of damage. The runway ahead of the records
             // is zero-filled, and a write-back cache can persist a multi-page
@@ -3666,6 +3684,18 @@ fn replay_segment(
                 "invalid transaction header",
             )
             .map(|()| offset);
+        }
+        // Checked before ANY declared length is trusted, and loud: a failed
+        // header checksum with intact magic cannot be a tear (a torn header
+        // is zeros and fails the magic above), so it is rot in exactly the
+        // fields whose corruption used to read as a torn tail and silently
+        // truncate the log.
+        if !record_header_crc_ok(&record_header) {
+            return Err(corrupt(
+                segment_id,
+                offset,
+                "transaction header checksum mismatch",
+            ));
         }
         let lsn = read_u64(&record_header, 5);
         let operation_count = read_u32(&record_header, 13) as usize;
@@ -3815,7 +3845,13 @@ pub(crate) fn scan_to_lsn(path: &Path, segment_id: u64, bound: u64) -> Result<Op
         }
         let mut record_header = [0; RECORD_HEADER_LEN];
         file.read_exact(&mut record_header)?;
-        if &record_header[0..4] != RECORD_MAGIC || record_header[4] != VERSION {
+        // Lenient by contract — this walk finds where records end — so a
+        // header that fails its own checksum stops the walk here rather
+        // than trusting the lengths it declares.
+        if &record_header[0..4] != RECORD_MAGIC
+            || !record_version_known(&record_header)
+            || !record_header_crc_ok(&record_header)
+        {
             return Ok(Some(offset));
         }
         if read_u64(&record_header, 5) > bound {
@@ -3922,7 +3958,7 @@ fn encode_record(lsn: u64, operations: &[PendingCommit], root: u64, len: u64) ->
         .map_err(|_| Error::Io(io::Error::other("transaction exceeds WAL record limit")))?;
     let mut record = vec![0; total_len];
     record[0..4].copy_from_slice(RECORD_MAGIC);
-    record[4] = VERSION;
+    record[4] = RECORD_VERSION;
     write_u64(&mut record, 5, lsn);
     write_u32(&mut record, 13, operation_count);
     write_u32(&mut record, 17, payload_len);
@@ -3933,6 +3969,11 @@ fn encode_record(lsn: u64, operations: &[PendingCommit], root: u64, len: u64) ->
     );
     write_u64(&mut record, 25, root);
     write_u64(&mut record, 33, len);
+    // The header guards itself: everything above, checksummed into the four
+    // bytes version 4 left reserved, so a reader can trust the lengths
+    // before it walks by them.
+    let header_crc = checksum(&record[..RECORD_HEADER_CRC_AT]);
+    write_u32(&mut record, RECORD_HEADER_CRC_AT, header_crc);
     record[RECORD_HEADER_LEN..total_len - RECORD_FOOTER_LEN].copy_from_slice(&payload);
     write_u32(&mut record, total_len - RECORD_FOOTER_LEN, total_len_u32);
     record[total_len - 4..].copy_from_slice(RECORD_END);
@@ -4338,6 +4379,22 @@ fn transaction_checksum(
     hasher.update(&len.to_be_bytes());
     hasher.update(payload);
     hasher.finalize()
+}
+
+/// Whether a record header's version is one this build reads.
+pub(crate) fn record_version_known(header: &[u8]) -> bool {
+    matches!(header[4], LEGACY_RECORD_VERSION | RECORD_VERSION)
+}
+
+/// Whether a record header's self-checksum holds.
+///
+/// Version-4 records predate the checksum and are accepted as they always
+/// were. For version 5, this is the check that stands between a rotted
+/// `payload_len` and the tear-shaped truncation it used to buy: it runs on
+/// the header alone, before any declared length is trusted.
+pub(crate) fn record_header_crc_ok(header: &[u8]) -> bool {
+    header[4] != RECORD_VERSION
+        || checksum(&header[..RECORD_HEADER_CRC_AT]) == read_u32(header, RECORD_HEADER_CRC_AT)
 }
 
 fn checksum(bytes: &[u8]) -> u32 {

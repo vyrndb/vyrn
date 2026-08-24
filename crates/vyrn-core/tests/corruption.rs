@@ -174,17 +174,15 @@ fn a_flip_inside_a_complete_record_is_still_corruption() {
         let mut changed = original.clone();
         changed[index] ^= 1;
         fs::write(case.path().join("wal/00000000000000000001.vwal"), changed).unwrap();
-        // The four bytes at +17 are the record's declared payload length, and a
-        // record header carries no checksum of its own to catch a flip in them:
-        // an inflated length makes the frame overrun the log and be truncated as
-        // a torn tail. That is pre-existing rather than a cost of the runway —
-        // before it, the same flip pushed the frame past end of file and was
-        // truncated identically. Closing it needs a header checksum, which is a
-        // record format change.
-        let declared_length = (first + 17..first + 21).contains(&index);
+        // No exemptions. The declared payload length at +17 used to be one:
+        // a header carried no checksum of its own, so an inflated length made
+        // the frame overrun the log and be truncated as a torn tail — a
+        // silently dropped commit. The version-5 header checksum closed it,
+        // and this test is what holds it closed: every single-bit flip
+        // anywhere in a complete record either fails the open loudly or
+        // leaves every committed record readable.
         match Engine::open(case.path()) {
             Err(_) => {}
-            Ok(_) if declared_length => {}
             Ok(engine) => assert_eq!(
                 engine.get(b"second").unwrap(),
                 Some(b"two".to_vec()),
@@ -393,4 +391,40 @@ fn a_zeroed_head_in_a_sealed_segment_stays_fatal() {
         matches!(error, vyrn_core::Error::CorruptWal { .. }),
         "a zeroed frame in a sealed segment must be reported as corruption, got {error:?}"
     );
+}
+
+/// Version-4 records — written before the header carried its own checksum —
+/// must stay replayable forever: their reserved bytes are zero and their
+/// headers are trusted exactly as they always were. A version-4 record is a
+/// version-5 record with the version byte rewound and the checksum slot
+/// zeroed (the transaction checksum covers neither), which is precisely what
+/// a segment written by the previous build holds.
+#[test]
+fn legacy_records_without_header_checksums_still_replay() {
+    let directory = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(directory.path()).unwrap();
+        engine.put(b"old".to_vec(), b"bytes".to_vec()).unwrap();
+        engine.put(b"older".to_vec(), b"still".to_vec()).unwrap();
+    }
+    let wal = directory.path().join("wal/00000000000000000001.vwal");
+    let mut bytes = fs::read(&wal).unwrap();
+    // Rewind every record to version 4 in place. Records start at the
+    // 32-byte segment header and chain by declared length; the fields the
+    // walk needs are intact, this test only edits version and checksum slot.
+    let mut offset = 32;
+    let mut rewound = 0;
+    while offset + 45 <= bytes.len() && &bytes[offset..offset + 4] == b"VTXN" {
+        bytes[offset + 4] = 4;
+        bytes[offset + 41..offset + 45].fill(0);
+        let payload_len =
+            u32::from_be_bytes(bytes[offset + 17..offset + 21].try_into().unwrap()) as usize;
+        offset += 45 + payload_len + 8;
+        rewound += 1;
+    }
+    assert!(rewound >= 2, "expected to rewind at least two records");
+    fs::write(&wal, bytes).unwrap();
+    let engine = Engine::open(directory.path()).unwrap();
+    assert_eq!(engine.get(b"old").unwrap(), Some(b"bytes".to_vec()));
+    assert_eq!(engine.get(b"older").unwrap(), Some(b"still".to_vec()));
 }

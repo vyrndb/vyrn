@@ -22,7 +22,7 @@
 //! corrupt replica.
 
 use crate::{
-    Error, Result, RECORD_END, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, RECORD_MAGIC, VERSION,
+    Error, Result, RECORD_END, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, RECORD_MAGIC,
 };
 use std::path::Path;
 
@@ -117,12 +117,13 @@ pub fn verify_record(bytes: &[u8]) -> Result<RecordHeader> {
         return Err(stream_error("replication record has invalid magic"));
     }
     // Before every other check, so "sent by a newer primary" never surfaces as
-    // "corrupt".
-    if bytes[4] != VERSION {
+    // "corrupt". Version 4 (pre-header-checksum) and 5 are both this build's
+    // to read; anything else is a future format.
+    if !crate::record_version_known(bytes) {
         return Err(Error::FormatVersion {
             structure: "replicated WAL record",
             found: bytes[4],
-            expected: VERSION,
+            expected: crate::RECORD_VERSION,
         });
     }
 
@@ -139,24 +140,25 @@ pub fn verify_record(bytes: &[u8]) -> Result<RecordHeader> {
         return Err(stream_error("replication record has LSN 0"));
     }
 
-    // Bytes 41..45 are UNUSED PADDING in the 45-byte header: the declared fields
-    // end at 41 (`len` occupies 33..41), and nothing reads the remainder. They
-    // are consequently outside `transaction_checksum`, so a flip in them is
-    // invisible to every other check here — an exhaustive bit-flip test over a
-    // real record is what surfaced that.
-    //
-    // Requiring them to be zero matters for a replica specifically. A record this
-    // build encodes always zero-fills them (`vec![0; total_len]`), so a non-zero
-    // byte means the bytes on the wire are not the bytes the primary encoded.
-    // Appending them anyway would leave the replica's segment differing from the
-    // primary's for the same LSN, which quietly breaks the one property that
-    // makes shipping raw records safe: that both sides hold identical logs.
-    //
-    // A future format that claims these bytes is caught by the version check
-    // above before reaching here.
-    if bytes[41..RECORD_HEADER_LEN].iter().any(|byte| *byte != 0) {
+    // Bytes 41..45 were UNUSED PADDING in a version-4 header; version 5
+    // claims them as the header's self-checksum. Either way every header
+    // byte on the wire is now accountable: a version-4 record must carry the
+    // zeros its primary encoded (a non-zero byte means the bytes on the wire
+    // are not the bytes the primary wrote, and appending them would leave
+    // the replica's segment differing from the primary's for the same LSN —
+    // quietly breaking the property that makes shipping raw records safe),
+    // and a version-5 record must carry a checksum its own header fields
+    // reproduce. An exhaustive bit-flip test over a real record is what
+    // surfaced the original padding hole.
+    if bytes[4] == crate::LEGACY_RECORD_VERSION {
+        if bytes[41..RECORD_HEADER_LEN].iter().any(|byte| *byte != 0) {
+            return Err(stream_error(
+                "replication record has non-zero padding in its header",
+            ));
+        }
+    } else if !crate::record_header_crc_ok(&bytes[..RECORD_HEADER_LEN]) {
         return Err(stream_error(
-            "replication record has non-zero padding in its header",
+            "replication record header fails its checksum",
         ));
     }
 
@@ -360,6 +362,15 @@ pub fn archived_records_from(
              * and is caught by the caller's `verify_record`. */
             if &header[0..4] != RECORD_MAGIC {
                 break;
+            }
+            // Magic matched, so bytes were meant to be here — a header that
+            // fails its own checksum is damage, and its declared length must
+            // not frame this walk.
+            if !crate::record_header_crc_ok(header) {
+                return Err(stream_error(format!(
+                    "archived segment {id} holds a record whose header fails its checksum \
+                     at byte {offset}"
+                )));
             }
             let lsn = crate::read_u64(header, 5);
             let payload_len = crate::read_u32(header, 17) as usize;

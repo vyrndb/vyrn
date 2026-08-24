@@ -524,11 +524,20 @@ fn scan_segment(segment_id: u64, bytes: &[u8]) -> Result<(u64, u64)> {
             ));
         }
         let record = &bytes[offset..offset + crate::RECORD_HEADER_LEN];
-        if &record[0..4] != crate::RECORD_MAGIC || record[4] != crate::VERSION {
+        if &record[0..4] != crate::RECORD_MAGIC || !crate::record_version_known(record) {
             return Err(crate::corrupt(
                 segment_id,
                 offset as u64,
                 "invalid transaction header",
+            ));
+        }
+        // Adoption is the loud path: an archive whose record header fails
+        // its own checksum is rot, reported before its lengths are walked.
+        if !crate::record_header_crc_ok(record) {
+            return Err(crate::corrupt(
+                segment_id,
+                offset as u64,
+                "transaction header checksum mismatch",
             ));
         }
         let lsn = crate::read_u64(record, 5);

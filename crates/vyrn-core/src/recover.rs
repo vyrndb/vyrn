@@ -317,7 +317,10 @@ fn record_frame_len(bytes: &[u8], offset: usize, written_through: usize) -> Opti
     if bytes.len() - offset < crate::RECORD_HEADER_LEN
         || offset + crate::RECORD_HEADER_LEN > written_through
         || &bytes[offset..offset + 4] != crate::RECORD_MAGIC
-        || bytes[offset + 4] != crate::VERSION
+        || !crate::record_version_known(&bytes[offset..offset + crate::RECORD_HEADER_LEN])
+        // A header that fails its own checksum declares lengths this walk
+        // must not step by; the frame boundary is here.
+        || !crate::record_header_crc_ok(&bytes[offset..offset + crate::RECORD_HEADER_LEN])
     {
         return None;
     }
