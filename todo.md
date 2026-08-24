@@ -193,14 +193,30 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       sled dipping alongside). Docs in benchmarks.md. NOT done: row cache on the server's
       ReadEngines (their overlay refresh is a separate design — publications already carry the
       keys, so the same invalidate-on-apply rule fits; queued), row cache metrics counters.
-- [ ] **What's still not #1, and what 10× would actually take.** durable_put 64 KiB vs flushed
-      sled ~1.15× — fsync-bound; confirm on Linux before touching. durable_put in general is the
-      disk's number, not the engine's: single-threaded per-op fsync is the floor on every engine;
-      the honest 10× there is concurrent group commit (exists) measured with many writers on real
-      NVMe (the queued Linux runs). scan 128 B #1 but ~10M rows/s: next levers are prefetching the
-      next leaf during emit and a fixed-stride fast path for uniform cells — revisit if a bench
-      war demands it. batch_put's remaining redb gap on its good runs: one shared buffer between
-      WAL encode and change-record staging instead of cloning values into each.
+- [x] **PERF round 11 (embedded group commit — `Engine::drain_wal`)** — the durable rows went
+      from disk-floor to 10K+: `durable_c64` 128 B **34,592/s** (16.7× the single-writer floor,
+      8.7× sled's group, 27× redb), 4 KiB **11,055/s**, 64 KiB 1,340/s trading with sled at the
+      device's bandwidth wall (10K × 64 KiB = 640 MB/s payload — past this SSD with durability on
+      OR off). Found and named the Windows convoy: FlushFileBuffers serializes against WriteFile
+      on the same file, so eager appends under the engine lock collapse a group to ONE commit per
+      fsync (measured 2,110/s at 32 writers = the single rate). Fix = the server's split, now
+      expressible embedded: Async-mode commits buffer records in memory under the lock;
+      `drain_wal` (new, refactored out of `Engine::sync`) hands them to the kernel under the lock
+      and returns the owed LSN; `Wal::sync_through` runs OUTSIDE the lock on the shared handle.
+      WAL-only durability — identical to a durable-mode commit's own barrier. Proof in
+      tests/group_commit.rs: crash-copy the live dir mid-flight; the acked commit survives, the
+      un-drained one does NOT (which is what proves the copy models a crash). Harness grew
+      `durable_c64` rows for all three engines (sled coalesces flush(), redb serializes
+      exclusive txns — its design, reported as found).
+- [ ] **What's still open on the bench front.** durable 64 KiB: bounded by the 2× spill
+      amplification (value log + WAL both carry the bytes) and then by the device — the
+      persistence-strategy change (WAL referencing value-log extents + value-log fsync in the
+      barrier) buys at most 2× and costs recovery complexity; decide deliberately. The served
+      path should expose the same group-commit shape the harness now proves embedded (the server
+      already has the flush stage; check whether its worker appends eagerly under the engine lock
+      — if so it convoys on Windows exactly as the harness did; Linux unaffected, write() and
+      fsync don't serialize there). scan 128 B trades ±10% with redb; batch_put trades on good
+      runs. Linux paired runs still queued and now cover group commit too.
 
 ## ⬜ Queued
 

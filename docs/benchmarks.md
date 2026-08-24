@@ -570,6 +570,55 @@ serve any read but latest-committed point gets (snapshots, transactions, and
 scans never touch it), cache absence, or exist on the server's `ReadEngine`s
 (their overlay-fed refresh is a separate design, queued).
 
+### Fixed: embedded group commit — `drain_wal`, and the Windows convoy
+
+Single-writer durable throughput is the disk's fsync latency and nothing
+else: all three engines sit within 2x of the same ~1–2 K/s floor on this
+host, because all three are waiting on the same barrier. The way past it is
+not less durability — sled's "async" 300 K/s row is what that looks like —
+but group commit: N concurrent writers share one barrier, and every put is
+still individually durable before it is acknowledged. The server has always
+done this; the embedded engine could not express it, and the first attempt
+exposed why naively it cannot work on Windows at all:
+
+**`FlushFileBuffers` serializes against `WriteFile` on the same file.** With
+eager WAL appends, a writer's append blocks behind the in-flight barrier —
+inside the engine lock — so writers convoy one commit per fsync and the
+group collapses to one (measured: 32 writers, 2,110/s, exactly the
+single-writer rate). The fix is the same split the server's flush stage
+uses: commit in `DurabilityMode::Async`, where the record is buffered in
+memory under the lock and touches no file, and let the barrier both write
+and sync. The new `Engine::drain_wal` hands every buffered record to the
+kernel under the lock and returns the LSN owed; the caller runs
+`Wal::sync_through` on the shared handle OUTSIDE the lock, so commits keep
+flowing into the buffer while the fsync runs. Durability is WAL-only —
+exactly the claim a durable-mode commit's own barrier makes; pages and
+spilled values are redo's job.
+
+The durability proof (`tests/group_commit.rs`) crashes the engine honestly:
+copy the live data directory mid-flight, open the copy. A commit
+acknowledged after `drain_wal` + `sync_through` survives; a commit still
+sitting in the async buffer does not — the second half is what proves the
+copy models a crash rather than riding a clean shutdown's sync.
+
+The harness's `durable_c64` rows (64 writers, each put counted only once
+its own LSN is behind a completed fsync; sled coalesces its own `flush()`,
+redb serializes exclusive write transactions — its design, reported as
+found):
+
+    durable_c64 128 B    34,592/s   (single-writer floor 2,073; sled's
+                                     group 3,981; redb 1,255)
+    durable_c64 4 KiB    11,055/s   (sled 3,048; redb 989)
+    durable_c64 64 KiB    1,340/s   (trading with sled's 1,382 at the
+                                     device's bandwidth wall)
+
+The 64 KiB row is arithmetic, not engineering: 10 K/s of 64 KiB durable
+puts is 640 MB/s of payload before any amplification — past this SSD
+entirely (sled with durability OFF manages 3.4 K there). The known 2x
+amplification for spilled values (the bytes land in the value log AND the
+WAL record) is the queued persistence-strategy item, and even solved it
+buys at most that factor.
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and

@@ -2801,37 +2801,65 @@ impl Engine {
         if !self.pending_wal.is_empty() {
             self.tree.sync()?;
             self.mvcc_values.sync()?;
-            let pending = std::mem::take(&mut self.pending_wal);
-            // Each record is appended with the LSN it was issued at. Draining
-            // them all at `last_lsn` published that highest LSN to
-            // `appended_lsn` on the very first append, so a concurrent
-            // `sync_through` could declare every buffered record durable while
-            // most of them had not even been handed to the kernel.
-            let flushed = pending
-                .into_iter()
-                .enumerate()
-                .try_for_each(|(index, (lsn, record))| {
-                    // Offered from the second record on only, so an injected
-                    // failure lands after one record has already left the
-                    // buffer — the shape of an ENOSPC mid-drain.
-                    if index > 0 {
-                        self.inject(FailurePoint::BetweenBufferedAppends)?;
-                    }
-                    self.wal.append(&record, lsn)
-                });
-            if let Err(error) = flushed {
-                // Whatever was drained is gone from the buffer and the records
-                // behind it were never issued; neither can be put back. Keeping
-                // quiet here would leave an engine that looks healthy while
-                // acknowledged async writes silently vanish at the next
-                // restart, which is the one outcome worse than refusing work.
-                self.poisoned = true;
-                return Err(error);
-            }
+            self.drain_pending_wal()?;
         }
         // Also covers a durable commit whose flush was deferred to the caller,
         // so a shutdown or checkpoint never leaves an acknowledged write behind.
         self.wal.sync_through(self.wal.appended())?;
+        Ok(())
+    }
+
+    /// Hands every async-buffered WAL record to the kernel and returns the
+    /// LSN the caller must pass to [`Wal::sync_through`] (via
+    /// [`Engine::wal`]) before acknowledging anything — the group-commit
+    /// shape: drain under the engine's write lock, barrier outside it, so
+    /// commits keep flowing while the flush runs. On Windows this split is
+    /// what makes group commit group at all: `FlushFileBuffers` serializes
+    /// against writes to the same file, so a barrier held under the same
+    /// lock as the appends collapses the group to one.
+    ///
+    /// Durability is WAL-only, which is exactly a durable-mode commit's own
+    /// barrier: pages and spilled values are written but not synced, and
+    /// redo recovery reconstructs them from the log when they do not
+    /// survive. [`Engine::sync`] remains the shutdown/checkpoint barrier
+    /// that also syncs the tree and value files.
+    pub fn drain_wal(&mut self) -> Result<u64> {
+        self.ensure_healthy()?;
+        self.drain_pending_wal()?;
+        Ok(self.wal.appended())
+    }
+
+    fn drain_pending_wal(&mut self) -> Result<()> {
+        if self.pending_wal.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending_wal);
+        // Each record is appended with the LSN it was issued at. Draining
+        // them all at `last_lsn` published that highest LSN to
+        // `appended_lsn` on the very first append, so a concurrent
+        // `sync_through` could declare every buffered record durable while
+        // most of them had not even been handed to the kernel.
+        let flushed = pending
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(index, (lsn, record))| {
+                // Offered from the second record on only, so an injected
+                // failure lands after one record has already left the
+                // buffer — the shape of an ENOSPC mid-drain.
+                if index > 0 {
+                    self.inject(FailurePoint::BetweenBufferedAppends)?;
+                }
+                self.wal.append(&record, lsn)
+            });
+        if let Err(error) = flushed {
+            // Whatever was drained is gone from the buffer and the records
+            // behind it were never issued; neither can be put back. Keeping
+            // quiet here would leave an engine that looks healthy while
+            // acknowledged async writes silently vanish at the next
+            // restart, which is the one outcome worse than refusing work.
+            self.poisoned = true;
+            return Err(error);
+        }
         Ok(())
     }
 
