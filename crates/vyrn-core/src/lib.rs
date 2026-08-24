@@ -4453,12 +4453,32 @@ fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> io::Result<()> {
+/// Windows directory-entry durability.
+///
+/// A directory opened with `FILE_FLAG_BACKUP_SEMANTICS` and write access is
+/// a legal target for `FlushFileBuffers`, which flushes the directory's NTFS
+/// metadata — the rename or create this call is asked to make durable. This
+/// used to be a silent no-op, which left every rename-publish (manifests,
+/// archive segments, backups) unproven on Windows; the flush is real now,
+/// and its failure is reported rather than swallowed, exactly as on Unix.
+#[cfg(windows)]
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 

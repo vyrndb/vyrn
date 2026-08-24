@@ -97,3 +97,22 @@ fn drain_is_idempotent_and_the_barrier_coalesces() {
     wal.sync_through(owed).unwrap();
     wal.sync_through(owed).unwrap(); // covered: must be a no-op, not an error
 }
+
+/// `sync_directory` was a silent no-op off Unix, which made every
+/// rename-publish (manifests, archive segments, backup outputs) unproven on
+/// Windows. The Windows arm opens the directory with backup semantics and
+/// write access and flushes it; this pins that the open+flush path actually
+/// succeeds on the platform the suite runs on, so a permissions or flags
+/// regression cannot quietly turn the flush back into a no-op that errors.
+#[test]
+fn a_data_directory_survives_a_directory_sync() {
+    let directory = tempfile::tempdir().unwrap();
+    // Exercised through the public surface: a put followed by a checkpointed
+    // engine drop runs the manifest rename + directory sync path end to end.
+    let mut engine = Engine::open(directory.path()).unwrap();
+    engine.put(b"k".to_vec(), b"v".to_vec()).unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let engine = Engine::open(directory.path()).unwrap();
+    assert_eq!(engine.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+}

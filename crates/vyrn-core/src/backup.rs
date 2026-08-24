@@ -384,14 +384,7 @@ fn read_u64(input: &mut File) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
-}
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
+use crate::sync_directory;
 
 #[cfg(test)]
 mod tests {
