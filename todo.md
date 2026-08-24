@@ -16,11 +16,18 @@
 - [ ] Windows flake: named — vyrnd integration binaries `hardening` and `replication` under
       full-workspace parallel load (2 of 6 runs); test-name capture in progress. Windows is a
       development platform; gate is "named and tracked", not "fixed".
-- [ ] REMAINING before the tag: CI green on the push (first-ever crash-soak run included), and
-      the sandbox items that need real hardware — multi-hour larger-than-memory soak and the
-      operational restore + PITR drill (production.md exit gates; tooling exists). Tag
-      v1.0.0 once CI passes; run the soak/drill as the first post-tag action or hold the tag
-      for them — owner's call.
+- [ ] REMAINING before the tag — **and a discovery**: GitHub Actions has NEVER successfully
+      started on this repo. Every run in history is `startup_failure` at 0 s (`path:
+      "BuildFailed"`), since the workflow landed in July. The YAML is valid (parses locally,
+      same-toolchain fmt/clippy/tests green), Actions is enabled with all actions allowed —
+      the repo is PRIVATE, which makes exhausted/unfunded Actions minutes (or a $0 spending
+      limit) the near-certain cause. OWNER ACTION REQUIRED, one of: add a payment method /
+      raise the Actions spending limit for private repos, or make the repo public (standard
+      runners are free for public repos). Consequence worth knowing: the Linux test suite has
+      only ever run on developer machines (WSL2 historically), never in CI. Once CI goes
+      green (first-ever crash-soak run included): tag v1.0.0. The multi-hour
+      larger-than-memory soak and the operational restore + PITR drill remain the
+      real-hardware items (tooling exists; run on the sandbox or a Linux box).
 
 Living checklist for the fix fleet. Baseline commit: `ac4c506`.
 
