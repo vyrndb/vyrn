@@ -3,6 +3,7 @@ pub mod change_log;
 pub mod document;
 mod fast_hash;
 mod mvcc;
+mod row_cache;
 mod overlay;
 mod page_tree;
 pub mod portable;
@@ -64,6 +65,18 @@ impl SharedBytes {
 
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_slice().to_vec()
+    }
+
+    /// The value as one shared allocation, for the row cache: when the bytes
+    /// already live in a reference-counted buffer — the value cache's or the
+    /// write-back overlay's — that buffer is reused with a count bump, and
+    /// only page-backed bytes are copied out.
+    fn shared_vec(&self) -> Arc<Vec<u8>> {
+        match &self.0 {
+            SharedRepr::Buffered(value) => Arc::clone(value),
+            SharedRepr::Tree(page_tree::SharedTreeValue::Log(value)) => Arc::clone(value),
+            SharedRepr::Tree(value) => Arc::new(value.as_slice().to_vec()),
+        }
     }
 }
 
@@ -866,6 +879,17 @@ pub struct Engine {
     archived_through: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Replication tap, `None` when replication is off.
     record_sink: Option<Arc<dyn RecordSink>>,
+    /// Newest committed value per hot user key — see [`row_cache`] for the
+    /// invalidation argument. Budget from `VYRN_ROW_CACHE_BYTES`.
+    row_cache: row_cache::RowCache,
+    /// Whether any tombstone can exist: probed once at open, set — never
+    /// cleared — by every delete that writes one. While false, a commit's
+    /// pre-state read skips the tombstone half of its key sweep, which
+    /// doubles the descents of a delete-free workload for lookups that can
+    /// only miss. Conservative by construction: a spurious `true` costs
+    /// descents, a spurious `false` would corrupt revision bookkeeping —
+    /// so it only ever moves toward `true` between opens.
+    tombstones_possible: bool,
 }
 
 impl Engine {
@@ -987,6 +1011,16 @@ impl Engine {
         // Everything already in the segment survived recovery, so it is durable.
         wal.adopt(state.lsn);
 
+        // One bounded probe: does any tombstone survive recovery? The
+        // write-back buffer is always empty at open, so the tree alone
+        // answers.
+        let tombstones_possible = !tree
+            .scan(
+                Some(TOMBSTONE_PREFIX),
+                prefix_end(TOMBSTONE_PREFIX).as_deref(),
+                1,
+            )?
+            .is_empty();
         Ok(Self {
             path: path.to_owned(),
             tree,
@@ -1017,12 +1051,25 @@ impl Engine {
             wal_len,
             archived_through: options.archived_through,
             record_sink: options.record_sink,
+            row_cache: row_cache::RowCache::new(),
+            tombstones_possible,
         })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         validate_user_key(key)?;
-        self.get_internal(key)
+        self.ensure_healthy()?;
+        validate_key(key)?;
+        // The health check runs before the cache: a poisoned engine refuses
+        // reads outright, cached or not.
+        if let Some(hit) = self.row_cache.get(key) {
+            return Ok(Some(hit.as_ref().clone()));
+        }
+        let value = self.tree_get(key)?;
+        if let Some(value) = &value {
+            self.row_cache.insert(key, Arc::new(value.clone()));
+        }
+        Ok(value)
     }
 
     /// [`Engine::get`] without copying the value out — see [`SharedBytes`].
@@ -1030,7 +1077,16 @@ impl Engine {
         validate_user_key(key)?;
         self.ensure_healthy()?;
         validate_key(key)?;
-        overlay::merged_get_shared(&self.tree, self.write_back.as_ref(), key)
+        // The health check runs before the cache: a poisoned engine refuses
+        // reads outright, cached or not.
+        if let Some(hit) = self.row_cache.get(key) {
+            return Ok(Some(SharedBytes::buffered(hit)));
+        }
+        let value = overlay::merged_get_shared(&self.tree, self.write_back.as_ref(), key)?;
+        if let Some(value) = &value {
+            self.row_cache.insert(key, value.shared_vec());
+        }
+        Ok(value)
     }
 
     /// The fastest scan there is: every row reaches `visit` as two borrowed
@@ -1984,8 +2040,10 @@ impl Engine {
             };
             wanted.push(key.clone());
             // A put clears any tombstone, and a delete writes one, so their
-            // presence matters too.
-            if !key.starts_with(INTERNAL_PREFIX) {
+            // presence matters too — unless none can exist, in which case
+            // the whole tombstone half of the sweep is descents that can
+            // only miss.
+            if self.tombstones_possible && !key.starts_with(INTERNAL_PREFIX) {
                 wanted.push(tombstone_key(key));
             }
         }
@@ -2058,13 +2116,18 @@ impl Engine {
                     validate_key(&key)?;
                     validate_value(&value)?;
                     let internal = key.starts_with(INTERNAL_PREFIX);
-                    if !internal {
+                    // `tombstones_possible` is read live, not snapshotted: a
+                    // delete earlier in this same batch may have written the
+                    // first tombstone ever, and it seeded the overlay on its
+                    // way — so this probe still sees it.
+                    if !internal && self.tombstones_possible {
                         let tombstone = tombstone_key(&key);
                         // Every key and tombstone the loop probes was seeded
-                        // into the overlay from `wanted`, so updates go
-                        // through `get_mut` — the `insert` this replaces
-                        // cloned the key just to hand the map a spelling it
-                        // already owned.
+                        // into the overlay from `wanted` (or by an earlier
+                        // delete in this batch), so updates go through
+                        // `get_mut` — the `insert` this replaces cloned the
+                        // key just to hand the map a spelling it already
+                        // owned.
                         if let Some(slot) = overlay.get_mut(&tombstone) {
                             if *slot {
                                 *slot = false;
@@ -2110,6 +2173,9 @@ impl Engine {
                     mutations.push((key.clone(), page_tree::Mutation::Delete));
                     if !internal {
                         user_delta -= 1;
+                        // From here on, tombstones exist — for this batch's
+                        // own later puts and for every commit after it.
+                        self.tombstones_possible = true;
                         let tombstone = tombstone_key(&key);
                         if let Some(slot) = overlay.get_mut(&tombstone) {
                             *slot = true;
@@ -2276,6 +2342,15 @@ impl Engine {
                 }
             }
         };
+        // The batch is visible — and, in durable mode, durable — so its keys
+        // leave the row cache before this method returns. `&mut self` means
+        // no read can interleave between the publish above and this point;
+        // the change-log record's internal key was never cached, and the
+        // invalidate is a cheap miss for it. Tombstones ride only
+        // `mutations`, and the cache never holds them either.
+        for operation in &pending {
+            self.row_cache.invalidate(&operation.key);
+        }
         // History maintenance runs after `commit_batch` has fsynced, so a
         // failure here must not travel to the caller as an ordinary error: the
         // write IS durable, and returning "retry" would invite a double apply.
@@ -3041,6 +3116,11 @@ impl Engine {
          * to become visible.
          */
         for (op, key, value) in operations {
+            // A replica serves reads while it applies, so every applied key
+            // leaves the row cache — the same rule `write_batch` follows at
+            // the same point: after the mutation is visible, under the same
+            // exclusive access that keeps reads from interleaving.
+            self.row_cache.invalidate(&key);
             if op == OP_PUT {
                 let value = value.unwrap_or_default();
                 let (root, len) = self.tree.prepare_put(&key, &value, lsn)?;
@@ -3058,6 +3138,7 @@ impl Engine {
                     // A delete of an existing user key records its revision on a
                     // tombstone at the deleting record's LSN.
                     if !key.starts_with(INTERNAL_PREFIX) {
+                        self.tombstones_possible = true;
                         let (root, len) = self.tree.prepare_put(&tombstone_key(&key), &[], lsn)?;
                         self.tree.publish(root, len);
                     }

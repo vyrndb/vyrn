@@ -1077,6 +1077,52 @@ impl PageTree {
         Ok(low)
     }
 
+    /// The slot-index segments of a leaf a scan should emit: `[start, end)`
+    /// resolved to index bounds by binary search, with the excluded prefix's
+    /// own index range cut out of the middle. Every per-ROW key comparison
+    /// disappears — the range test and the prefix test each become one bound
+    /// computed in log2(count) probes per leaf. On a forged page whose keys
+    /// are not actually sorted the bounds may admit rows a per-row test
+    /// would have dropped; the per-row walk already placed the same trust in
+    /// cell order when it stopped at the first key past `end`.
+    fn leaf_emit_segments(
+        &self,
+        directory: &Slots,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        excluded_prefix: Option<&[u8]>,
+    ) -> Result<[(usize, usize); 2]> {
+        let first = match start {
+            Some(start) => self.leaf_lower_bound(directory, page_id, start)?,
+            None => 0,
+        };
+        let last = match end {
+            Some(end) => self
+                .leaf_lower_bound(directory, page_id, end)?
+                .max(first),
+            None => directory.count,
+        };
+        let (skip_from, skip_to) = match excluded_prefix {
+            Some(prefix) => {
+                let from = self.leaf_lower_bound(directory, page_id, prefix)?;
+                // An all-0xFF prefix has no successor: everything at or past
+                // it is excluded. An empty prefix has a `from` of zero and no
+                // successor either, which excludes the whole leaf — exactly
+                // what `starts_with(&[])` excluded per row.
+                let to = match prefix_successor(prefix) {
+                    Some(successor) => {
+                        self.leaf_lower_bound(directory, page_id, &successor)?
+                    }
+                    None => directory.count,
+                };
+                (from.clamp(first, last), to.clamp(first, last))
+            }
+            None => (last, last),
+        };
+        Ok([(first, skip_from), (skip_to, last)])
+    }
+
     /// `find_in_leaf`'s slot-directory fast path: binary-search the cell,
     /// then parse just that one cell into a [`LeafHit`].
     fn find_in_leaf_slots(
@@ -2038,79 +2084,46 @@ impl PageTree {
             Blob(Vec<u8>),
         }
         let mut deferred: Option<Vec<(Src, std::result::Result<Src, ValueRef>)>> = None;
-        let first = match start {
-            Some(start) => self.leaf_lower_bound(directory, page_id, start)?,
-            None => 0,
-        };
-        for index in first..directory.count {
-            let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
-            let flags = leaf[cell];
-            let key_len = read_u32(leaf, cell + 1) as usize;
-            let value_len = read_u32(leaf, cell + 5) as usize;
-            if key_len == 0
-                || key_len > MAX_STORED_KEY_SIZE
-                || value_len > MAX_VALUE_SIZE
-                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
-            {
-                return Err(Error::CorruptPage {
-                    page_id,
-                    reason: "invalid leaf cell metadata".into(),
-                });
-            }
-            let external_key = flags & EXTERNAL_KEY != 0;
-            let key_start = cell + LEAF_CELL_HEADER;
-            let blob_key = if external_key {
-                Some(self.read_blob(read_u64(leaf, cell + 9), key_len)?)
-            } else {
-                if key_start + key_len > cell_end {
+        let segments =
+            self.leaf_emit_segments(directory, page_id, start, end, excluded_prefix)?;
+        'segments: for (from, to) in segments {
+            for index in from..to {
+                let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
+                let flags = leaf[cell];
+                let key_len = read_u32(leaf, cell + 1) as usize;
+                let value_len = read_u32(leaf, cell + 5) as usize;
+                if key_len == 0
+                    || key_len > MAX_STORED_KEY_SIZE
+                    || value_len > MAX_VALUE_SIZE
+                    || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+                {
                     return Err(Error::CorruptPage {
                         page_id,
                         reason: "invalid leaf cell metadata".into(),
                     });
                 }
-                None
-            };
-            let cell_key: &[u8] = match &blob_key {
-                Some(key) => key,
-                None => &leaf[key_start..key_start + key_len],
-            };
-            if end.is_some_and(|end| cell_key >= end) {
-                break;
-            }
-            if excluded_prefix.is_some_and(|prefix| cell_key.starts_with(prefix)) {
-                continue;
-            }
-            let value_external = flags & EXTERNAL_VALUE != 0;
-            if value_external {
-                deferred.get_or_insert_with(Vec::new).push((
-                    match blob_key {
-                        Some(key) => Src::Blob(key),
-                        None => Src::Page {
-                            offset: key_start,
-                            len: key_len,
-                        },
-                    },
-                    Err(ValueRef {
-                        offset: read_u64(leaf, cell + 17),
-                        len: value_len as u32,
-                        revision: read_u64(leaf, cell + 25),
-                    }),
-                ));
-            } else {
-                let value_start = if external_key {
-                    key_start
+                let external_key = flags & EXTERNAL_KEY != 0;
+                let key_start = cell + LEAF_CELL_HEADER;
+                let blob_key = if external_key {
+                    Some(self.read_blob(read_u64(leaf, cell + 9), key_len)?)
                 } else {
-                    key_start + key_len
+                    if key_start + key_len > cell_end {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    None
                 };
-                if value_start + value_len > cell_end {
-                    return Err(Error::CorruptPage {
-                        page_id,
-                        reason: "invalid leaf cell metadata".into(),
-                    });
-                }
-                match &mut deferred {
-                    None => visit(cell_key, &leaf[value_start..value_start + value_len]),
-                    Some(deferred) => deferred.push((
+                // The range and prefix filters are the segment bounds; no
+                // per-row key comparison remains.
+                let cell_key: &[u8] = match &blob_key {
+                    Some(key) => key,
+                    None => &leaf[key_start..key_start + key_len],
+                };
+                let value_external = flags & EXTERNAL_VALUE != 0;
+                if value_external {
+                    deferred.get_or_insert_with(Vec::new).push((
                         match blob_key {
                             Some(key) => Src::Blob(key),
                             None => Src::Page {
@@ -2118,16 +2131,45 @@ impl PageTree {
                                 len: key_len,
                             },
                         },
-                        Ok(Src::Page {
-                            offset: value_start,
-                            len: value_len,
+                        Err(ValueRef {
+                            offset: read_u64(leaf, cell + 17),
+                            len: value_len as u32,
+                            revision: read_u64(leaf, cell + 25),
                         }),
-                    )),
+                    ));
+                } else {
+                    let value_start = if external_key {
+                        key_start
+                    } else {
+                        key_start + key_len
+                    };
+                    if value_start + value_len > cell_end {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    match &mut deferred {
+                        None => visit(cell_key, &leaf[value_start..value_start + value_len]),
+                        Some(deferred) => deferred.push((
+                            match blob_key {
+                                Some(key) => Src::Blob(key),
+                                None => Src::Page {
+                                    offset: key_start,
+                                    len: key_len,
+                                },
+                            },
+                            Ok(Src::Page {
+                                offset: value_start,
+                                len: value_len,
+                            }),
+                        )),
+                    }
                 }
-            }
-            *emitted += 1;
-            if *emitted == limit {
-                break;
+                *emitted += 1;
+                if *emitted == limit {
+                    break 'segments;
+                }
             }
         }
         if let Some(deferred) = deferred {
@@ -2343,80 +2385,72 @@ impl PageTree {
     ) -> Result<()> {
         let leaf: &Page = page;
         let mut pending: Vec<(usize, ValueRef)> = Vec::new();
-        let first = match start {
-            Some(start) => self.leaf_lower_bound(directory, page_id, start)?,
-            None => 0,
-        };
-        for index in first..directory.count {
-            let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
-            let flags = leaf[cell];
-            let key_len = read_u32(leaf, cell + 1) as usize;
-            let value_len = read_u32(leaf, cell + 5) as usize;
-            if key_len == 0
-                || key_len > MAX_STORED_KEY_SIZE
-                || value_len > MAX_VALUE_SIZE
-                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
-            {
-                return Err(Error::CorruptPage {
-                    page_id,
-                    reason: "invalid leaf cell metadata".into(),
-                });
-            }
-            let external_key = flags & EXTERNAL_KEY != 0;
-            let key_start = cell + LEAF_CELL_HEADER;
-            let blob_key = if external_key {
-                Some(self.read_blob(read_u64(leaf, cell + 9), key_len)?)
-            } else {
-                if key_start + key_len > cell_end {
+        let segments =
+            self.leaf_emit_segments(directory, page_id, start, end, excluded_prefix)?;
+        'segments: for (from, to) in segments {
+            for index in from..to {
+                let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
+                let flags = leaf[cell];
+                let key_len = read_u32(leaf, cell + 1) as usize;
+                let value_len = read_u32(leaf, cell + 5) as usize;
+                if key_len == 0
+                    || key_len > MAX_STORED_KEY_SIZE
+                    || value_len > MAX_VALUE_SIZE
+                    || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+                {
                     return Err(Error::CorruptPage {
                         page_id,
                         reason: "invalid leaf cell metadata".into(),
                     });
                 }
-                None
-            };
-            let cell_key: &[u8] = match &blob_key {
-                Some(key) => key,
-                None => &leaf[key_start..key_start + key_len],
-            };
-            if end.is_some_and(|end| cell_key >= end) {
-                break;
-            }
-            if excluded_prefix.is_some_and(|prefix| cell_key.starts_with(prefix)) {
-                continue;
-            }
-            let revision = read_u64(leaf, cell + 25);
-            let key = match blob_key {
-                Some(key) => Bytes::Owned(key),
-                None => Bytes::paged(page, key_start, key_len),
-            };
-            let value = if flags & EXTERNAL_VALUE != 0 {
-                pending.push((
-                    rows.len(),
-                    ValueRef {
-                        offset: read_u64(leaf, cell + 17),
-                        len: value_len as u32,
-                        revision,
-                    },
-                ));
-                SharedTreeValue::Paged(Bytes::Owned(Vec::new()))
-            } else {
-                let value_start = if external_key {
-                    key_start
+                let external_key = flags & EXTERNAL_KEY != 0;
+                let key_start = cell + LEAF_CELL_HEADER;
+                let blob_key = if external_key {
+                    Some(self.read_blob(read_u64(leaf, cell + 9), key_len)?)
                 } else {
-                    key_start + key_len
+                    if key_start + key_len > cell_end {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    None
                 };
-                if value_start + value_len > cell_end {
-                    return Err(Error::CorruptPage {
-                        page_id,
-                        reason: "invalid leaf cell metadata".into(),
-                    });
+                // The range and prefix filters are the segment bounds; no
+                // per-row key comparison remains.
+                let revision = read_u64(leaf, cell + 25);
+                let key = match blob_key {
+                    Some(key) => Bytes::Owned(key),
+                    None => Bytes::paged(page, key_start, key_len),
+                };
+                let value = if flags & EXTERNAL_VALUE != 0 {
+                    pending.push((
+                        rows.len(),
+                        ValueRef {
+                            offset: read_u64(leaf, cell + 17),
+                            len: value_len as u32,
+                            revision,
+                        },
+                    ));
+                    SharedTreeValue::Paged(Bytes::Owned(Vec::new()))
+                } else {
+                    let value_start = if external_key {
+                        key_start
+                    } else {
+                        key_start + key_len
+                    };
+                    if value_start + value_len > cell_end {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid leaf cell metadata".into(),
+                        });
+                    }
+                    SharedTreeValue::Paged(Bytes::paged(page, value_start, value_len))
+                };
+                rows.push((key, value, revision));
+                if rows.len() == limit {
+                    break 'segments;
                 }
-                SharedTreeValue::Paged(Bytes::paged(page, value_start, value_len))
-            };
-            rows.push((key, value, revision));
-            if rows.len() == limit {
-                break;
             }
         }
         if !pending.is_empty() {
@@ -3318,6 +3352,15 @@ fn internal_cell_size(key: &[u8]) -> usize {
         } else {
             0
         }
+}
+
+/// The smallest key that sorts after every key carrying `prefix`, or `None`
+/// when no such key exists (an all-0xFF prefix bounds nothing above).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last_incrementable = prefix.iter().rposition(|byte| *byte != 0xFF)?;
+    let mut successor = prefix[..=last_incrementable].to_vec();
+    *successor.last_mut().expect("nonempty by construction") += 1;
+    Some(successor)
 }
 
 fn require_page(offset: usize, length: usize, page_id: u64) -> Result<()> {

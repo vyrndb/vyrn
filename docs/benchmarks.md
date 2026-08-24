@@ -510,6 +510,66 @@ The harness after all three (same host; write rows ±10–15% run to run):
     point_get 64 KiB   1.82-1.86 M vs redb 1.99-2.07 M (~1.1x behind,
                        consistently — the one read row still lost)
 
+### Fixed: the row cache — hot point reads in one hash probe
+
+A hot point read recomputed, on every call, an answer that had not changed:
+a page-cache probe per tree level, a leaf binary search, and (for a spilled
+value) a value-cache probe. The comparison engines do not pay this — sled's
+tree IS an in-memory cache of refcounted buffers, and redb hands out slices
+of mmap the OS keeps warm — so vyrn now has the equivalent: a byte-budgeted
+cache of the newest committed value per user key (`VYRN_ROW_CACHE_BYTES`,
+default 64 MiB, 0 disables). A hit is one fast-hash probe and a
+reference-count bump.
+
+The invalidation argument, stated once and pinned by tests: only
+`Engine::get`/`get_shared` consult the cache, and both refuse internal keys,
+so everything cacheable mutates through exactly two paths — `write_batch`
+(which every embedded write, transaction commit, document write, and indexed
+write funnels through) and the replica's record apply — and both invalidate
+after the mutation is visible, under the same exclusive access that keeps
+reads from interleaving. Every other tree mutation is content-preserving
+(write-back absorb, checkpoint compaction) or precedes serving reads
+(recovery, restore, import). Absent keys are never cached, so no
+creation-invalidation rule exists to miss. `tests/row_cache.rs` pins
+read-your-write through overwrites, deletes, multi-key batches, threshold
+flushes, and reopen — all three tests fail with the invalidation removed
+(verified by removing it).
+
+Two companions in the same round:
+
+- **Scans emit between binary-searched bounds.** The `[start, end)` range
+  and the excluded-prefix filter each became index bounds computed once per
+  leaf (the prefix region is cut out as an index gap), so the emit loop
+  compares no keys at all — the per-row `end` test was a full key
+  comparison on every row of every bounded scan.
+- **Delete-free databases stop sweeping for tombstones.** A commit's
+  pre-state read included a tombstone probe per key — descents that can
+  only miss until the first delete ever. One bounded probe at open plus a
+  monotonic flag (set by the first tombstone-writing delete, live within
+  the batch so a delete-then-put still clears correctly) halves the sweep.
+
+The harness, all engines on 1 GiB cache budgets (vyrn's page, value, and row
+caches never fill together — each row shape exercises one):
+
+    point_get 128 B    2.1 -> 3.2-3.3 M/s     #1, 1.8x over redb
+    point_get 4 KiB    1.2 -> 3.0-3.3 M/s     #1, 2.5-2.7x over redb (was
+                                              the contested row)
+    point_get 64 KiB   1.8 -> 3.5-3.7 M/s     #1, 1.75x over redb (was the
+                                              last read row lost)
+    scan_1000 4 KiB    11.8 -> 12.5-13.1 M rows/s  (#1, 3x over redb)
+    scan_1000 128 B    9.8-10.3 M rows/s      #1 both runs
+    batch_put 128 B    268 -> 328 K ops/s     #1 over redb's 283 K (row is
+                                              noisy on this host: one run
+                                              dipped to 162 K with sled
+                                              dipping the same run)
+    durable_put        128 B and 4 KiB #1; 64 KiB behind flushed sled
+                       ~1.15x, inside this host's fsync noise, Linux-gated
+
+Eight of nine rows #1 or better. What this cache deliberately does NOT do:
+serve any read but latest-committed point gets (snapshots, transactions, and
+scans never touch it), cache absence, or exist on the server's `ReadEngine`s
+(their overlay-fed refresh is a separate design, queued).
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and

@@ -178,15 +178,29 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       Harness: batch_put 211K → ~268K (now trading with redb), point_get 4 KiB now trading
       (1.27M vs 1.19M in the confirming run), scan_4KiB #1 by 2.3–2.8×. Write-up in
       docs/benchmarks.md.
-- [ ] **The remaining contested rows.** point_get 64 KiB: ~1.1× behind redb consistently — the
-      last read row lost; remaining cost is the value-cache probe + Arc round trip vs redb's
-      guard handing out an mmap slice, plus the descent's per-page mutex (a sharded or lock-free
-      read path is the structural fix). durable_put 64 KiB vs flushed sled ~1.15x (consistent but
-      fsync-noise adjacent; confirm on Linux first). scan 128 B trades ±10% with redb run to run;
-      the 20M rows/s aspiration needs per-row emit cost halved (fewer bounds-checked field reads
-      per visit) — diminishing returns, revisit after the mutex work. batch_put now trades with
-      redb; the next step there would be sharing one buffer between the WAL encode and the
-      change-record staging instead of cloning values into each.
+- [x] **PERF round 10 (row cache + segment scans + tombstone skip)** — 8 of 9 harness rows #1.
+      (1) Row cache (`row_cache.rs`, `VYRN_ROW_CACHE_BYTES`, default 64 MiB): newest committed
+      value per user key, one fast-hash probe per hit; invalidated in write_batch and replica
+      apply after visibility — the only two paths that can mutate a cacheable key (get/get_shared
+      refuse internal keys; everything else is content-preserving or pre-serving). Absence never
+      cached. `tests/row_cache.rs` ×3, all fail with invalidation removed. point_get 128 B/4 KiB/
+      64 KiB → 3.0–3.7 M/s, ALL #1 over redb by 1.75–2.7× (4 KiB and 64 KiB were the contested
+      rows). (2) Scans emit between binary-searched index bounds — range and excluded-prefix
+      filters computed once per leaf, zero per-row key comparisons; scan_4KiB 12.5–13.1M rows/s
+      (3× redb). (3) `tombstones_possible` flag (open probe + monotonic set on first
+      tombstone-writing delete, live within a batch) halves a delete-free commit's pre-state
+      sweep; batch_put 328K #1 over redb (row noisy on this host: one run dipped to 162K with
+      sled dipping alongside). Docs in benchmarks.md. NOT done: row cache on the server's
+      ReadEngines (their overlay refresh is a separate design — publications already carry the
+      keys, so the same invalidate-on-apply rule fits; queued), row cache metrics counters.
+- [ ] **What's still not #1, and what 10× would actually take.** durable_put 64 KiB vs flushed
+      sled ~1.15× — fsync-bound; confirm on Linux before touching. durable_put in general is the
+      disk's number, not the engine's: single-threaded per-op fsync is the floor on every engine;
+      the honest 10× there is concurrent group commit (exists) measured with many writers on real
+      NVMe (the queued Linux runs). scan 128 B #1 but ~10M rows/s: next levers are prefetching the
+      next leaf during emit and a fixed-stride fast path for uniform cells — revisit if a bench
+      war demands it. batch_put's remaining redb gap on its good runs: one shared buffer between
+      WAL encode and change-record staging instead of cloning values into each.
 
 ## ⬜ Queued
 
