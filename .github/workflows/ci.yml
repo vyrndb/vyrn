@@ -59,6 +59,11 @@ jobs:
 
   audit:
     runs-on: ubuntu-24.04
+    # The action posts its findings as a check run, which the workflow's
+    # read-only default forbids.
+    permissions:
+      contents: read
+      checks: write
     # cargo-audit tracks recent rustc and the repo's rust-toolchain.toml pins
     # the build toolchain, which overrides any installed default — the env
     # var outranks the file, so the audit alone runs on stable.
