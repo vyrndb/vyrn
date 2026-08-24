@@ -61,6 +61,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # cargo-audit tracks recent rustc; the pinned build toolchain fell
+      # behind its requirement, so the audit installs on stable.
+      - uses: dtolnay/rust-toolchain@stable
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -304,11 +304,24 @@ fn an_acknowledged_write_is_durable_on_the_replica() {
         Some("alica@example.com".to_owned()),
         "replica should hold the acknowledged write"
     );
-    assert_eq!(
-        replica.metric("vyrn_replication_last_lsn"),
-        cluster.primary.metric("vyrn_replication_last_lsn"),
-        "replica and primary should agree on the last LSN"
-    );
+    /* The LSN gauges, unlike the read above, are REPORTING, and reporting is
+     * asynchronous on both sides — the tag-run CI caught the primary's gauge
+     * still at 0 an instant after the acknowledged write. Sampled until they
+     * agree at a nonzero LSN; the durability guarantee itself was already
+     * proven by the un-polled read. */
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let replica_lsn = replica.metric("vyrn_replication_last_lsn");
+        let primary_lsn = cluster.primary.metric("vyrn_replication_last_lsn");
+        if replica_lsn == primary_lsn && replica_lsn > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica ({replica_lsn}) and primary ({primary_lsn}) never agreed on the last LSN"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
