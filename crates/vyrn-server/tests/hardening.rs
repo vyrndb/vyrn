@@ -168,7 +168,9 @@ fn connect(url: &str) -> Result<(), vyrn_client::Error> {
         .enable_all()
         .build()
         .expect("build runtime");
-    runtime.block_on(vyrn_client::Client::connect(url)).map(drop)
+    runtime
+        .block_on(vyrn_client::Client::connect(url))
+        .map(drop)
 }
 
 fn put(url: &str, key: &str, value: &str) -> Result<(), String> {
@@ -257,9 +259,9 @@ fn raw_exchange(port: u16, payload: &[u8], settle: Duration) -> Option<Vec<u8>> 
     stream.write_all(payload).expect("write payload");
     let mut response = Vec::new();
     match stream.read(&mut response) {
-        Ok(0) => None,                    // clean close, nothing sent
-        Ok(_) => Some(response),          // the server answered
-        Err(_) => None,                   // reset / timeout
+        Ok(0) => None,           // clean close, nothing sent
+        Ok(_) => Some(response), // the server answered
+        Err(_) => None,          // reset / timeout
     }
 }
 
@@ -497,4 +499,3 @@ fn a_rejected_handshake_is_logged_without_the_credential_it_rejected() {
         "a rejected handshake must be logged at all:\n{written}"
     );
 }
-

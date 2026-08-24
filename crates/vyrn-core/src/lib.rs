@@ -3,12 +3,12 @@ pub mod change_log;
 pub mod document;
 mod fast_hash;
 mod mvcc;
-mod row_cache;
 mod overlay;
 mod page_tree;
 pub mod portable;
 pub mod recover;
 pub mod replication;
+mod row_cache;
 mod value_log;
 mod wal;
 pub mod wal_archive;
@@ -630,8 +630,7 @@ impl ReadEngine {
         }
         let Some(overlay) = &mut self.overlay else {
             return Err(Error::WriteBackMismatch {
-                reason: "commit published to a read handle opened without write-back replay"
-                    .into(),
+                reason: "commit published to a read handle opened without write-back replay".into(),
             });
         };
         for mutation in &publish.mutations {
@@ -806,8 +805,12 @@ impl ReadEngine {
     pub fn lookup_index(&self, name: &[u8], value: &[u8], limit: usize) -> Result<Vec<Vec<u8>>> {
         validate_index_name(name)?;
         validate_index_value(Some(value))?;
-        if overlay::merged_get(&self.tree, self.overlay.as_ref(), &index_definition_key(name))?
-            .is_none()
+        if overlay::merged_get(
+            &self.tree,
+            self.overlay.as_ref(),
+            &index_definition_key(name),
+        )?
+        .is_none()
         {
             return Err(Error::IndexNotFound);
         }
@@ -2529,9 +2532,7 @@ impl Engine {
     /// `None` when write-back is off. Read handles serving the engine's
     /// current root may evict overlay entries at or below it.
     pub fn write_back_absorbed_through(&self) -> Option<u64> {
-        self.write_back
-            .as_ref()
-            .map(|_| self.write_back_absorbed)
+        self.write_back.as_ref().map(|_| self.write_back_absorbed)
     }
 
     /// Discards the change records `with_change_log` staged for a batch that

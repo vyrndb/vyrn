@@ -23,7 +23,6 @@ use vyrn_protocol::{
     PROTOCOL_VERSION,
 };
 
-
 const DEFAULT_PORT: u16 = 7432;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1103,9 +1102,6 @@ KUCeypY1f0rLPW4/BQ==
         assert_eq!(roots.len(), 1);
     }
 
-
-
-
     /// `ConnectionOptions`' own `Debug` is the other place a password could
     /// escape, and it is what a caller reaches for when logging its config.
     #[test]
@@ -1115,12 +1111,6 @@ KUCeypY1f0rLPW4/BQ==
         assert!(!rendered.contains("s3cr3t"), "{rendered}");
         assert!(rendered.contains("[REDACTED]"));
     }
-
-
-
-
-
-
 
     #[tokio::test]
     async fn load_ca_rejects_a_file_without_certificates() {

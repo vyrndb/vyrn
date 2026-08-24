@@ -225,9 +225,7 @@ pub(crate) fn merged_get_many_revisions(
             let mut slots = Vec::new();
             for (index, key) in keys.iter().enumerate() {
                 match buffer.get(key) {
-                    Some(entry) => {
-                        results[index] = entry.value.is_some().then_some(entry.revision)
-                    }
+                    Some(entry) => results[index] = entry.value.is_some().then_some(entry.revision),
                     None => {
                         // A subsequence of a sorted list stays sorted.
                         misses.push(key.clone());
@@ -270,10 +268,7 @@ pub(crate) fn merged_get_many_with_revision(
                     }
                 }
             }
-            for (slot, found) in slots
-                .into_iter()
-                .zip(tree.get_many_with_revision(&misses)?)
-            {
+            for (slot, found) in slots.into_iter().zip(tree.get_many_with_revision(&misses)?) {
                 results[slot] = found;
             }
             Ok(results)

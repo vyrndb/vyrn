@@ -151,9 +151,7 @@ fn spawn(data: &Path, hash: &Path, extra: &[(&str, String)]) -> Node {
 fn http_get(port: u16, path: &str) -> Option<String> {
     use std::io::{Read, Write as _};
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -263,10 +261,7 @@ fn cluster(ack_timeout_ms: u64) -> Cluster {
         &[
             (
                 "VYRN_REPLICA_OF",
-                format!(
-                    "vyrn://vyrn@127.0.0.1:{}/default?tls=disable",
-                    primary.port
-                ),
+                format!("vyrn://vyrn@127.0.0.1:{}/default?tls=disable", primary.port),
             ),
             (
                 "VYRN_REPLICA_PASSWORD_FILE",
@@ -452,10 +447,7 @@ fn a_replica_whose_records_were_pruned_rebuilds_from_the_archive() {
         let mut settings = vec![
             (
                 "VYRN_REPLICA_OF",
-                format!(
-                    "vyrn://vyrn@127.0.0.1:{}/default?tls=disable",
-                    primary.port
-                ),
+                format!("vyrn://vyrn@127.0.0.1:{}/default?tls=disable", primary.port),
             ),
             (
                 "VYRN_REPLICA_PASSWORD_FILE",
@@ -624,10 +616,7 @@ fn a_lagging_replica_without_an_archive_says_why_it_cannot_recover() {
     let settings = vec![
         (
             "VYRN_REPLICA_OF",
-            format!(
-                "vyrn://vyrn@127.0.0.1:{}/default?tls=disable",
-                primary.port
-            ),
+            format!("vyrn://vyrn@127.0.0.1:{}/default?tls=disable", primary.port),
         ),
         (
             "VYRN_REPLICA_PASSWORD_FILE",
@@ -651,7 +640,11 @@ fn a_lagging_replica_without_an_archive_says_why_it_cannot_recover() {
         drop(replica);
     }
     for index in 0..60 {
-        let _ = put(&primary.url(), &format!("during/outage/{index:03}"), "value");
+        let _ = put(
+            &primary.url(),
+            &format!("during/outage/{index:03}"),
+            "value",
+        );
     }
     std::thread::sleep(Duration::from_secs(2));
 
@@ -709,7 +702,9 @@ fn writes_fail_rather_than_silently_dropping_the_guarantee() {
          unreplicated. Got: {error}"
     );
     assert_eq!(
-        cluster.primary.metric("vyrn_replication_ack_timeouts_total"),
+        cluster
+            .primary
+            .metric("vyrn_replication_ack_timeouts_total"),
         1,
         "the timeout should be counted"
     );

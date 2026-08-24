@@ -273,8 +273,10 @@ impl ValueLog {
         debug_assert_eq!(record.len(), total_len);
         self.file.write_all(&record)?;
         self.dirty = true;
-        self.len
-            .fetch_max(offset + total_len as u64, std::sync::atomic::Ordering::Relaxed);
+        self.len.fetch_max(
+            offset + total_len as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(ValueRef {
             offset,
             len,
@@ -724,10 +726,10 @@ mod tests {
         }
         log.sync().unwrap();
         let layouts: Vec<Vec<usize>> = vec![
-            (0..20).collect(),                        // one contiguous run
-            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18],  // gaps: no two adjacent
-            vec![7, 3, 11, 3, 0, 19, 12],             // unsorted, one duplicate
-            vec![5],                                  // single
+            (0..20).collect(),                       // one contiguous run
+            vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18], // gaps: no two adjacent
+            vec![7, 3, 11, 3, 0, 19, 12],            // unsorted, one duplicate
+            vec![5],                                 // single
         ];
         for layout in layouts {
             let batch: Vec<ValueRef> = layout

@@ -1,10 +1,53 @@
 # Changelog
 
-All notable changes to Vyrn are documented here. Until the 1.0 release the
-on-disk storage formats may change incompatibly between versions — see
-`docs/production.md` for the current compatibility statement.
+All notable changes to Vyrn are documented here. From 1.0.0 the on-disk
+formats follow the contract in `docs/compatibility.md`: every 1.x build
+reads what any earlier build wrote, and downgrade is unsupported.
 
-## [Unreleased]
+## [1.0.0] - 2026-08-24
+
+The first stable release. What "stable" freezes: the on-disk formats (tree
+pages v5 with the slot directory, WAL records v5 with the header
+self-checksum — v4 of both readable forever), the wire protocol, the
+documented limits, and the upgrade rules (`docs/compatibility.md`). The
+security model is a stated contract (`docs/security.md`): one shared
+credential on a private network — read it before deploying.
+
+### Added
+
+- **Slot-directory pages (format v5)** — leaf lookups and descents
+  binary-search; scans address cells directly and emit between
+  binary-searched bounds with zero per-row key comparisons. Purely additive
+  over v4: legacy pages stay readable and convert as they are rewritten.
+- **WAL record header self-checksum (record format v5)** — one flipped bit
+  in a record's declared lengths used to read as a torn tail and silently
+  truncate the log; it is now loud corruption, and the exhaustive bit-flip
+  test runs with no exemptions.
+- **Row cache** (`VYRN_ROW_CACHE_BYTES`) — hot point reads in one hash
+  probe, invalidated at the two paths that can mutate a cacheable key,
+  with staleness tests that fail when the invalidation is removed.
+- **Embedded group commit** (`Engine::drain_wal` + `Wal::sync_through`) —
+  N writers share one barrier with per-op durability intact; proven by a
+  crash-copy test where an unacknowledged commit vanishing is what proves
+  the test models a crash.
+- **Write-back mode end to end** — commit = WAL record + in-memory buffer,
+  reader overlays on the served path, absorb on threshold and checkpoint.
+- **Pay-for-what-you-use change log** (`EngineOptions::change_log`) — the
+  subscription feature's cost (a change record carrying a copy of every
+  written value) is declinable by embedded engines with no subscribers.
+- **Compatibility and security contracts** — `docs/compatibility.md`,
+  `docs/security.md`; CI grew a Linux crash soak (SIGKILL mid-write and
+  SIGTERM-under-async against the shipped stack), a docker build gate, and
+  a bench smoke.
+
+### Performance
+
+Measured against sled and redb in the 3-engine harness (fairness rules in
+`docs/benchmarks.md`): first or trading on every row on the development
+hosts — point reads 3.0–3.7 M/s at every value size, scans to 13 M rows/s,
+group-commit durable writes to 34 K/s at 64 writers, batch puts ~350 K/s —
+with the full write-ups, caveats, and the rows that are host-arithmetic
+rather than engineering stated plainly in `docs/benchmarks.md`.
 
 ### Fixed
 

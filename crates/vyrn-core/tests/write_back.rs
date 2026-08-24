@@ -8,9 +8,7 @@
 //! answer; the rest pin the specific seams: the WAL-only crash story, the
 //! checkpoint hand-off, threshold flushes, and MVCC reads over buffered state.
 
-use vyrn_core::{
-    BatchOperation, DurabilityMode, Engine, EngineOptions, IndexUpdate, ReadEngine,
-};
+use vyrn_core::{BatchOperation, DurabilityMode, Engine, EngineOptions, IndexUpdate, ReadEngine};
 
 fn write_back_options(buffer: usize) -> EngineOptions {
     EngineOptions {
@@ -88,7 +86,10 @@ fn a_write_back_engine_answers_identically_to_a_classic_engine() {
             // the key is in.
             for engine in [&classic, &buffered] {
                 assert_eq!(
-                    engine.get_shared(&probe).unwrap().map(|value| value.to_vec()),
+                    engine
+                        .get_shared(&probe)
+                        .unwrap()
+                        .map(|value| value.to_vec()),
                     engine.get(&probe).unwrap(),
                     "get_shared diverged from get at step {step}"
                 );
@@ -312,8 +313,10 @@ fn a_published_read_handle_answers_identically_to_a_classic_one() {
                     old_value: buckets.get(&k).cloned(),
                     new_value: Some(b.clone()),
                 };
-                let operations =
-                    vec![BatchOperation::Put(k.clone(), format!("v{step}").into_bytes())];
+                let operations = vec![BatchOperation::Put(
+                    k.clone(),
+                    format!("v{step}").into_bytes(),
+                )];
                 classic
                     .write_indexed(operations.clone(), vec![update.clone()])
                     .unwrap();
@@ -496,7 +499,9 @@ fn publishing_to_a_plain_read_handle_is_refused() {
         Engine::open_with_options(directory.path(), write_back_options(1024 * 1024)).unwrap();
     engine.enable_write_back_publish();
     let mut reader = ReadEngine::open(directory.path()).unwrap();
-    engine.put(b"wired-wrong".to_vec(), b"value".to_vec()).unwrap();
+    engine
+        .put(b"wired-wrong".to_vec(), b"value".to_vec())
+        .unwrap();
     let publish = engine.take_write_back_publish();
     assert!(
         matches!(

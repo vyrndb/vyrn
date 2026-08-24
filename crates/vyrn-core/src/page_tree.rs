@@ -1058,7 +1058,9 @@ impl PageTree {
                 });
             }
             let below = if flags & EXTERNAL_KEY != 0 {
-                self.read_blob(read_u64(page, cell + 9), key_len)?.as_slice() < target
+                self.read_blob(read_u64(page, cell + 9), key_len)?
+                    .as_slice()
+                    < target
             } else {
                 if cell + LEAF_CELL_HEADER + key_len > end {
                     return Err(Error::CorruptPage {
@@ -1098,9 +1100,7 @@ impl PageTree {
             None => 0,
         };
         let last = match end {
-            Some(end) => self
-                .leaf_lower_bound(directory, page_id, end)?
-                .max(first),
+            Some(end) => self.leaf_lower_bound(directory, page_id, end)?.max(first),
             None => directory.count,
         };
         let (skip_from, skip_to) = match excluded_prefix {
@@ -1111,9 +1111,7 @@ impl PageTree {
                 // successor either, which excludes the whole leaf — exactly
                 // what `starts_with(&[])` excluded per row.
                 let to = match prefix_successor(prefix) {
-                    Some(successor) => {
-                        self.leaf_lower_bound(directory, page_id, &successor)?
-                    }
+                    Some(successor) => self.leaf_lower_bound(directory, page_id, &successor)?,
                     None => directory.count,
                 };
                 (from.clamp(first, last), to.clamp(first, last))
@@ -1152,7 +1150,9 @@ impl PageTree {
         }
         let external_key = flags & EXTERNAL_KEY != 0;
         let matched = if external_key {
-            self.read_blob(read_u64(page, cell + 9), key_len)?.as_slice() == key
+            self.read_blob(read_u64(page, cell + 9), key_len)?
+                .as_slice()
+                == key
         } else {
             if cell + LEAF_CELL_HEADER + key_len > end {
                 return Err(Error::CorruptPage {
@@ -1193,7 +1193,12 @@ impl PageTree {
     /// can copy it out and `get_shared` can hand it back in place. A page
     /// with a slot directory is binary-searched; a legacy page walks its
     /// cells in order, stopping at the first cell past the target.
-    fn find_in_leaf(&self, page: &Page, page_id: u64, key: &[u8]) -> Result<Option<(LeafHit, u64)>> {
+    fn find_in_leaf(
+        &self,
+        page: &Page,
+        page_id: u64,
+        key: &[u8],
+    ) -> Result<Option<(LeafHit, u64)>> {
         let count = read_u32(page, 20) as usize;
         // Same bound and same reasoning as `decode_leaf`: a count past what the
         // page can physically hold is a forged field, not a large tree.
@@ -1868,7 +1873,16 @@ impl PageTree {
             return Ok(());
         }
         let mut emitted = 0usize;
-        self.scan_visit_node(self.root, start, end, limit, excluded_prefix, &mut emitted, visit, 0)
+        self.scan_visit_node(
+            self.root,
+            start,
+            end,
+            limit,
+            excluded_prefix,
+            &mut emitted,
+            visit,
+            0,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2084,8 +2098,7 @@ impl PageTree {
             Blob(Vec<u8>),
         }
         let mut deferred: Option<Vec<(Src, std::result::Result<Src, ValueRef>)>> = None;
-        let segments =
-            self.leaf_emit_segments(directory, page_id, start, end, excluded_prefix)?;
+        let segments = self.leaf_emit_segments(directory, page_id, start, end, excluded_prefix)?;
         'segments: for (from, to) in segments {
             for index in from..to {
                 let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
@@ -2349,15 +2362,7 @@ impl PageTree {
             }
             INTERNAL => {
                 self.scan_children(&page, page_id, start, end, &mut |tree, child| {
-                    tree.scan_node(
-                        child,
-                        start,
-                        end,
-                        limit,
-                        excluded_prefix,
-                        rows,
-                        depth + 1,
-                    )?;
+                    tree.scan_node(child, start, end, limit, excluded_prefix, rows, depth + 1)?;
                     Ok(rows.len() >= limit)
                 })?;
             }
@@ -2385,8 +2390,7 @@ impl PageTree {
     ) -> Result<()> {
         let leaf: &Page = page;
         let mut pending: Vec<(usize, ValueRef)> = Vec::new();
-        let segments =
-            self.leaf_emit_segments(directory, page_id, start, end, excluded_prefix)?;
+        let segments = self.leaf_emit_segments(directory, page_id, start, end, excluded_prefix)?;
         'segments: for (from, to) in segments {
             for index in from..to {
                 let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
@@ -2676,7 +2680,9 @@ impl PageTree {
                     });
                 }
                 let below = if flags & EXTERNAL_KEY != 0 {
-                    self.read_blob(read_u64(page, cell + 5), key_len)?.as_slice() <= key
+                    self.read_blob(read_u64(page, cell + 5), key_len)?
+                        .as_slice()
+                        <= key
                 } else {
                     if cell + INTERNAL_CELL_HEADER + key_len > end {
                         return Err(Error::CorruptPage {
@@ -2684,8 +2690,7 @@ impl PageTree {
                             reason: "invalid internal cell metadata".into(),
                         });
                     }
-                    &page[cell + INTERNAL_CELL_HEADER..cell + INTERNAL_CELL_HEADER + key_len]
-                        <= key
+                    &page[cell + INTERNAL_CELL_HEADER..cell + INTERNAL_CELL_HEADER + key_len] <= key
                 };
                 if below {
                     low = mid + 1;
@@ -3737,7 +3742,10 @@ mod tests {
         let deleted = tree.prepare_delete(b"key-000150").unwrap().unwrap();
         tree.publish(deleted.0, deleted.1);
         tree.sync().unwrap();
-        assert_eq!(tree.get(b"key-000100").unwrap(), Some(b"rewritten".to_vec()));
+        assert_eq!(
+            tree.get(b"key-000100").unwrap(),
+            Some(b"rewritten".to_vec())
+        );
         assert_eq!(tree.get(b"key-000150").unwrap(), None);
         assert_eq!(tree.len(), 199);
         tree.validate().unwrap();
@@ -3808,7 +3816,9 @@ mod tests {
             let mut state = (0, 0);
             for index in 0..20_u64 {
                 let key = format!("key-{index:02}");
-                state = tree.prepare_put(key.as_bytes(), &[3; 16], index + 1).unwrap();
+                state = tree
+                    .prepare_put(key.as_bytes(), &[3; 16], index + 1)
+                    .unwrap();
                 tree.publish(state.0, state.1);
             }
             tree.sync().unwrap();

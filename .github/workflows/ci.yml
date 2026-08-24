@@ -59,3 +59,35 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The crash soak is the one durability proof no unit test can give: SIGKILL
+  # mid-write and SIGTERM-under-async against the real shipped stack, over
+  # and over, asserting exactly what the server acknowledged. Linux-only by
+  # design (real signals, real directory-entry durability); this job is what
+  # discharges the "crash-soak has never run" release gate on every push.
+  crash-soak:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      - run: VYRN_SOAK_CYCLES=12 VYRN_SOAK_WRITES=30 bash scripts/crash-soak.sh
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t vyrn-ci .
+
+  # Benches must never rot: compile every bench target, then one short
+  # apply-profile run so the write-path instrumentation stays runnable. No
+  # numeric thresholds — shared runners are too noisy to gate on timings,
+  # and a gate everyone learns to ignore is worse than none.
+  bench-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run --locked
+      - run: CLIENTS=8 BATCHES=50 PREFILL=2000 cargo run --release -p vyrn-core --bin apply-profile

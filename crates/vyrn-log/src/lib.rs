@@ -521,14 +521,8 @@ mod tests {
     fn url_redaction_leaves_credential_free_urls_intact() {
         // Nothing to hide, so nothing is invented: an operator reading
         // "[REDACTED]" would otherwise conclude a password was configured.
-        assert_eq!(
-            redact_url("vyrn://host:7432/app"),
-            "vyrn://host:7432/app"
-        );
-        assert_eq!(
-            redact_url("vyrn://user@host/app"),
-            "vyrn://user@host/app"
-        );
+        assert_eq!(redact_url("vyrn://host:7432/app"), "vyrn://host:7432/app");
+        assert_eq!(redact_url("vyrn://user@host/app"), "vyrn://user@host/app");
         assert_eq!(redact_url("127.0.0.1:7433"), "127.0.0.1:7433");
     }
 

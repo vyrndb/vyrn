@@ -2,7 +2,7 @@
 
 ## Supported envelope
 
-Vyrn `0.1.0-dev` is a single-node production candidate for Linux x86-64 on local persistent ext4/XFS storage. It is not highly available. A host or disk failure causes downtime and may require restore.
+Vyrn `1.0.0` is a single-node production database for Linux x86-64 on local persistent ext4/XFS storage. It is not highly available. A host or disk failure causes downtime and may require restore.
 
 Use it only when:
 
@@ -11,7 +11,8 @@ Use it only when:
 - TLS 1.3 is enabled and the admin listener remains private;
 - the data directory is on local persistent storage, not an ephemeral container layer;
 - `durable` mode is used for authoritative records; `async` is limited to reconstructable realtime state and its bounded loss window is accepted;
-- monitoring alerts on readiness, failed requests, disk space, backup age, and write-batch efficiency.
+- monitoring alerts on readiness, failed requests, disk space, backup age, and write-batch efficiency;
+- the security model in `docs/security.md` matches the deployment's requirements (single shared credential, no ACLs, no audit trail — read it before assuming otherwise), and the upgrade rules in `docs/compatibility.md` are followed (replicas upgrade before primaries; downgrade is unsupported).
 
 Current observed WSL2/Linux baseline in `durable` mode with 16 persistent clients and 128-byte values, measured 2026-07-27: approximately 83k snapshot reads/s (p50 0.19 ms, p99 0.33 ms), 5.7k durable writes/s (p50 2.8 ms, p99 4.7 ms), 13.8k ops/s in a 70/30 durable mix (p50 0.30 ms, p99 5.3 ms), 50k index lookups/s, and 2.6k four-key transactions/s. See `docs/benchmarks.md` for the full matrix. The async-mode and commit-to-subscription figures previously quoted here were not re-measured and have been removed rather than carried forward stale.
 
@@ -80,6 +81,8 @@ Offline backups bound loss to the backup interval. Add continuous archiving to s
 
 **Windows caveat:** `sync_directory` is a no-op on non-Unix platforms, so archive-directory durability (the rename publishing a copied segment or the index) is not certified on Windows. Windows remains a development-only platform; run archiving in production on Linux ext4/XFS only.
 
+**Windows caveat, concurrent writes:** on Windows, `FlushFileBuffers` serializes against `WriteFile` on the same file, and `vyrnd`'s write worker appends WAL records eagerly under the engine lock while the flush stage syncs — so group commit degrades toward one commit per fsync there. Linux is unaffected (the production platform). The embedded engine offers the convoy-free shape (`DurabilityMode::Async` + `drain_wal`); teaching the server's flush stage the same split is queued.
+
 ## Logs
 
 Every Vyrn binary writes structured single-line records to **stderr**. Each record is a timestamp, a level, a target, a message, and `key=value` fields:
@@ -139,7 +142,7 @@ When readiness becomes false:
 
 ## Known limitations
 
-These are reviewed, understood, and deliberately not fixed in `0.1.0-dev`. Each one can affect a production deployment, so plan around them rather than discovering them during an incident.
+These are reviewed, understood, and deliberately not fixed in `1.0.0`. Each one can affect a production deployment, so plan around them rather than discovering them during an incident.
 
 ### The largest value you can actually write is under 16 MiB
 

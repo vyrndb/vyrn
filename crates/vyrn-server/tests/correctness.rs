@@ -391,7 +391,10 @@ fn a_failed_document_write_does_not_rebroadcast_the_previous_commit() {
          * code then re-broadcast. A nonexistent collection would not do: writing to
          * one creates it, so that path succeeds. */
         client
-            .create_collection("orders", &[vyrn_client::CollectionIndex::new("email", true)])
+            .create_collection(
+                "orders",
+                &[vyrn_client::CollectionIndex::new("email", true)],
+            )
             .await
             .expect("create collection with a unique index");
 
@@ -869,7 +872,11 @@ fn a_pipelined_burst_answers_every_operation_in_order() {
         operations.push(PipelineOperation::Delete(b"pipe/never-existed".to_vec()));
 
         let results = client.pipeline(operations).await.expect("pipeline burst");
-        assert_eq!(results.len(), 205, "one answer per operation, no more, no fewer");
+        assert_eq!(
+            results.len(),
+            205,
+            "one answer per operation, no more, no fewer"
+        );
         for (index, result) in results[..200].iter().enumerate() {
             assert_eq!(
                 result.as_ref().expect("put succeeds"),
@@ -897,7 +904,9 @@ fn a_pipelined_burst_answers_every_operation_in_order() {
             "the second get must see the delete earlier in the same burst"
         );
         assert_eq!(
-            results[204].as_ref().expect("delete of missing key succeeds"),
+            results[204]
+                .as_ref()
+                .expect("delete of missing key succeeds"),
             &PipelineResponse::Deleted(false),
         );
 

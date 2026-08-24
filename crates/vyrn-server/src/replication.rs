@@ -198,7 +198,9 @@ impl Replication {
         if let Ok(mut replicas) = self.replicas.lock() {
             replicas.remove(&id);
         }
-        self.metrics.dropped_replicas.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .dropped_replicas
+            .fetch_add(1, Ordering::Relaxed);
         // Wake waiters: losing a replica cannot complete a quorum, but it can
         // make one permanently unreachable, and a waiter should find that out now
         // rather than at its timeout.
@@ -370,11 +372,7 @@ pub enum JoinDecision {
 /// filesystem access on the connection-accept path. The caller passes in
 /// `oldest_available_lsn` — the earliest LSN the primary can still supply from
 /// its live WAL — which it already knows.
-pub fn decide_join(
-    replica_lsn: u64,
-    primary_lsn: u64,
-    oldest_available_lsn: u64,
-) -> JoinDecision {
+pub fn decide_join(replica_lsn: u64, primary_lsn: u64, oldest_available_lsn: u64) -> JoinDecision {
     // Ahead of the primary: unreachable by streaming, and appending the
     // primary's next record would rewrite this replica's history. A rebuild is
     // the only fix, and unlike the gap case it is not obviously safe to do

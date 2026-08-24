@@ -24,7 +24,10 @@ async fn spawn_listener() -> (TcpListener, String) {
         .await
         .expect("loopback bind succeeds");
     let address = listener.local_addr().expect("local address");
-    (listener, format!("vyrn://user:pass@{address}/app?tls=disable"))
+    (
+        listener,
+        format!("vyrn://user:pass@{address}/app?tls=disable"),
+    )
 }
 
 async fn accept(listener: &TcpListener) -> ServerEnd {
@@ -61,7 +64,10 @@ struct Received(Arc<Mutex<Vec<Message>>>);
 
 impl Received {
     fn push(&self, message: &Message) {
-        self.0.lock().expect("lock is not poisoned").push(message.clone());
+        self.0
+            .lock()
+            .expect("lock is not poisoned")
+            .push(message.clone());
     }
 
     fn snapshot(&self) -> Vec<Message> {
@@ -74,17 +80,14 @@ async fn requests_round_trip_against_the_mock() {
     let (listener, url) = spawn_listener().await;
     let (mut client, mut server) = connect_pair(&listener, &url).await;
 
-    let (written, put) = tokio::join!(
-        client.put(b"k".to_vec(), b"v".to_vec()),
-        async {
-            let request = server.next().await.expect("open").expect("decodes");
-            server
-                .send(Envelope::new(request.request_id, Message::Written))
-                .await
-                .expect("reply sends");
-            request.message
-        }
-    );
+    let (written, put) = tokio::join!(client.put(b"k".to_vec(), b"v".to_vec()), async {
+        let request = server.next().await.expect("open").expect("decodes");
+        server
+            .send(Envelope::new(request.request_id, Message::Written))
+            .await
+            .expect("reply sends");
+        request.message
+    });
     written.expect("put succeeds");
     assert_eq!(
         put,
@@ -94,22 +97,19 @@ async fn requests_round_trip_against_the_mock() {
         }
     );
 
-    let (value, get) = tokio::join!(
-        client.get(b"k".to_vec()),
-        async {
-            let request = server.next().await.expect("open").expect("decodes");
-            server
-                .send(Envelope::new(
-                    request.request_id,
-                    Message::Value {
-                        value: Some(b"v".to_vec()),
-                    },
-                ))
-                .await
-                .expect("reply sends");
-            request.message
-        }
-    );
+    let (value, get) = tokio::join!(client.get(b"k".to_vec()), async {
+        let request = server.next().await.expect("open").expect("decodes");
+        server
+            .send(Envelope::new(
+                request.request_id,
+                Message::Value {
+                    value: Some(b"v".to_vec()),
+                },
+            ))
+            .await
+            .expect("reply sends");
+        request.message
+    });
     assert_eq!(value.expect("get succeeds"), Some(b"v".to_vec()));
     assert_eq!(get, Message::Get { key: b"k".to_vec() });
 }
@@ -171,9 +171,7 @@ async fn timed_out_request_retires_the_connection() {
     driver.await.expect("driver joins");
     assert_eq!(
         received.snapshot(),
-        vec![Message::Get {
-            key: b"k".to_vec()
-        }],
+        vec![Message::Get { key: b"k".to_vec() }],
         "a retired connection must refuse to send further requests"
     );
 }
@@ -311,7 +309,13 @@ async fn commit_rejected_by_the_server_clears_the_transaction() {
     let transaction = client.transaction().await.expect("begin succeeds");
     let error = transaction.commit().await.unwrap_err();
     assert!(
-        matches!(error, Error::Server { code: ErrorCode::InvalidRequest, .. }),
+        matches!(
+            error,
+            Error::Server {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ),
         "commit: {error:?}"
     );
 
@@ -325,9 +329,7 @@ async fn commit_rejected_by_the_server_clears_the_transaction() {
         vec![
             Message::Begin,
             Message::Commit,
-            Message::Get {
-                key: b"k".to_vec()
-            },
+            Message::Get { key: b"k".to_vec() },
         ],
         "no rollback may follow a definite server answer"
     );
@@ -371,9 +373,7 @@ async fn new_request_after_an_open_transaction_rolls_back_first() {
         vec![
             Message::Begin,
             Message::Rollback,
-            Message::Get {
-                key: b"k".to_vec()
-            },
+            Message::Get { key: b"k".to_vec() },
         ],
     );
 }
@@ -395,22 +395,19 @@ async fn subscription_rejects_a_foreign_protocol_version() {
     let (listener, url) = spawn_listener().await;
     let (client, mut server) = connect_pair(&listener, &url).await;
 
-    let subscribed = tokio::join!(
-        client.subscribe(b"users/".to_vec()),
-        async {
-            let request = server.next().await.expect("open").expect("decodes");
-            assert_eq!(
-                request.message,
-                Message::Subscribe {
-                    prefix: b"users/".to_vec(),
-                }
-            );
-            server
-                .send(Envelope::new(request.request_id, Message::Subscribed))
-                .await
-                .expect("reply sends");
-        }
-    );
+    let subscribed = tokio::join!(client.subscribe(b"users/".to_vec()), async {
+        let request = server.next().await.expect("open").expect("decodes");
+        assert_eq!(
+            request.message,
+            Message::Subscribe {
+                prefix: b"users/".to_vec(),
+            }
+        );
+        server
+            .send(Envelope::new(request.request_id, Message::Subscribed))
+            .await
+            .expect("reply sends");
+    });
     let mut subscription = subscribed.0.expect("subscribe succeeds");
 
     server
@@ -455,17 +452,14 @@ async fn cursor_subscription_rejects_a_foreign_protocol_version() {
         },
     };
 
-    let subscribed = tokio::join!(
-        client.subscribe_from(b"users/".to_vec(), None),
-        async {
-            let request = server.next().await.expect("open").expect("decodes");
-            assert!(matches!(request.message, Message::SubscribeFrom { .. }));
-            server
-                .send(Envelope::new(request.request_id, Message::Subscribed))
-                .await
-                .expect("reply sends");
-        }
-    );
+    let subscribed = tokio::join!(client.subscribe_from(b"users/".to_vec(), None), async {
+        let request = server.next().await.expect("open").expect("decodes");
+        assert!(matches!(request.message, Message::SubscribeFrom { .. }));
+        server
+            .send(Envelope::new(request.request_id, Message::Subscribed))
+            .await
+            .expect("reply sends");
+    });
     let mut subscription = subscribed.0.expect("subscribe succeeds");
 
     server
@@ -507,22 +501,22 @@ async fn document_subscription_rejects_a_foreign_protocol_version() {
         },
     };
 
-    let subscribed = tokio::join!(
-        client.subscribe_collection("users"),
-        async {
-            let request = server.next().await.expect("open").expect("decodes");
-            assert_eq!(
-                request.message,
-                Message::SubscribeCollection {
-                    collection: "users".into(),
-                }
-            );
-            server
-                .send(Envelope::new(request.request_id, Message::CollectionSubscribed))
-                .await
-                .expect("reply sends");
-        }
-    );
+    let subscribed = tokio::join!(client.subscribe_collection("users"), async {
+        let request = server.next().await.expect("open").expect("decodes");
+        assert_eq!(
+            request.message,
+            Message::SubscribeCollection {
+                collection: "users".into(),
+            }
+        );
+        server
+            .send(Envelope::new(
+                request.request_id,
+                Message::CollectionSubscribed,
+            ))
+            .await
+            .expect("reply sends");
+    });
     let mut subscription = subscribed.0.expect("subscribe succeeds");
 
     server
@@ -560,5 +554,8 @@ async fn missing_ca_file_reports_a_tls_error() {
     let _ = std::fs::remove_file(&missing);
 
     let outcome = Client::connect_with_ca(&url, Some(missing.as_path())).await;
-    assert!(matches!(outcome, Err(Error::Tls(_))), "expected a TLS error");
+    assert!(
+        matches!(outcome, Err(Error::Tls(_))),
+        "expected a TLS error"
+    );
 }

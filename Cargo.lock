@@ -1967,7 +1967,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vyrn"
-version = "0.1.0-dev"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-client"
-version = "0.1.0-dev"
+version = "1.0.0"
 dependencies = [
  "futures-util",
  "rustls",
@@ -2002,7 +2002,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-core"
-version = "0.1.0-dev"
+version = "1.0.0"
 dependencies = [
  "crc32fast",
  "criterion",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-http"
-version = "0.1.0-dev"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2034,11 +2034,11 @@ dependencies = [
 
 [[package]]
 name = "vyrn-log"
-version = "0.1.0-dev"
+version = "1.0.0"
 
 [[package]]
 name = "vyrn-protocol"
-version = "0.1.0-dev"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "vyrnd"
-version = "0.1.0-dev"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "argon2",

@@ -353,7 +353,10 @@ fn a_disabled_change_log_records_nothing_and_changes_no_answers() {
         assert_eq!(engine.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
         assert_eq!(engine.get(b"a").unwrap(), None);
         assert!(
-            engine.read_changes(Cursor::start(), 100).unwrap().is_empty(),
+            engine
+                .read_changes(Cursor::start(), 100)
+                .unwrap()
+                .is_empty(),
             "a disabled change log must record nothing"
         );
         assert!(
@@ -364,7 +367,10 @@ fn a_disabled_change_log_records_nothing_and_changes_no_answers() {
     // Re-enabled: history for the disabled stretch is gone (silence, not an
     // error), and new commits record normally from here.
     let mut engine = Engine::open(directory.path()).unwrap();
-    assert!(engine.read_changes(Cursor::start(), 100).unwrap().is_empty());
+    assert!(engine
+        .read_changes(Cursor::start(), 100)
+        .unwrap()
+        .is_empty());
     engine.put(b"c".to_vec(), b"3".to_vec()).unwrap();
     let changes = engine.read_changes(Cursor::start(), 100).unwrap();
     assert_eq!(changes.len(), 1);

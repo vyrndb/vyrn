@@ -535,9 +535,7 @@ fn document_write_bytes(request: &DocumentWrite) -> usize {
         DocumentWrite::CreateCollection {
             collection,
             indexes,
-        } => {
-            collection.len() + indexes.iter().map(|index| index.field.len()).sum::<usize>()
-        }
+        } => collection.len() + indexes.iter().map(|index| index.field.len()).sum::<usize>(),
         DocumentWrite::Put {
             collection,
             id,
@@ -1941,13 +1939,8 @@ async fn run_session(
                                     Message::ReplicaStream { first_lsn },
                                 ))
                                 .await?;
-                            stream_records(
-                                &mut framed,
-                                &state.replication,
-                                first_lsn,
-                                &replica_id,
-                            )
-                            .await?;
+                            stream_records(&mut framed, &state.replication, first_lsn, &replica_id)
+                                .await?;
                             return Ok(());
                         }
                     }
@@ -2155,14 +2148,15 @@ async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
      * the state an operator needs to see, and hiding it would defeat the purpose
      * of publishing the number. */
     if matches!(released, Ok(true)) {
-        let _ = state
-            .metrics
-            .active_transaction_snapshots
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        let _ = state.metrics.active_transaction_snapshots.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |count| {
                 // Saturating: a double release would otherwise wrap the gauge to
                 // u64::MAX and look like a catastrophic leak.
                 Some(count.saturating_sub(1))
-            });
+            },
+        );
     }
 }
 
@@ -2618,7 +2612,10 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
      * Checked here because `execute` is the single funnel every client request
      * passes through, so one guard covers every mutation path rather than six. */
     if state.read_only && mutates_storage(&request) {
-        state.metrics.failed_requests.fetch_add(1, Ordering::Relaxed);
+        state
+            .metrics
+            .failed_requests
+            .fetch_add(1, Ordering::Relaxed);
         return server_error(
             ErrorCode::InvalidRequest,
             "this node is a replica and does not accept writes; \
@@ -2951,8 +2948,7 @@ fn advance_scan(
     }
     // One extra row when resuming, because the chunk restarts AT the last key
     // already collected and drops it again.
-    let wanted =
-        (job.limit - job.rows.len()).min(SCAN_CHUNK_ROWS) + usize::from(job.skip_resume);
+    let wanted = (job.limit - job.rows.len()).min(SCAN_CHUNK_ROWS) + usize::from(job.skip_resume);
     let chunk = match reader.scan(job.from.as_deref(), job.end.as_deref(), wanted) {
         Ok(chunk) => chunk,
         Err(error) => return Some(Err(error.into())),
@@ -3575,7 +3571,11 @@ fn start_mvcc_gc(
                     versions_collected = collected,
                     // Which threshold fired: a write-count trigger or the
                     // retained-version one. They point at different workloads.
-                    trigger = if due { "write count" } else { "retained versions" }
+                    trigger = if due {
+                        "write count"
+                    } else {
+                        "retained versions"
+                    }
                 ),
                 Ok(Ok((collected, None))) => log_debug!(
                     "vyrnd.mvcc_gc",
@@ -3695,11 +3695,7 @@ fn start_wal_archiver(
                         .wal_archive_failures_total
                         .fetch_add(1, Ordering::Relaxed);
                     if let Ok(Err(error)) = other {
-                        log_error!(
-                            "vyrnd.wal_archive",
-                            "archive tick failed",
-                            detail = error
-                        );
+                        log_error!("vyrnd.wal_archive", "archive tick failed", detail = error);
                     }
                 }
             }
@@ -3859,20 +3855,23 @@ async fn run_write_pipeline(
                 })
                 .await;
                 let (message, published, write_back, generation, root, len) = match result {
-                    Ok(Ok((outcome, published, write_back, generation, root, len))) => match outcome
-                    {
-                        Ok((message, _)) => (message, published, write_back, generation, root, len),
-                        /* Nothing committed, so nothing is owed to the ordered
-                         * publication point and the client is answered here.
-                         * Rendered through `storage_error_message` so the code the
-                         * error deserves survives — a unique-index violation stays
-                         * `Conflict` rather than becoming a generic storage fault. */
-                        Err(error) => {
-                            record_storage_error(&config.metrics, "document write", &error);
-                            let _ = response.send(Ok(storage_error_message(error)));
-                            continue;
+                    Ok(Ok((outcome, published, write_back, generation, root, len))) => {
+                        match outcome {
+                            Ok((message, _)) => {
+                                (message, published, write_back, generation, root, len)
+                            }
+                            /* Nothing committed, so nothing is owed to the ordered
+                             * publication point and the client is answered here.
+                             * Rendered through `storage_error_message` so the code the
+                             * error deserves survives — a unique-index violation stays
+                             * `Conflict` rather than becoming a generic storage fault. */
+                            Err(error) => {
+                                record_storage_error(&config.metrics, "document write", &error);
+                                let _ = response.send(Ok(storage_error_message(error)));
+                                continue;
+                            }
                         }
-                    },
+                    }
                     // The engine lock was poisoned: the write never ran.
                     Ok(Err(error)) => {
                         record_storage_error(&config.metrics, "document write", &error);
@@ -3957,7 +3956,9 @@ async fn run_write_pipeline(
                 continue;
             }
             // Data requests: batched below.
-            request @ (WriteRequest::Operation { .. } | WriteRequest::Transaction { .. }) => request,
+            request @ (WriteRequest::Operation { .. } | WriteRequest::Transaction { .. }) => {
+                request
+            }
         };
         let mut requests = vec![first];
         // Group-commit: collect more single writes or transactions so one
@@ -5172,9 +5173,7 @@ async fn send_frame(
 ) -> Result<()> {
     match timeout(RESPONSE_WRITE_TIMEOUT, framed.send(envelope)).await {
         Ok(result) => Ok(result?),
-        Err(_) => bail!(
-            "peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"
-        ),
+        Err(_) => bail!("peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"),
     }
 }
 
@@ -5192,9 +5191,7 @@ async fn feed_frame(
 ) -> Result<()> {
     match timeout(RESPONSE_WRITE_TIMEOUT, framed.feed(envelope)).await {
         Ok(result) => Ok(result?),
-        Err(_) => bail!(
-            "peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"
-        ),
+        Err(_) => bail!("peer stopped reading; response write exceeded {RESPONSE_WRITE_TIMEOUT:?}"),
     }
 }
 
@@ -5202,9 +5199,7 @@ async fn feed_frame(
 async fn flush_frames(framed: &mut Framed<BoxedTransport, VyrnCodec>) -> Result<()> {
     match timeout(RESPONSE_WRITE_TIMEOUT, framed.flush()).await {
         Ok(result) => Ok(result?),
-        Err(_) => bail!(
-            "peer stopped reading; response flush exceeded {RESPONSE_WRITE_TIMEOUT:?}"
-        ),
+        Err(_) => bail!("peer stopped reading; response flush exceeded {RESPONSE_WRITE_TIMEOUT:?}"),
     }
 }
 
@@ -5214,7 +5209,11 @@ async fn send_error(
     code: ErrorCode,
     message: &str,
 ) -> Result<()> {
-    send_frame(framed, Envelope::new(request_id, server_error(code, message))).await
+    send_frame(
+        framed,
+        Envelope::new(request_id, server_error(code, message)),
+    )
+    .await
 }
 
 fn load_password_hash(path: &Path) -> Result<PasswordHashString> {

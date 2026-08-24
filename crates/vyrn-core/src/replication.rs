@@ -21,9 +21,7 @@
 //! later refuses to open, turning a detectable stream error into an undetectable
 //! corrupt replica.
 
-use crate::{
-    Error, Result, RECORD_END, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, RECORD_MAGIC,
-};
+use crate::{Error, Result, RECORD_END, RECORD_FOOTER_LEN, RECORD_HEADER_LEN, RECORD_MAGIC};
 use std::path::Path;
 
 /// What a received record describes, once its framing has been verified.
@@ -157,9 +155,7 @@ pub fn verify_record(bytes: &[u8]) -> Result<RecordHeader> {
             ));
         }
     } else if !crate::record_header_crc_ok(&bytes[..RECORD_HEADER_LEN]) {
-        return Err(stream_error(
-            "replication record header fails its checksum",
-        ));
+        return Err(stream_error("replication record header fails its checksum"));
     }
 
     let total_len = RECORD_HEADER_LEN

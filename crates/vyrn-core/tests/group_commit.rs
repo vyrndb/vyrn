@@ -54,7 +54,9 @@ fn drained_commits_survive_a_crash_and_undrained_ones_do_not() {
     let owed = engine.drain_wal().unwrap();
     wal.sync_through(owed).unwrap();
     // Buffered but never drained: visible to this engine, owed nothing.
-    engine.put(b"unacked".to_vec(), b"volatile".to_vec()).unwrap();
+    engine
+        .put(b"unacked".to_vec(), b"volatile".to_vec())
+        .unwrap();
     assert_eq!(
         engine.get(b"unacked").unwrap().as_deref(),
         Some(&b"volatile"[..])

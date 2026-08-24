@@ -478,9 +478,7 @@ fn parse_url(url: &str) -> Result<(String, u16, String, String, bool)> {
         .context("primary URL must start with vyrn://")?;
     let (rest, tls_required) = match rest.split_once('?') {
         Some((head, query)) => {
-            let disable = query
-                .split('&')
-                .any(|pair| pair.trim() == "tls=disable");
+            let disable = query.split('&').any(|pair| pair.trim() == "tls=disable");
             (head, !disable)
         }
         None => (rest, true),

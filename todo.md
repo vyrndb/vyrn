@@ -1,5 +1,27 @@
 # vyrn — production-readiness TODO
 
+## 🚢 1.0.0 release gates (2026-08-24)
+
+- [x] WAL record header self-checksum (record format v5) — the last known format defect; the
+      bit-flip test now runs with NO exemptions, mutation-verified; v4 records readable forever.
+- [x] Compatibility contract (`docs/compatibility.md`) and security model (`docs/security.md`);
+      production.md envelope references both. Value-size ceiling: documented limit IS the 1.0
+      contract; the change-record split may raise it in 1.x.
+- [x] CI gates: crash-soak on Linux (both modes — this discharges the "never executed" gate on
+      every push, including SIGTERM shutdown-sync coverage), docker build, bench smoke.
+- [x] Server Windows convoy: confirmed (eager appends under the engine lock vs flush-stage
+      fsync), documented in production.md as a Windows caveat; Linux unaffected. Post-1.0:
+      teach the flush stage the Async+drain_wal split.
+- [x] Version 1.0.0 across workspace, SDK, docs; CHANGELOG 1.0.0 entry.
+- [ ] Windows flake: named — vyrnd integration binaries `hardening` and `replication` under
+      full-workspace parallel load (2 of 6 runs); test-name capture in progress. Windows is a
+      development platform; gate is "named and tracked", not "fixed".
+- [ ] REMAINING before the tag: CI green on the push (first-ever crash-soak run included), and
+      the sandbox items that need real hardware — multi-hour larger-than-memory soak and the
+      operational restore + PITR drill (production.md exit gates; tooling exists). Tag
+      v1.0.0 once CI passes; run the soak/drill as the first post-tag action or hold the tag
+      for them — owner's call.
+
 Living checklist for the fix fleet. Baseline commit: `ac4c506`.
 
 ## ✅ Done (verified green at time of completion)
