@@ -122,6 +122,12 @@ pub struct Failover {
     /// When a follower last heard from a live primary (any stream frame),
     /// and when a primary last held a quorum. Both feed the same timers.
     last_heard: Mutex<Instant>,
+    /// Whether a primary has EVER been heard since boot. Until then a
+    /// follower campaigns only after ten election timeouts: a slow cluster
+    /// boot must not let a follower that merely has not connected yet stand
+    /// and depose the healthy configured primary — which is precisely how a
+    /// widened vote timeout broke the trio's setup on a loaded runner.
+    ever_heard: AtomicBool,
     pub lease: Duration,
     pub election_timeout: Duration,
 }
@@ -148,6 +154,7 @@ impl Failover {
             }),
             led_with_quorum: AtomicBool::new(false),
             last_heard: Mutex::new(Instant::now()),
+            ever_heard: AtomicBool::new(false),
             lease,
             election_timeout,
         }
@@ -179,6 +186,23 @@ impl Failover {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *last = Instant::now();
+    }
+
+    /// A frame from a live primary's stream: resets the timer AND ends the
+    /// boot-patience period.
+    pub fn heard_primary(&self) {
+        self.ever_heard.store(true, Ordering::Release);
+        self.heard_from_leader();
+    }
+
+    /// The silence a follower tolerates before standing: the configured
+    /// timeout once a primary has ever been heard, ten of them until then.
+    pub fn patience(&self) -> Duration {
+        if self.ever_heard.load(Ordering::Acquire) {
+            self.election_timeout
+        } else {
+            self.election_timeout * 10
+        }
     }
 
     pub fn silence(&self) -> Duration {
@@ -423,7 +447,7 @@ pub async fn run_coordinator(
                 let Some(credentials) = credentials.as_ref() else {
                     continue;
                 };
-                if failover.silence() <= failover.election_timeout + jitter {
+                if failover.silence() <= failover.patience() + jitter {
                     continue;
                 }
                 match stand_for_election(&failover, &engine, credentials).await {

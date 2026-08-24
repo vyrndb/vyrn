@@ -403,7 +403,7 @@ async fn apply_stream(
         let envelope = envelope?;
         // Anything arriving on a live stream is proof of a live primary.
         if let Some(failover) = failover {
-            failover.heard_from_leader();
+            failover.heard_primary();
         }
         match envelope.message {
             /* THE FENCE. A primary whose epoch is below this node's persisted

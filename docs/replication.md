@@ -162,7 +162,7 @@ vyrnd --data /var/lib/vyrn   --replication-min-acks 1   --cluster 'a=vyrn://repl
 | `--cluster` | off | `name=url,...` for ALL members, this one included. |
 | `--cluster-self` | — | This member's name in that list. |
 | `--failover-lease-ms` | 3000 | A primary that has held a quorum and then lost it for this long demotes itself. |
-| `--failover-election-ms` | 6000 | A follower that has heard nothing from a live primary for this long (plus a per-member jitter) stands for election. |
+| `--failover-election-ms` | 6000 | A follower that has heard nothing from a live primary for this long (plus a per-member jitter) stands for election. Until a follower has heard a primary at least once since boot, ten of these apply — a slow cluster boot must not depose a healthy primary that a follower merely has not reached yet. |
 
 Startup refuses fewer than 3 members, and refuses
 `--replication-min-acks < floor(N/2)`. Both refusals are the safety
