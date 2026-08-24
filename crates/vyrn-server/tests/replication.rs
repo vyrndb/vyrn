@@ -861,7 +861,10 @@ fn a_dead_primary_is_replaced_and_acknowledged_writes_survive() {
     nodes[0].kill();
 
     // A new primary within the deadline: exactly one of b, c accepts writes.
-    let deadline = Instant::now() + Duration::from_secs(45);
+    // Wide: election on a loaded CI runner includes debug-build Argon2 per
+    // authenticated connect, both in the vote solicitations and in these
+    // probes. The election itself is seconds on an idle host.
+    let deadline = Instant::now() + Duration::from_secs(150);
     let leader = loop {
         assert!(
             Instant::now() < deadline,

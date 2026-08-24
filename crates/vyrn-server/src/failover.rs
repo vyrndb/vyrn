@@ -370,7 +370,13 @@ pub struct PeerCredentials {
 const TICK: Duration = Duration::from_millis(250);
 /// How long one vote solicitation may take before the peer is counted as
 /// unreachable for this candidacy.
-const VOTE_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// Generous on purpose: a solicitation includes a full authenticated
+/// connect, and Argon2 verification on a slow or loaded host takes real
+/// seconds — a starved candidacy elects nobody, which the first Windows CI
+/// run demonstrated. A DEAD peer costs nearly none of this: its TCP
+/// connect is refused immediately.
+const VOTE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Drives the failover timers until the process exits.
 ///
