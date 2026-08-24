@@ -1,8 +1,13 @@
 name: ci
 
+# Release gates, not per-commit CI: the full matrix (both OSes, crash soak,
+# docker, audit) runs when a release tag is pushed, and on demand via
+# `gh workflow run ci`. Day-to-day verification is local — the same
+# fmt/clippy/test commands the README's Verification section lists.
 on:
   push:
-  pull_request:
+    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

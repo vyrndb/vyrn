@@ -701,11 +701,17 @@ fn writes_fail_rather_than_silently_dropping_the_guarantee() {
         "a write with no replica must fail, not be silently acknowledged \
          unreplicated. Got: {error}"
     );
-    assert_eq!(
-        cluster
-            .primary
-            .metric("vyrn_replication_ack_timeouts_total"),
-        1,
+    // Sampled like every other counter in this file, not read once: the
+    // increment happens on the write path but this observation crosses the
+    // admin endpoint, and the first Linux CI run caught the instant read
+    // arriving before the scrape reflected it.
+    assert!(
+        wait_for_metric(
+            &cluster.primary,
+            "vyrn_replication_ack_timeouts_total",
+            1,
+            Duration::from_secs(10)
+        ),
         "the timeout should be counted"
     );
 
