@@ -328,3 +328,46 @@ fn latest_cursor_subscribes_to_future_changes_only() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].key, b"new");
 }
+
+/// `EngineOptions::change_log = false` declines the whole subscription
+/// feature: no change records are appended (halving a small put's WAL
+/// payload and removing a key from its commit pipeline), `read_changes`
+/// reports nothing, and `last_published` stays empty — while every ordinary
+/// read and write is untouched. Re-enabling later records from that point
+/// on; the disabled stretch is silence, as the option documents.
+#[test]
+fn a_disabled_change_log_records_nothing_and_changes_no_answers() {
+    let directory = tempdir().unwrap();
+    {
+        let mut engine = Engine::open_with_options(
+            directory.path(),
+            vyrn_core::EngineOptions {
+                change_log: false,
+                ..vyrn_core::EngineOptions::default()
+            },
+        )
+        .unwrap();
+        engine.put(b"a".to_vec(), b"1".to_vec()).unwrap();
+        engine.put(b"b".to_vec(), b"2".to_vec()).unwrap();
+        engine.delete(b"a").unwrap();
+        assert_eq!(engine.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+        assert_eq!(engine.get(b"a").unwrap(), None);
+        assert!(
+            engine.read_changes(Cursor::start(), 100).unwrap().is_empty(),
+            "a disabled change log must record nothing"
+        );
+        assert!(
+            engine.last_published().is_empty(),
+            "a disabled change log must publish nothing"
+        );
+    }
+    // Re-enabled: history for the disabled stretch is gone (silence, not an
+    // error), and new commits record normally from here.
+    let mut engine = Engine::open(directory.path()).unwrap();
+    assert!(engine.read_changes(Cursor::start(), 100).unwrap().is_empty());
+    engine.put(b"c".to_vec(), b"3".to_vec()).unwrap();
+    let changes = engine.read_changes(Cursor::start(), 100).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].key, b"c".to_vec());
+    assert_eq!(engine.last_published().len(), 1);
+}

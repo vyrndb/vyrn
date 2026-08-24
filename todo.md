@@ -212,10 +212,16 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       sandbox run (fsync ~45 µs) showed vyrn 4.9–5.3K/s single-writer against sled's 19.7–22K —
       overhead the Windows fsync hid completely. The WAL phase is now split (wal_encode/fill/
       write/sync + bytes and fills per request, printed by apply-profile) so the next sandbox run
-      can attribute it. Known already: a 128 B put hands ~400 B to the WAL (the change-log record
-      rides along, doubling small-write payload); suspects beyond that are the write_all_at shape
-      and the runway fill's own fdatasync on that filesystem. Run `CLIENTS=1 WRITE_BACK=8388608
-      apply-profile` on the sandbox and read the split before changing anything.
+      can attribute it. Run `CLIENTS=1 WRITE_BACK=8388608 CHANGE_LOG=0 apply-profile` there and
+      read the split before changing anything. **First bite taken (round 12):**
+      `EngineOptions::change_log` (default true, server unchanged) lets an embedded engine
+      decline the subscription feature — the change record was riding a FULL COPY of every value
+      through the WAL (a 64 KiB put wrote its value three times: value log, WAL op, change
+      record; a 128 B put's WAL payload was ~2×). Declined in the harness (sled/redb have no
+      change log). Even under this host's fsync: durable_c64 4 KiB 11.1K → 17.3K/s, 64 KiB
+      1.34K → 2.13K/s, single 64 KiB now #1 over flushed sled, batch_put 354K. The sandbox's
+      single-writer rows should close much of the 3.8× — rerun there. If a gap remains, the
+      remaining suspects are wal_write shape and the runway fill's fdatasync on that filesystem.
 - [ ] **What's still open on the bench front.** durable 64 KiB: bounded by the 2× spill
       amplification (value log + WAL both carry the bytes) and then by the device — the
       persistence-strategy change (WAL referencing value-log extents + value-log fsync in the

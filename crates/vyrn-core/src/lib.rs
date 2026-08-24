@@ -461,6 +461,21 @@ pub struct EngineOptions {
     /// to see the buffer. Same-`Engine` reads — everything on this type — see
     /// every committed write immediately, exactly as without the buffer.
     pub write_back_buffer: usize,
+    /// Whether commits append durable change records for subscriptions.
+    ///
+    /// `true` — the default, and what the server requires — makes every
+    /// commit of published keys carry a change record: an extra key through
+    /// the whole commit pipeline and a near-doubling of a small put's WAL
+    /// payload (a 128 B put hands ~400 B to the log). That is the honest
+    /// price of `read_changes`, `last_published`, and every subscription
+    /// built on them. An embedded engine that serves no subscribers can
+    /// decline to pay it: with `false`, commits skip the record entirely,
+    /// `read_changes` returns nothing new, and `last_published` stays empty.
+    ///
+    /// Choose per database, not per open: a database that alternates loses
+    /// change history for the disabled stretches, which subscribers see as
+    /// silence rather than an error.
+    pub change_log: bool,
 }
 
 /// Receives WAL records as the engine appends them.
@@ -498,6 +513,7 @@ impl Default for EngineOptions {
             archived_through: None,
             record_sink: None,
             write_back_buffer: 0,
+            change_log: true,
         }
     }
 }
@@ -912,6 +928,9 @@ pub struct Engine {
     /// descents, a spurious `false` would corrupt revision bookkeeping —
     /// so it only ever moves toward `true` between opens.
     tombstones_possible: bool,
+    /// Whether commits append durable change records — see
+    /// [`EngineOptions::change_log`].
+    change_log_enabled: bool,
 }
 
 impl Engine {
@@ -1075,6 +1094,7 @@ impl Engine {
             record_sink: options.record_sink,
             row_cache: row_cache::RowCache::new(),
             tombstones_possible,
+            change_log_enabled: options.change_log,
         })
     }
 
@@ -2588,6 +2608,14 @@ impl Engine {
     /// The records join the same batch as the data they describe, so a change is
     /// visible after recovery exactly when its mutation committed.
     fn with_change_log(&mut self, operations: Vec<BatchOperation>) -> Result<Vec<BatchOperation>> {
+        // Declined per EngineOptions: no record, no presence scan, no
+        // published staging — the commit carries exactly the caller's
+        // operations, which for a small put halves its WAL payload and
+        // removes a whole key from its pipeline.
+        if !self.change_log_enabled {
+            self.last_published = Vec::new();
+            return Ok(operations);
+        }
         let sequence = self
             .last_lsn
             .checked_add(1)

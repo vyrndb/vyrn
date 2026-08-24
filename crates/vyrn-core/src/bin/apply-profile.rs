@@ -30,6 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // CHANGE_LOG=0 profiles commits without their change records — the A/B
+    // that shows what the subscription feature costs a small write.
+    let change_log = std::env::var("CHANGE_LOG").map_or(true, |v| v != "0");
 
     let directory = std::env::temp_dir().join("vyrn-apply-profile");
     let _ = std::fs::remove_dir_all(&directory);
@@ -38,10 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &directory,
         EngineOptions {
             write_back_buffer: write_back,
+            change_log,
             ..EngineOptions::default()
         },
     )?;
-    println!("write_back={write_back}");
+    println!("write_back={write_back} change_log={change_log}");
     let value = vec![7u8; value_size];
 
     // Build a tree of realistic depth first; a batch against an empty tree

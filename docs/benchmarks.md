@@ -619,6 +619,33 @@ amplification for spilled values (the bytes land in the value log AND the
 WAL record) is the queued persistence-strategy item, and even solved it
 buys at most that factor.
 
+### Fixed: the change log is pay-for-what-you-use
+
+The durable change log — what funds `read_changes`, `last_published`, and
+every subscription — rode through EVERY commit of published keys as a full
+extra key: a change record carrying a copy of each written key AND value,
+encoded into the commit's WAL record and stored in the tree. The new WAL
+sub-phase counters made the price legible: a 128 B put handed ~400 B to the
+WAL (~2x), and a 64 KiB put wrote its value THREE times — value log, WAL
+operation, change record. sled and redb have no change log at all, so every
+comparison was vyrn-with-a-feature against engines without it.
+
+`EngineOptions::change_log` (default `true`; the server requires it and is
+unchanged) lets an embedded engine that serves no subscribers decline the
+whole feature: no record, no presence scan, no published staging —
+`read_changes` reports nothing and `last_published` stays empty, pinned by
+a test. Choose per database, not per open: a disabled stretch is silence to
+subscribers, not an error.
+
+Measured with the change log declined, same host, same run (and this host's
+~500 us fsync still hiding most of the CPU): durable_c64 4 KiB 11.1K ->
+17.3K/s, durable_c64 64 KiB 1.34K -> 2.13K/s, single-writer durable 64 KiB
+now ahead of flushed sled, batch_put 355K ops/s. On a cheap-barrier host —
+where a sandbox run measured vyrn's single-writer commit at ~200 us against
+sled's ~50 — the halved payload is a much larger share of the gap; the WAL
+split (`wal_encode`/`wal_fill`/`wal_write`/`wal_sync`, printed by
+apply-profile) attributes whatever remains.
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and
