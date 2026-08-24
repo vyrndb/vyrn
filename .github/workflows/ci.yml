@@ -59,10 +59,13 @@ jobs:
 
   audit:
     runs-on: ubuntu-24.04
+    # cargo-audit tracks recent rustc and the repo's rust-toolchain.toml pins
+    # the build toolchain, which overrides any installed default — the env
+    # var outranks the file, so the audit alone runs on stable.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
-      # cargo-audit tracks recent rustc; the pinned build toolchain fell
-      # behind its requirement, so the audit installs on stable.
       - uses: dtolnay/rust-toolchain@stable
       - uses: rustsec/audit-check@v2
         with:

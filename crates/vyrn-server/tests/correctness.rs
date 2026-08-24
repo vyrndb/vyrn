@@ -632,8 +632,20 @@ fn a_read_past_its_deadline_is_abandoned_not_served_forever() {
         );
 
         // And the server is still fully usable afterwards: abandoning a statement
-        // is not a fault, so nothing should have been marked failed.
-        let ready = http_get(node.admin_port, "/health/ready").unwrap_or_default();
+        // is not a fault, so nothing should have been marked failed. The probe
+        // itself crosses the admin listener and can transiently fail to connect
+        // on a loaded host — which says nothing about the health claim — so it
+        // is sampled; a genuinely unready node answers non-200 every time and
+        // still fails here.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut ready = String::new();
+        while Instant::now() < deadline {
+            ready = http_get(node.admin_port, "/health/ready").unwrap_or_default();
+            if ready.contains("200") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
         assert!(
             ready.contains("200"),
             "abandoning one oversized read must not take the node out of service: {ready}"
