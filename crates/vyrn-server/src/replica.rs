@@ -72,6 +72,11 @@ pub struct ReplicaConfig {
     /// the primary's archive is what turns "rebuild this replica by hand" into an
     /// automatic recovery.
     pub wal_archive_dir: Option<std::path::PathBuf>,
+    /// Automatic-failover state, when `--cluster` configured it. The replica
+    /// loop then fences the stream by epoch, feeds the election timers, and
+    /// exits when this node is promoted; on reconnect it rotates through the
+    /// other cluster members until it finds the member that is primary.
+    pub failover: Option<std::sync::Arc<crate::failover::Failover>>,
     /// The read handles clients are served from.
     ///
     /// Reads do NOT go through the write engine — they use separate
@@ -88,8 +93,33 @@ pub struct ReplicaConfig {
 /// Never returns `Ok` in normal operation; it reconnects indefinitely.
 pub async fn run(engine: Arc<RwLock<Engine>>, config: ReplicaConfig) -> Result<()> {
     let mut backoff = RECONNECT_MIN;
+    /* Under failover the configured primary is only the FIRST place to look:
+     * after an election the leader is some other member, and the searching
+     * rotation below is how a follower finds it — each member that is not
+     * the primary refuses ReplicaHello with an ordinary error, and the next
+     * reconnect tries the next member. */
+    let mut candidates: Vec<String> = vec![config.primary_url.clone()];
+    if let Some(failover) = &config.failover {
+        for member in &failover.members {
+            if member.name != failover.self_name && !candidates.contains(&member.url) {
+                candidates.push(member.url.clone());
+            }
+        }
+    }
+    let mut which = 0usize;
     loop {
-        match stream_once(&engine, &config).await {
+        if let Some(failover) = &config.failover {
+            /* Promotion ends the following role: the winner's log is the
+             * cluster's history now, and streaming FROM anyone would append
+             * records this node is itself responsible for producing. */
+            if failover.role() == crate::failover::Role::Primary {
+                eprintln!("promoted to primary; replica loop ends");
+                return Ok(());
+            }
+        }
+        let url = candidates[which % candidates.len()].clone();
+        which = which.wrapping_add(1);
+        match stream_once(&engine, &config, &url).await {
             Ok(()) => {
                 // A clean end means the primary closed the stream — reconnect
                 // promptly rather than backing off, since nothing is broken.
@@ -97,9 +127,18 @@ pub async fn run(engine: Arc<RwLock<Engine>>, config: ReplicaConfig) -> Result<(
                 backoff = RECONNECT_MIN;
             }
             Err(error) => {
+                /* Under failover the cap stays low: a follower searching
+                 * for a freshly elected primary must find it within the
+                 * leader's patience, and ten seconds of backoff is how the
+                 * last election died on the vine. */
+                let cap = if config.failover.is_some() {
+                    Duration::from_millis(1_000)
+                } else {
+                    RECONNECT_MAX
+                };
                 eprintln!("replication failed: {error:#}; retrying in {backoff:?}");
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_MAX);
+                backoff = (backoff * 2).min(cap);
                 continue;
             }
         }
@@ -107,9 +146,17 @@ pub async fn run(engine: Arc<RwLock<Engine>>, config: ReplicaConfig) -> Result<(
     }
 }
 
-/// One connection's lifetime: handshake, then stream until it ends.
-async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Result<()> {
-    let (host, port, username, database, tls_required) = parse_url(&config.primary_url)?;
+/// Connects to `url` and authenticates with the replica credentials,
+/// returning the framed connection and the database the URL named. Shared by
+/// the replica stream and the election driver — a vote travels the same
+/// authenticated door as everything else.
+pub(crate) async fn connect_authenticated(
+    url: &str,
+    password: &str,
+    ca_file: Option<&Path>,
+    allow_plaintext: bool,
+) -> Result<(Framed<BoxedTransport, VyrnCodec>, String)> {
+    let (host, port, username, database, tls_required) = parse_url(url)?;
 
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
         .await
@@ -118,16 +165,12 @@ async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Re
     stream.set_nodelay(true).ok();
 
     let transport: BoxedTransport = if tls_required {
-        let ca = config
-            .ca_file
-            .as_deref()
-            .context("TLS requires a CA certificate; pass --replica-ca-file")?;
+        let ca = ca_file.context("TLS requires a CA certificate; pass --replica-ca-file")?;
         Box::new(connect_tls(stream, &host, ca).await?)
     } else {
-        if !config.allow_plaintext {
+        if !allow_plaintext {
             bail!(
-                "refusing to replicate over plaintext; supply a CA certificate or set \
-                 --allow-plaintext for isolated local testing"
+                "refusing to replicate over plaintext; supply a CA certificate or set                  --allow-plaintext for isolated local testing"
             );
         }
         Box::new(stream)
@@ -142,7 +185,7 @@ async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Re
             1,
             Message::Authenticate {
                 username,
-                password: config.password.clone(),
+                password: password.to_owned(),
                 database: database.clone(),
             },
         ))
@@ -156,6 +199,22 @@ async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Re
         Some(Err(error)) => return Err(error.into()),
         None => bail!("primary closed the connection during authentication"),
     }
+    Ok((framed, database))
+}
+
+/// One connection's lifetime: handshake, then stream until it ends.
+async fn stream_once(
+    engine: &Arc<RwLock<Engine>>,
+    config: &ReplicaConfig,
+    url: &str,
+) -> Result<()> {
+    let (mut framed, database) = connect_authenticated(
+        url,
+        &config.password,
+        config.ca_file.as_deref(),
+        config.allow_plaintext,
+    )
+    .await?;
 
     // Where this replica's log ends decides where the stream must start.
     let last_lsn = engine
@@ -193,9 +252,7 @@ async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Re
         None => bail!("primary closed the connection during the replication handshake"),
     };
 
-    eprintln!(
-        "replicating from {host}:{port} starting at LSN {first_lsn} (local log ends at {last_lsn})"
-    );
+    eprintln!("replicating from {url} starting at LSN {first_lsn} (local log ends at {last_lsn})");
 
     /* CLOSE A GAP BEFORE CONSUMING THE STREAM.
      *
@@ -264,7 +321,13 @@ async fn stream_once(engine: &Arc<RwLock<Engine>>, config: &ReplicaConfig) -> Re
         }
     }
 
-    apply_stream(engine, &config.readers, &mut framed).await
+    apply_stream(
+        engine,
+        &config.readers,
+        config.failover.as_deref(),
+        &mut framed,
+    )
+    .await
 }
 
 /// The primary LSN to validate a join against, given what the primary offered.
@@ -333,11 +396,35 @@ async fn close_gap_from_archive(
 async fn apply_stream(
     engine: &Arc<RwLock<Engine>>,
     readers: &Arc<Vec<RwLock<ReadEngine>>>,
+    failover: Option<&crate::failover::Failover>,
     framed: &mut Framed<BoxedTransport, VyrnCodec>,
 ) -> Result<()> {
     while let Some(envelope) = framed.next().await {
         let envelope = envelope?;
+        // Anything arriving on a live stream is proof of a live primary.
+        if let Some(failover) = failover {
+            failover.heard_from_leader();
+        }
         match envelope.message {
+            /* THE FENCE. A primary whose epoch is below this node's persisted
+             * epoch was deposed by an election it has not seen; applying its
+             * records would resurrect the very split-brain the epochs exist
+             * to prevent. A HIGHER epoch is adopted (persisted before this
+             * returns): whoever leads at it is legitimate. */
+            Message::PrimaryEpoch { epoch } => {
+                let Some(failover) = failover else {
+                    continue;
+                };
+                if epoch < failover.epoch() {
+                    bail!(
+                        "refusing the stream: the sender claims epoch {epoch} but this member                          has seen epoch {}; that primary was deposed",
+                        failover.epoch()
+                    );
+                }
+                failover
+                    .observe_epoch(epoch)
+                    .context("failed to persist the observed epoch")?;
+            }
             Message::ReplicaRecords { records } => {
                 let durable_lsn = apply_batch(engine, readers, &records).await?;
                 if let Some(durable_lsn) = durable_lsn {

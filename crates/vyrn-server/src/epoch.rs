@@ -53,9 +53,7 @@ impl EpochStore {
                 Ok(store)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(store),
-            Err(error) => {
-                Err(error).with_context(|| format!("failed to open {:?}", store.path))
-            }
+            Err(error) => Err(error).with_context(|| format!("failed to open {:?}", store.path)),
         }
     }
 
@@ -157,13 +155,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         {
             let mut store = EpochStore::open(directory.path()).unwrap();
-            assert_eq!((store.current, store.voted), (0, 0), "absent file is epoch 0");
+            assert_eq!(
+                (store.current, store.voted),
+                (0, 0),
+                "absent file is epoch 0"
+            );
             store.advance(3, true).unwrap();
             store.advance(2, false).unwrap(); // lower: must not regress
             assert_eq!((store.current, store.voted), (3, 3));
         }
         let mut store = EpochStore::open(directory.path()).unwrap();
-        assert_eq!((store.current, store.voted), (3, 3), "epochs must be durable");
+        assert_eq!(
+            (store.current, store.voted),
+            (3, 3),
+            "epochs must be durable"
+        );
         store.advance(5, false).unwrap();
         assert_eq!((store.current, store.voted), (5, 3));
     }

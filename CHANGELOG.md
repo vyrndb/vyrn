@@ -4,6 +4,30 @@ All notable changes to Vyrn are documented here. From 1.0.0 the on-disk
 formats follow the contract in `docs/compatibility.md`: every 1.x build
 reads what any earlier build wrote, and downgrade is unsupported.
 
+## [1.1.0] - 2026-08-25
+
+The "what it is not" release: four of the five 1.0 limitations fell.
+
+### Added
+
+- **Automatic failover** (`--cluster`, 3+ members): epoch-fenced quorum
+  elections where a vote requires the candidate to hold every acknowledged
+  write; primaries self-demote on lease loss and campaign again; two-member
+  clusters are refused with the split-brain argument. Safety argument and
+  operator procedure in docs/replication.md. Additive protocol messages,
+  sent only when configured.
+- **Per-user accounts, prefix ACLs, and an audit trail**
+  (`VYRN_USERS_FILE`, `VYRN_AUDIT_LOG`): read/write/admin per key prefix,
+  revocation by file edit, denials distinct from auth failures, audit lines
+  that never contain values or credentials. The single-credential mode is
+  unchanged; the wire protocol is unchanged.
+- **Delete rebalancing**: underfull pages merge during copy-on-write
+  rewrites on both delete paths; deleting 90% of a tree's keys now shrinks
+  it ~9x instead of leaving it full-size until compaction.
+- **Windows directory durability**: `sync_directory` performs a real
+  directory flush on Windows (was a silent no-op), covering every
+  rename-publish. Linux remains the soak-certified production platform.
+
 ## [1.0.0] - 2026-08-24
 
 The first stable release. What "stable" freezes: the on-disk formats (tree

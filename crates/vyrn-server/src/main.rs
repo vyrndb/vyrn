@@ -1,7 +1,7 @@
 mod audit;
+mod auth;
 mod epoch;
 mod failover;
-mod auth;
 mod replica;
 mod replication;
 
@@ -241,6 +241,28 @@ struct Args {
     /// writes to the archive.
     #[arg(long, env = "VYRN_REPLICA_WAL_ARCHIVE_DIR", requires = "replica_of")]
     replica_wal_archive_dir: Option<PathBuf>,
+    /// Static cluster membership for automatic failover:
+    /// `name=vyrn://user@host:port/db,name=...`, every member listed,
+    /// including this one. Absent (the default) means no automatic failover —
+    /// promotion stays the manual procedure in docs/replication.md.
+    ///
+    /// Requires at least 3 members and `--replication-min-acks >= floor(N/2)`;
+    /// both are refused at startup otherwise, with the safety argument in the
+    /// error. See docs/replication.md for why 2-member automatic failover is
+    /// split-brain by construction.
+    #[arg(long, env = "VYRN_CLUSTER", requires = "cluster_self")]
+    cluster: Option<String>,
+    /// This member's name in `--cluster`.
+    #[arg(long, env = "VYRN_CLUSTER_SELF", requires = "cluster")]
+    cluster_self: Option<String>,
+    /// How long a primary may go without holding its quorum before it
+    /// self-fences (refuses writes as deposed).
+    #[arg(long, env = "VYRN_FAILOVER_LEASE_MS", default_value_t = 3_000)]
+    failover_lease_ms: u64,
+    /// How long a follower waits without hearing from a primary before
+    /// standing for election. Jittered per member to avoid split votes.
+    #[arg(long, env = "VYRN_FAILOVER_ELECTION_MS", default_value_t = 6_000)]
+    failover_election_ms: u64,
 }
 
 struct Metrics {
@@ -1133,6 +1155,11 @@ struct ServerState {
     /// non-contiguous, and the replica could never be promoted without silently
     /// serving a history that never existed on the primary.
     read_only: bool,
+    /// Present when `--cluster` configured automatic failover. Writes are
+    /// then governed by the ROLE (primary/follower/deposed) rather than the
+    /// static `read_only`, `ReplicaHello` streams only from the primary, and
+    /// vote requests are answered — see the safety argument in [`failover`].
+    failover: Option<Arc<failover::Failover>>,
 }
 
 #[tokio::main]
@@ -1247,6 +1274,36 @@ async fn main() -> Result<()> {
             ack_timeout_ms = args.replication_ack_timeout_ms
         );
     }
+    /* Automatic failover, only when the full membership is declared. The
+     * shape checks (N >= 3, min-acks >= majority) are the safety argument
+     * and refuse startup rather than degrade — see failover.rs. */
+    let failover_state = match (&args.cluster, &args.cluster_self) {
+        (Some(spec), Some(self_name)) => {
+            let members = failover::parse_cluster(spec, self_name, args.replication_min_acks)?;
+            let epochs = epoch::EpochStore::open(&args.data)?;
+            log_info!(
+                "vyrnd.failover",
+                "automatic failover enabled",
+                members = members.len(),
+                self_name = self_name.clone(),
+                epoch = epochs.current,
+                role = if args.replica_of.is_some() {
+                    "follower"
+                } else {
+                    "primary"
+                }
+            );
+            Some(Arc::new(failover::Failover::new(
+                members,
+                self_name.clone(),
+                epochs,
+                args.replica_of.is_none(),
+                Duration::from_millis(args.failover_lease_ms),
+                Duration::from_millis(args.failover_election_ms),
+            )))
+        }
+        _ => None,
+    };
     /* The sink is attached ONLY when replication is on. With it absent the
      * engine's commit path is byte-for-byte what it was before this feature
      * existed — no clone of the record, no call, nothing to go wrong for the
@@ -1416,6 +1473,7 @@ async fn main() -> Result<()> {
         metrics: Arc::clone(&metrics),
         replication: Arc::clone(&replication),
         read_only: args.replica_of.is_some(),
+        failover: failover_state.clone(),
     });
     /* REPLICA MODE. Started after the engine and the write pipeline exist,
      * because the replica task appends through the same engine handle. Reads are
@@ -1444,6 +1502,7 @@ async fn main() -> Result<()> {
             replica_id,
             allow_plaintext: args.allow_plaintext,
             wal_archive_dir: args.replica_wal_archive_dir.clone(),
+            failover: failover_state.clone(),
             readers: Arc::clone(&readers),
         };
         tokio::spawn(async move {
@@ -1456,6 +1515,33 @@ async fn main() -> Result<()> {
                 );
             }
         });
+    }
+
+    /* The failover coordinator: the lease on a primary, elections on a
+     * follower. A follower dials its peers with the same credentials it
+     * streams with; the initial primary has none and never stands — it
+     * leads until deposed and rejoins via operator restart. */
+    if let Some(failover) = failover_state.clone() {
+        let credentials = match &args.replica_password_file {
+            Some(file) => {
+                let password = std::fs::read_to_string(file)
+                    .with_context(|| format!("failed to read {file:?}"))?
+                    .trim_end_matches(['\r', '\n'])
+                    .to_owned();
+                Some(failover::PeerCredentials {
+                    password,
+                    ca_file: args.replica_ca_file.clone(),
+                    allow_plaintext: args.allow_plaintext,
+                })
+            }
+            None => None,
+        };
+        tokio::spawn(failover::run_coordinator(
+            failover,
+            Arc::clone(&replication),
+            Arc::clone(&engine),
+            credentials,
+        ));
     }
 
     let admin_metrics = Arc::clone(&metrics);
@@ -1930,12 +2016,78 @@ async fn run_session(
              * `transaction.is_none()` guard: a connection mid-transaction has
              * pinned engine state, and turning it into a stream would leak that.
              */
+            /* A candidacy. Granting is durable before it is answered (see
+             * `Failover::consider_vote`), and merely SEEING a higher epoch
+             * deposes a primary — the request is proof an election it cannot
+             * win is underway. */
+            Message::VoteRequest { epoch, durable_lsn } if transaction.is_none() => {
+                match &state.failover {
+                    None => server_error(
+                        ErrorCode::InvalidRequest,
+                        "this node is not configured for automatic failover (--cluster)",
+                    ),
+                    Some(failover) => {
+                        let own_lsn = state
+                            .engine
+                            .read()
+                            .map(|engine| engine.last_lsn())
+                            .unwrap_or(u64::MAX);
+                        match failover.consider_vote(epoch, durable_lsn, own_lsn) {
+                            Ok(granted) => {
+                                log_info!(
+                                    "vyrnd.failover",
+                                    "vote requested",
+                                    epoch = epoch,
+                                    candidate_lsn = durable_lsn,
+                                    own_lsn = own_lsn,
+                                    granted = granted
+                                );
+                                Message::VoteResponse {
+                                    granted,
+                                    epoch: failover.epoch(),
+                                }
+                            }
+                            /* A vote that cannot be persisted must not be
+                             * granted — an unremembered grant can be cast
+                             * twice. Refusing is always safe. */
+                            Err(error) => {
+                                log_error!(
+                                    "vyrnd.failover",
+                                    "vote refused: epoch persistence failed",
+                                    detail = format!("{error:#}")
+                                );
+                                Message::VoteResponse {
+                                    granted: false,
+                                    epoch: failover.epoch(),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Message::ReplicaHello {
                 database,
                 last_lsn,
                 replica_id,
             } if transaction.is_none() => {
-                if database != state.database {
+                /* Under automatic failover only the PRIMARY streams. Answered
+                 * as an ordinary error, not ReplicaDiverged: divergence is
+                 * fatal to a replica by design, while "not the primary" is
+                 * exactly what a searching replica's member rotation retries
+                 * past until it finds the member that is. */
+                let not_primary = state.failover.as_ref().and_then(|failover| {
+                    (failover.role() != failover::Role::Primary).then(|| {
+                        format!(
+                            "this member is not the primary ({:?} at epoch {}); \
+                             try the other cluster members",
+                            failover.role(),
+                            failover.epoch()
+                        )
+                    })
+                });
+                if let Some(reason) = not_primary {
+                    server_error(ErrorCode::InvalidRequest, &reason)
+                } else if database != state.database {
                     server_error(
                         ErrorCode::InvalidRequest,
                         "replica requested a different database",
@@ -2036,11 +2188,13 @@ async fn run_session(
                                     },
                                 ))
                                 .await?;
+                            send_primary_epoch(&mut framed, state.failover.as_deref()).await?;
                             stream_records(
                                 &mut framed,
                                 &state.replication,
                                 oldest_available,
                                 &replica_id,
+                                state.failover.as_deref(),
                             )
                             .await?;
                             return Ok(());
@@ -2059,8 +2213,15 @@ async fn run_session(
                                     Message::ReplicaStream { first_lsn },
                                 ))
                                 .await?;
-                            stream_records(&mut framed, &state.replication, first_lsn, &replica_id)
-                                .await?;
+                            send_primary_epoch(&mut framed, state.failover.as_deref()).await?;
+                            stream_records(
+                                &mut framed,
+                                &state.replication,
+                                first_lsn,
+                                &replica_id,
+                                state.failover.as_deref(),
+                            )
+                            .await?;
                             return Ok(());
                         }
                     }
@@ -2307,6 +2468,26 @@ async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
 
 /// Feeds WAL records to a replica and collects its acknowledgements.
 ///
+/// The primary's fencing epoch, sent immediately after `ReplicaStream` and
+/// then as the stream's heartbeat — only when automatic failover is
+/// configured, so a node without it never sees the tag.
+async fn send_primary_epoch(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    failover: Option<&failover::Failover>,
+) -> Result<()> {
+    if let Some(failover) = failover {
+        framed
+            .send(Envelope::new(
+                0,
+                Message::PrimaryEpoch {
+                    epoch: failover.epoch(),
+                },
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Both directions on one connection, driven by `select!`: records go out as the
 /// engine produces them, acknowledgements come back as the replica syncs. They
 /// cannot be sequenced — waiting for an acknowledgement before sending the next
@@ -2322,9 +2503,11 @@ async fn stream_records(
     replication: &Arc<replication::Replication>,
     first_lsn: u64,
     replica_id: &str,
+    failover: Option<&failover::Failover>,
 ) -> Result<()> {
     let (id, mut records) = replication.register();
-    let result = stream_records_inner(framed, replication, &mut records, first_lsn, id).await;
+    let result =
+        stream_records_inner(framed, replication, &mut records, first_lsn, id, failover).await;
     // Always, on every exit path.
     replication.deregister(id);
     match &result {
@@ -2349,9 +2532,31 @@ async fn stream_records_inner(
     records: &mut broadcast::Receiver<replication::Shipment>,
     first_lsn: u64,
     id: u64,
+    failover: Option<&failover::Failover>,
 ) -> Result<()> {
+    /* Under failover the stream carries the primary's epoch as an idle
+     * heartbeat: it is what keeps followers from timing out into an election
+     * while the primary is healthy but idle, and each tick re-checks the
+     * role so a primary deposed mid-stream stops feeding within one beat.
+     * A third of the lease, so a follower misses two beats before its own
+     * timers can even begin to matter. */
+    let heartbeat = failover.map(|failover| failover.lease / 3);
+    let mut beat = tokio::time::interval(heartbeat.unwrap_or(std::time::Duration::from_secs(3600)));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = beat.tick(), if heartbeat.is_some() => {
+                let failover = failover.expect("ticking only when configured");
+                if failover.role() != failover::Role::Primary {
+                    anyhow::bail!(
+                        "this member was deposed at epoch {} and stops streaming",
+                        failover.epoch()
+                    );
+                }
+                framed
+                    .send(Envelope::new(0, Message::PrimaryEpoch { epoch: failover.epoch() }))
+                    .await?;
+            }
             shipment = records.recv() => match shipment {
                 Ok(shipment) => {
                     // Records below the join point are skipped rather than sent:
@@ -2756,17 +2961,34 @@ async fn execute(state: Arc<ServerState>, request: Message) -> Message {
      *
      * Checked here because `execute` is the single funnel every client request
      * passes through, so one guard covers every mutation path rather than six. */
-    if state.read_only && mutates_storage(&request) {
-        state
-            .metrics
-            .failed_requests
-            .fetch_add(1, Ordering::Relaxed);
-        return server_error(
-            ErrorCode::InvalidRequest,
-            "this node is a replica and does not accept writes; \
-             send writes to the primary, or promote this node by restarting it \
-             without --replica-of",
-        );
+    if mutates_storage(&request) {
+        /* With failover configured the ROLE governs writes — a follower may
+         * be promoted at runtime, and a deposed primary must refuse forever —
+         * so the static flag defers to it. Without failover the flag is the
+         * whole story, exactly as before the feature existed. */
+        let refusal = match &state.failover {
+            Some(failover) => match failover.role() {
+                failover::Role::Primary => None,
+                failover::Role::Follower => Some(format!(
+                    "this node is a follower at epoch {}; send writes to the primary",
+                    failover.epoch()
+                )),
+            },
+            None if state.read_only => Some(
+                "this node is a replica and does not accept writes; \
+                 send writes to the primary, or promote this node by restarting it \
+                 without --replica-of"
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        if let Some(refusal) = refusal {
+            state
+                .metrics
+                .failed_requests
+                .fetch_add(1, Ordering::Relaxed);
+            return server_error(ErrorCode::InvalidRequest, &refusal);
+        }
     }
     match request {
         Message::Put { key, value } => {

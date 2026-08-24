@@ -16,10 +16,10 @@ can be opened as a primary directly.
 
 **Not guaranteed, and deliberately so:**
 
-- **No automatic failover.** Nothing elects a new primary. If the primary dies,
-  writes stop until an operator promotes a replica. This is a scope decision, not
-  an oversight — leader election without consensus is how split-brain happens, and
-  a wrong answer there loses more data than no answer.
+- **Automatic failover is opt-in and needs three members.** Without
+  `--cluster`, nothing elects a new primary and promotion is manual, exactly
+  as before. With it, see "Automatic failover" below — including what it
+  still does not do (redirect clients, preserve unacknowledged writes).
 - **No read-your-writes across nodes.** A replica applies a record before
   acknowledging it, so a read there immediately after a primary write will
   normally see it — but that ordering is not enforced for reads and must not be
@@ -143,9 +143,73 @@ accepts writes immediately. Verified end to end: after `kill -9` on a primary wi
 6 acknowledged commits, the replica held all 6 at the same LSN, served them after
 its own restart, and accepted new writes.
 
-**Confirm the old primary is dead before promoting.** Two nodes both accepting
-writes will diverge, and nothing here detects or repairs that. There is no
-fencing — that is the main thing automatic failover would have to add.
+**Confirm the old primary is dead before promoting manually.** Manual
+promotion has no fencing: two nodes both accepting writes will diverge, and
+nothing detects or repairs that. Fencing is exactly what the automatic mode
+below adds.
+
+## Automatic failover
+
+Opt-in: every member runs with the full membership declared.
+
+```bash
+vyrnd --data /var/lib/vyrn   --replication-min-acks 1   --cluster 'a=vyrn://repl@node-a:7432/default,b=vyrn://repl@node-b:7432/default,c=vyrn://repl@node-c:7432/default'   --cluster-self a
+  # followers additionally: --replica-of <initial primary> --replica-password-file ...
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--cluster` | off | `name=url,...` for ALL members, this one included. |
+| `--cluster-self` | — | This member's name in that list. |
+| `--failover-lease-ms` | 3000 | A primary that has held a quorum and then lost it for this long demotes itself. |
+| `--failover-election-ms` | 6000 | A follower that has heard nothing from a live primary for this long (plus a per-member jitter) stands for election. |
+
+Startup refuses fewer than 3 members, and refuses
+`--replication-min-acks < floor(N/2)`. Both refusals are the safety
+argument:
+
+**Why an elected leader holds every acknowledged write.** With
+`min-acks >= floor(N/2)`, an acknowledged write is durable on a majority of
+the membership (the primary plus its acks). An election also needs a
+majority (the candidate's own vote plus grants). Any two majorities
+intersect, and a member grants a vote only to a candidate whose durable LSN
+is at or past its own — so the intersecting member blocks any candidate
+missing an acknowledged write. Verified end to end by
+`a_dead_primary_is_replaced_and_acknowledged_writes_survive`, and the vote
+rule is mutation-tested: remove the LSN condition and the stale-candidate
+unit test fails.
+
+**Why a deposed primary cannot split the brain.** Epochs are persisted (the
+`EPOCH` file in the data directory, written with the same rename-and-sync
+discipline as manifests) BEFORE they are acted on. The stream carries the
+primary's epoch as its heartbeat; a follower whose persisted epoch is
+higher refuses the stream, so an old primary cannot feed anyone. It also
+cannot acknowledge: acknowledgement needs `min-acks` connected followers,
+and the majority follows the higher epoch. A primary that has held a quorum
+and then lost it for a full lease demotes itself to follower — it may stand
+in later elections (its log may be the longest), but it refuses writes
+until it wins one.
+
+**Why two members are refused.** A majority of 2 is 2: the survivor of a
+pair can never elect itself, and lowering the bar to 1 would let both sides
+of a partition lead at once. No timeout tuning fixes this; use three
+members. `a_two_member_cluster_is_refused_at_startup` pins the refusal and
+`a_minority_partition_cannot_elect` pins that a lone survivor of three
+keeps refusing writes.
+
+**What automatic failover does NOT do**, stated plainly:
+
+- **Clients are not redirected.** They reconnect against the member list
+  until a member accepts writes; a follower's refusal names its role and
+  epoch. Followers find a new primary the same way — rotating through the
+  membership until one streams.
+- **Unacknowledged writes may be lost or delivered late.** A write that
+  never reached its quorum was reported failed; if the old primary later
+  rejoins and wins an election, its durable-but-unacknowledged tail is
+  delivered then. Nothing a client was told succeeded is ever lost.
+- **A demoted ex-primary serves stale reads** until an operator restarts it
+  with `--replica-of` (it has no follower stream of its own). It votes and
+  campaigns correctly in the meantime.
 
 ## Failure modes
 
@@ -176,7 +240,6 @@ production-certified — the README's other gaps stand: sustained crash loops,
 fuzzing beyond the decoder, performance characterisation under failure, and
 external review. In particular:
 
-- **No automatic failover or fencing** (above).
 - **No gap recovery from the WAL archive yet.** A replica that falls behind the
   live buffer reconnects and resumes, but if the primary has already checkpointed
   and pruned those segments the replica cannot catch up and must be rebuilt from a

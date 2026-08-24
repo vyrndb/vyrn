@@ -1,24 +1,21 @@
 # vyrn — production-readiness TODO
 
-## 🔨 IN PROGRESS: fenced automatic failover (v1.1 wave 2, implementing now)
+## ✅ v1.1.0 — "fix all of these" wave (2026-08-25)
 
-Design (safety argument goes in docs/replication.md when done): static membership
-`--cluster name=vyrn://url,...` + `--cluster-self <name>`; failover only when set; startup
-refuses N<3 or `min-acks < floor(N/2)` (majority incl. primary → any acked write is on a
-majority → any election majority intersects it → the LSN vote rule makes the winner hold every
-acked write). Epochs persisted crash-safe in `<data>/EPOCH` (current + voted, temp+rename+dir
-sync) — persist BEFORE granting/candidacy. Fencing: new ADDITIVE protocol msgs (tags after 53:
-PrimaryEpoch, VoteRequest{epoch,durable_lsn}, VoteResponse{granted,epoch}) sent only when
-clustered so old nodes never see unknown tags; replica refuses a stream whose PrimaryEpoch <
-its persisted epoch; primary hard-latches step-down (readiness 503, writes refused "deposed at
-epoch E") on seeing a higher epoch. Election: randomized timeout on primary silence → epoch+1
-persisted → votes over the normal authenticated protocol (admin-gated like the replica
-handshake); grant iff epoch > voted (persist first) AND candidate lsn >= own; majority of FULL
-membership → in-place promotion (read_only becomes AtomicBool, replica task stops, node serves
-writes at new epoch); losers re-point their replica loop at the winner via a shared leader
-cell. Old primary rejoin: sees higher epoch → persists, demotes, rejoins via decide_join
-(ReplicaAhead tail → existing rebuild answer). Wiring status if interrupted: check
-crates/vyrn-server/src/{epoch.rs,failover.rs} existence and main.rs `--cluster` flag.
+- [x] **Per-user accounts, prefix ACLs, audit trail** (agent; mutation-verified; 50 server tests)
+- [x] **Deletes rebalance** (agent; 90%-delete → 9.2× fewer live pages; both delete paths; mutation-verified)
+- [x] **Windows directory durability** — sync_directory is a real flush on Windows, one impl, empirically verified
+- [x] **Fenced automatic failover** — epochs persisted crash-safe (EPOCH file, refused-not-zeroed on damage),
+      additive protocol (PrimaryEpoch/VoteRequest/VoteResponse, sent only when --cluster is set), N>=3 +
+      min-acks>=floor(N/2) enforced with the safety argument in the refusal, LSN vote rule (mutation-verified),
+      lease with first-quorum grace, demotion-not-deposition (a lease-lost primary campaigns again — permanence
+      deadlocked the cluster around unacked tails, caught by the integration test), grant-resets-election-timer +
+      scrambled per-member jitter (both liveness bugs caught live), follower member-rotation discovery, in-place
+      promotion. Tests: kill-primary election with acked-write survival, minority partition cannot elect,
+      two-member refusal; docs/replication.md carries the full safety argument. Ex-primary serves stale reads
+      until restarted with --replica-of (documented). vyrnd integration suites remain timing-sensitive on a
+      loaded Windows host (known, documented; Linux CI is the gate).
+
 
 ## 🚢 1.0.0 release gates (2026-08-24)
 

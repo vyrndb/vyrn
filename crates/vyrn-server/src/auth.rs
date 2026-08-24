@@ -619,6 +619,14 @@ fn classify(message: &Message) -> Option<Classified<'_>> {
             requirement: Requirement::Prefix(Admin, Vec::new()),
             scope: None,
         },
+        // A vote decides who may serve the whole keyspace, so requesting one
+        // is gated exactly like the replica handshake.
+        Message::VoteRequest { .. } => Classified {
+            op: "vote-request",
+            read: true,
+            requirement: Requirement::Prefix(Admin, Vec::new()),
+            scope: None,
+        },
         Message::Commit => Classified {
             op: "commit",
             read: false,

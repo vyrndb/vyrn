@@ -12,7 +12,7 @@ log from the last checkpoint; an exhaustive bit-flip suite asserts that any
 single-bit change to a committed record either fails the open loudly or
 leaves every acknowledged write readable.
 
-Version 1.0.0. Formats are frozen per [docs/compatibility.md](docs/compatibility.md):
+Version 1.1.0. Formats are frozen per [docs/compatibility.md](docs/compatibility.md):
 every 1.x build reads what any earlier build wrote, downgrade is
 unsupported, replicas upgrade before primaries.
 
@@ -143,12 +143,15 @@ mutation-verified: revert the fix, watch the test fail.
 
 ## What it is not
 
-Single node, single writer. No SQL. One shared credential — no per-user
-accounts, no ACLs, no audit trail; [docs/security.md](docs/security.md) is
-the full trust model, read it before deploying. Replication is synchronous
-with manual promotion, not automatic failover. Deletes never rebalance the
-tree; space returns at checkpoint compaction. The production platform is
-Linux on ext4/XFS; Windows is for development.
+No SQL, by intent. One writer per keyspace: synchronous replication with
+quorum acknowledgement, and — for clusters of three or more — automatic
+failover with epoch fencing, where an elected leader provably holds every
+acknowledged write (the safety argument is in
+[docs/replication.md](docs/replication.md)). Per-user accounts with
+prefix-granularity ACLs and an audit trail, or a single shared credential;
+either way [docs/security.md](docs/security.md) is the full trust model,
+read it before deploying. The production platform is Linux on ext4/XFS;
+Windows durability is implemented and tested but not yet soak-certified.
 
 ## Documentation
 

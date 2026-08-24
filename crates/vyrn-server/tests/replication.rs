@@ -735,3 +735,215 @@ fn writes_fail_rather_than_silently_dropping_the_guarantee() {
         "a primary that cannot reach quorum must report itself not ready: {ready}"
     );
 }
+
+// --- automatic failover ----------------------------------------------------
+
+/// Like `spawn`, but on ports chosen by the caller — cluster URLs name every
+/// member's address, so the addresses must exist before any member starts.
+fn spawn_member(
+    data: &Path,
+    hash: &Path,
+    port: u16,
+    admin_port: u16,
+    extra: &[(&str, String)],
+) -> Node {
+    // Each member's stderr lands beside its data, so a failed election is
+    // diagnosable from the artifacts instead of re-run guesswork.
+    std::fs::create_dir_all(data).expect("member data dir");
+    let log = std::fs::File::create(data.join("stderr.log")).expect("member log");
+    let mut command = Command::new(vyrnd());
+    command
+        .env("VYRN_BIND", format!("127.0.0.1:{port}"))
+        .env("VYRN_ADMIN_BIND", format!("127.0.0.1:{admin_port}"))
+        .env("VYRN_DATA", data)
+        .env("VYRN_PASSWORD_HASH_FILE", hash)
+        .env("VYRN_ALLOW_PLAINTEXT", "true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn vyrnd");
+    let node = Node {
+        child,
+        port,
+        admin_port,
+    };
+    // 90s, not the spawn helper's 30: three members start at once, and
+    // under full-workspace parallel load a debug build has taken over 30s
+    // to bind — which is a slow host, not a failover defect.
+    assert!(
+        node.wait_ready(Duration::from_secs(90)),
+        "member did not become ready"
+    );
+    node
+}
+
+/// Three members with automatic failover: `a` the initial primary, `b` and
+/// `c` following it. min-acks 1 is exactly floor(3/2), so an acknowledged
+/// write is on a majority (the primary plus one), which is what makes any
+/// election majority provably hold it. Short lease and election timeouts so
+/// the test observes a failover in seconds; every observation below is
+/// still sampled with a deadline, never read once.
+fn failover_trio(dir: &tempfile::TempDir) -> Vec<Node> {
+    let hash = dir.path().join("password.phc");
+    let password = dir.path().join("password.txt");
+    write_password_hash(&hash);
+    write_password(&password);
+    let names = ["a", "b", "c"];
+    let ports: Vec<(u16, u16)> = names.iter().map(|_| (free_port(), free_port())).collect();
+    let spec = names
+        .iter()
+        .zip(&ports)
+        .map(|(name, (port, _))| format!("{name}=vyrn://vyrn@127.0.0.1:{port}/default?tls=disable"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut nodes = Vec::new();
+    for (index, (name, (port, admin_port))) in names.iter().zip(&ports).enumerate() {
+        let mut extra = vec![
+            ("VYRN_REPLICATION_MIN_ACKS", "1".to_string()),
+            ("VYRN_REPLICATION_ACK_TIMEOUT_MS", "4000".to_string()),
+            ("VYRN_CLUSTER", spec.clone()),
+            ("VYRN_CLUSTER_SELF", (*name).to_string()),
+            ("VYRN_FAILOVER_LEASE_MS", "1500".to_string()),
+            ("VYRN_FAILOVER_ELECTION_MS", "2500".to_string()),
+        ];
+        // The initial primary never dials peers — it never stands and never
+        // follows — so the replica credential belongs to followers only
+        // (and clap enforces that pairing).
+        if index > 0 {
+            extra.push((
+                "VYRN_REPLICA_PASSWORD_FILE",
+                password.to_string_lossy().into_owned(),
+            ));
+            extra.push((
+                "VYRN_REPLICA_OF",
+                format!("vyrn://vyrn@127.0.0.1:{}/default?tls=disable", ports[0].0),
+            ));
+            extra.push(("VYRN_REPLICA_ID", (*name).to_string()));
+        }
+        nodes.push(spawn_member(
+            &dir.path().join(name),
+            &hash,
+            *port,
+            *admin_port,
+            &extra,
+        ));
+    }
+    assert!(
+        wait_for_metric(
+            &nodes[0],
+            "vyrn_replicas_connected",
+            2,
+            Duration::from_secs(30)
+        ),
+        "both followers should connect to the initial primary"
+    );
+    nodes
+}
+
+/// THE FAILOVER CLAIM, end to end: kill the primary and a follower elects
+/// itself within the timeout, serves writes, and holds every acknowledged
+/// pre-kill write — the safety argument in failover.rs, observed from
+/// outside. The member that lost the election keeps refusing writes.
+#[test]
+fn a_dead_primary_is_replaced_and_acknowledged_writes_survive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut nodes = failover_trio(&dir);
+    for index in 0..5 {
+        put(
+            &nodes[0].url(),
+            &format!("pre/{index}"),
+            &format!("value-{index}"),
+        )
+        .expect("acknowledged write against the initial primary");
+    }
+    nodes[0].kill();
+
+    // A new primary within the deadline: exactly one of b, c accepts writes.
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let leader = loop {
+        assert!(
+            Instant::now() < deadline,
+            "no member was elected primary after the kill"
+        );
+        let elected: Vec<usize> = (1..3)
+            .filter(|index| put(&nodes[*index].url(), "post/probe", "alive").is_ok())
+            .collect();
+        match elected.as_slice() {
+            [] => std::thread::sleep(Duration::from_millis(250)),
+            [one] => break *one,
+            both => panic!("split-brain: members {both:?} both accepted a write"),
+        }
+    };
+    // Every acknowledged pre-kill write is on the elected leader.
+    for index in 0..5 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match get(&nodes[leader].url(), &format!("pre/{index}")) {
+                Ok(Some(value)) if value == format!("value-{index}") => break,
+                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
+                other => panic!(
+                    "acknowledged write pre/{index} missing on the elected leader: {other:?}"
+                ),
+            }
+        }
+    }
+    // The loser is a follower of the new epoch: still refusing writes.
+    let loser = if leader == 1 { 2 } else { 1 };
+    let refusal = put(&nodes[loser].url(), "post/loser", "must-fail")
+        .expect_err("the losing member must keep refusing writes");
+    assert!(
+        refusal.contains("follower") || refusal.contains("replica"),
+        "the refusal should name the role, got: {refusal}"
+    );
+}
+
+/// A minority cannot elect: with the primary AND one follower dead, the
+/// survivor can gather only its own vote of the three, so it must keep
+/// refusing writes — through several election timeouts, sampled.
+#[test]
+fn a_minority_partition_cannot_elect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut nodes = failover_trio(&dir);
+    nodes[0].kill();
+    nodes[1].kill();
+    // Long enough for several candidacies (election 2.5s + jitter).
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        assert!(
+            put(&nodes[2].url(), "minority/probe", "must-fail").is_err(),
+            "a member without a majority elected itself: split-brain"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+/// Two-member automatic failover is split-brain by construction and must be
+/// refused at startup, loudly.
+#[test]
+fn a_two_member_cluster_is_refused_at_startup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hash = dir.path().join("password.phc");
+    write_password_hash(&hash);
+    let output = Command::new(vyrnd())
+        .env("VYRN_BIND", format!("127.0.0.1:{}", free_port()))
+        .env("VYRN_ADMIN_BIND", format!("127.0.0.1:{}", free_port()))
+        .env("VYRN_DATA", dir.path().join("solo"))
+        .env("VYRN_PASSWORD_HASH_FILE", &hash)
+        .env("VYRN_ALLOW_PLAINTEXT", "true")
+        .env("VYRN_REPLICATION_MIN_ACKS", "1")
+        .env("VYRN_CLUSTER", "a=vyrn://x,b=vyrn://y")
+        .env("VYRN_CLUSTER_SELF", "a")
+        .output()
+        .expect("run vyrnd");
+    assert!(
+        !output.status.success(),
+        "a two-member cluster must refuse startup"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("at least 3") && stderr.contains("split-brain"),
+        "the refusal must carry the safety argument, got: {stderr}"
+    );
+}

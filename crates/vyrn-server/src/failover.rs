@@ -31,6 +31,7 @@ use anyhow::{bail, Result};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use vyrn_log::{log_info, log_warn};
 
 /// One `--cluster` entry: a member's name and the URL its peers reach it at.
 #[derive(Debug, Clone)]
@@ -88,17 +89,20 @@ pub fn votes_needed(member_count: usize) -> usize {
     member_count / 2 + 1
 }
 
-/// What this node currently is. Roles only ever move Primary -> Deposed and
-/// Follower -> Primary (through an election); a deposed primary rejoins as a
-/// follower only through operator restart with --replica-of, which is the
-/// rebuild path divergence requires anyway.
+/// What this node currently is.
+///
+/// A primary that loses its lease or sees a higher epoch DEMOTES to
+/// follower rather than fencing permanently — permanence deadlocks the
+/// cluster: an ex-primary holding a durable-but-unacknowledged tail refuses
+/// every vote for a candidate without it (the LSN rule), and if it may
+/// never stand itself, no majority can form. As a follower it campaigns
+/// with that longer log, wins, and the tail is delivered late — which an
+/// unacknowledged write is always allowed to be. Writes are refused in any
+/// non-primary role, so demotion fences exactly as hard as deposition did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Primary,
     Follower,
-    /// A primary that saw a higher epoch or lost its lease: it refuses
-    /// writes and acknowledgements, forever, until an operator restarts it.
-    Deposed,
 }
 
 /// Shared failover state: the persisted epochs, the role, and the liveness
@@ -111,7 +115,10 @@ pub struct Failover {
     /// on hot paths (stream frames, write guards).
     current_epoch: AtomicU64,
     role: Mutex<Role>,
-    deposed: AtomicBool,
+    /// Whether this primary has held a quorum since it (last) became one.
+    /// The lease only fences a primary that HAS led: a freshly elected
+    /// leader must survive its followers' reconnect rotation finding it.
+    led_with_quorum: AtomicBool,
     /// When a follower last heard from a live primary (any stream frame),
     /// and when a primary last held a quorum. Both feed the same timers.
     last_heard: Mutex<Instant>,
@@ -139,7 +146,7 @@ impl Failover {
             } else {
                 Role::Follower
             }),
-            deposed: AtomicBool::new(false),
+            led_with_quorum: AtomicBool::new(false),
             last_heard: Mutex::new(Instant::now()),
             lease,
             election_timeout,
@@ -151,10 +158,19 @@ impl Failover {
     }
 
     pub fn role(&self) -> Role {
-        if self.deposed.load(Ordering::Acquire) {
-            return Role::Deposed;
-        }
-        *self.role.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        *self
+            .role
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn quorum_held(&self) {
+        self.led_with_quorum.store(true, Ordering::Release);
+        self.heard_from_leader();
+    }
+
+    pub fn has_led_with_quorum(&self) -> bool {
+        self.led_with_quorum.load(Ordering::Acquire)
     }
 
     pub fn heard_from_leader(&self) {
@@ -188,9 +204,7 @@ impl Failover {
             epochs.advance(epoch, false)?;
             self.current_epoch.store(epochs.current, Ordering::Release);
         }
-        if *self.role.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) == Role::Primary {
-            self.deposed.store(true, Ordering::Release);
-        }
+        self.demote_if_primary();
         Ok(())
     }
 
@@ -208,6 +222,10 @@ impl Failover {
         if granted {
             epochs.advance(epoch, true)?;
             self.current_epoch.store(epochs.current, Ordering::Release);
+            // Granting resets this member's own election timer: the candidate
+            // needs a full timeout to win and start streaming before its own
+            // voters depose it with candidacies of their own.
+            self.heard_from_leader();
         }
         Ok(granted)
     }
@@ -225,21 +243,38 @@ impl Failover {
         Ok(epoch)
     }
 
-    /// The candidate won: this node leads at `epoch`.
+    /// The candidate won: this node leads at `epoch`, its lease dormant
+    /// until a quorum has actually connected.
     pub fn promote(&self) {
         let mut role = self
             .role
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *role = Role::Primary;
+        self.led_with_quorum.store(false, Ordering::Release);
         self.heard_from_leader();
     }
 
-    /// A primary that could not hold a quorum for a full lease self-fences:
-    /// its acknowledgements would promise a durability it cannot deliver,
-    /// and an election it cannot see may already have replaced it.
+    fn demote_if_primary(&self) {
+        let mut role = self
+            .role
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *role == Role::Primary {
+            *role = Role::Follower;
+            self.led_with_quorum.store(false, Ordering::Release);
+        }
+        drop(role);
+        // A fresh follower timer: it campaigns only after a full timeout.
+        self.heard_from_leader();
+    }
+
+    /// A primary that held a quorum and then lost it for a full lease
+    /// demotes: its acknowledgements would promise a durability it cannot
+    /// deliver, and an election it cannot see may already have replaced it.
+    /// It remains a voter and a possible candidate — see [`Role`].
     pub fn step_down(&self) {
-        self.deposed.store(true, Ordering::Release);
+        self.demote_if_primary();
     }
 }
 
@@ -247,15 +282,17 @@ impl Failover {
 mod tests {
     use super::*;
 
-    fn store() -> EpochStore {
-        EpochStore::open(tempfile::tempdir().unwrap().path()).unwrap()
-    }
-
     #[test]
     fn cluster_shapes_the_safety_argument_rejects_are_refused() {
         assert!(parse_cluster("a=u,b=u2", "a", 1).is_err(), "2 members");
-        assert!(parse_cluster("a=u,b=u2,c=u3", "a", 0).is_err(), "min-acks 0");
-        assert!(parse_cluster("a=u,b=u2,c=u3", "d", 1).is_err(), "self absent");
+        assert!(
+            parse_cluster("a=u,b=u2,c=u3", "a", 0).is_err(),
+            "min-acks 0"
+        );
+        assert!(
+            parse_cluster("a=u,b=u2,c=u3", "d", 1).is_err(),
+            "self absent"
+        );
         assert!(parse_cluster("a=u,a=u2,c=u3", "a", 1).is_err(), "duplicate");
         let members = parse_cluster("a=u,b=u2,c=u3", "a", 1).unwrap();
         assert_eq!(members.len(), 3);
@@ -288,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_primary_that_sees_a_higher_epoch_is_deposed() {
+    fn a_primary_that_sees_a_higher_epoch_demotes_and_may_campaign_again() {
         let directory = tempfile::tempdir().unwrap();
         let failover = Failover::new(
             parse_cluster("a=u,b=u2,c=u3", "a", 1).unwrap(),
@@ -300,9 +337,179 @@ mod tests {
         );
         assert_eq!(failover.role(), Role::Primary);
         failover.observe_epoch(7).unwrap();
-        assert_eq!(failover.role(), Role::Deposed);
-        // Deposition is permanent for this process: promote() cannot undo it.
+        assert_eq!(
+            failover.role(),
+            Role::Follower,
+            "a higher epoch demotes: someone won an election this node did not stand in"
+        );
+        assert_eq!(failover.epoch(), 7);
+        /* Demotion, not permanent deposition: an ex-primary with a
+         * durable-but-unacknowledged tail must be able to win a later
+         * election, or the LSN vote rule deadlocks the cluster around the
+         * very records nobody was promised. */
+        let epoch = failover.stand().unwrap();
+        assert_eq!(epoch, 8);
         failover.promote();
-        assert_eq!(failover.role(), Role::Deposed);
+        assert_eq!(failover.role(), Role::Primary);
     }
+}
+
+/// Credentials a follower dials peers with when it stands for election —
+/// the same replica credentials it streams with. The initial primary has
+/// none and never stands: it leads until deposed, and rejoins after an
+/// operator restarts it as a replica.
+#[derive(Clone)]
+pub struct PeerCredentials {
+    pub password: String,
+    pub ca_file: Option<std::path::PathBuf>,
+    pub allow_plaintext: bool,
+}
+
+/// How often the timers are checked. Small against the lease and election
+/// timeouts, so their configured values are what an operator reasons about.
+const TICK: Duration = Duration::from_millis(250);
+/// How long one vote solicitation may take before the peer is counted as
+/// unreachable for this candidacy.
+const VOTE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Drives the failover timers until the process exits.
+///
+/// On a primary: the lease. Holding a quorum of connected replica streams
+/// renews it; a full lease without one self-fences (`step_down`) — the
+/// acknowledgements this node could give would promise a durability it
+/// cannot deliver, and an election it cannot see may already have replaced
+/// it. On a follower: elections. A full election timeout (jittered per
+/// member so two followers do not stand in the same instant) without a
+/// frame from a live primary starts a candidacy.
+pub async fn run_coordinator(
+    failover: std::sync::Arc<Failover>,
+    replication: std::sync::Arc<crate::replication::Replication>,
+    engine: std::sync::Arc<std::sync::RwLock<vyrn_core::Engine>>,
+    credentials: Option<PeerCredentials>,
+) {
+    // Deterministic per-member jitter: names differ, so timeouts differ.
+    // Scrambled, not just folded: adjacent names ("b", "c") fold to adjacent
+    // values, and near-equal jitter is exactly what makes two followers stand
+    // in the same tick and split every election.
+    let folded = failover.self_name.bytes().fold(0u64, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u64)
+    });
+    let jitter = Duration::from_millis((folded.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 1_500);
+    loop {
+        tokio::time::sleep(TICK).await;
+        match failover.role() {
+            Role::Primary => {
+                let acks_needed = replication.min_acks();
+                if replication.connected() >= acks_needed {
+                    failover.quorum_held();
+                } else if failover.has_led_with_quorum() && failover.silence() > failover.lease {
+                    log_warn!(
+                        "vyrnd.failover",
+                        "quorum lost for a full lease; demoting to follower",
+                        epoch = failover.epoch(),
+                        connected = replication.connected(),
+                        needed = acks_needed
+                    );
+                    failover.step_down();
+                }
+            }
+            Role::Follower => {
+                let Some(credentials) = credentials.as_ref() else {
+                    continue;
+                };
+                if failover.silence() <= failover.election_timeout + jitter {
+                    continue;
+                }
+                match stand_for_election(&failover, &engine, credentials).await {
+                    Ok(true) => {
+                        log_info!(
+                            "vyrnd.failover",
+                            "elected primary",
+                            epoch = failover.epoch()
+                        );
+                        failover.promote();
+                    }
+                    Ok(false) => {
+                        // Lost or short of quorum: reset the timer so the next
+                        // candidacy waits a full jittered timeout instead of
+                        // re-standing every tick.
+                        failover.heard_from_leader();
+                    }
+                    Err(error) => {
+                        log_warn!(
+                            "vyrnd.failover",
+                            "candidacy failed",
+                            detail = format!("{error:#}")
+                        );
+                        failover.heard_from_leader();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One candidacy: persist the new epoch, solicit every other member, count.
+async fn stand_for_election(
+    failover: &Failover,
+    engine: &std::sync::RwLock<vyrn_core::Engine>,
+    credentials: &PeerCredentials,
+) -> Result<bool> {
+    use futures_util::{SinkExt, StreamExt};
+    let epoch = failover.stand()?;
+    let durable_lsn = engine.read().map(|engine| engine.last_lsn()).unwrap_or(0);
+    log_info!(
+        "vyrnd.failover",
+        "standing for election",
+        epoch = epoch,
+        durable_lsn = durable_lsn
+    );
+    let mut votes = 1usize; // this member's own, persisted by stand()
+    for member in &failover.members {
+        if member.name == failover.self_name {
+            continue;
+        }
+        let solicit = async {
+            let (mut framed, _) = crate::replica::connect_authenticated(
+                &member.url,
+                &credentials.password,
+                credentials.ca_file.as_deref(),
+                credentials.allow_plaintext,
+            )
+            .await?;
+            framed
+                .send(vyrn_protocol::Envelope::new(
+                    1,
+                    vyrn_protocol::Message::VoteRequest { epoch, durable_lsn },
+                ))
+                .await?;
+            match framed.next().await {
+                Some(Ok(envelope)) => match envelope.message {
+                    vyrn_protocol::Message::VoteResponse { granted, epoch } => {
+                        Ok::<(bool, u64), anyhow::Error>((granted, epoch))
+                    }
+                    other => bail!("unexpected reply to a vote request: {other:?}"),
+                },
+                Some(Err(error)) => Err(error.into()),
+                None => bail!("peer closed the connection during the vote"),
+            }
+        };
+        // Unreachable or failing peers simply do not vote; that is what
+        // makes a minority partition unable to elect.
+        if let Ok(Ok((granted, peer_epoch))) = tokio::time::timeout(VOTE_TIMEOUT, solicit).await {
+            if peer_epoch > epoch {
+                // Someone leads (or stands) at a higher epoch; this
+                // candidacy is already history. Adopt and yield.
+                failover.observe_epoch(peer_epoch)?;
+                return Ok(false);
+            }
+            if granted {
+                votes += 1;
+            }
+        }
+        if votes >= votes_needed(failover.members.len()) {
+            return Ok(true);
+        }
+    }
+    Ok(votes >= votes_needed(failover.members.len()))
 }
