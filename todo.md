@@ -208,6 +208,14 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       un-drained one does NOT (which is what proves the copy models a crash). Harness grew
       `durable_c64` rows for all three engines (sled coalesces flush(), redb serializes
       exclusive txns — its design, reported as found).
+- [ ] **Single-writer durable on cheap-barrier hosts: vyrn ~200 µs/commit vs sled ~50.** A Linux
+      sandbox run (fsync ~45 µs) showed vyrn 4.9–5.3K/s single-writer against sled's 19.7–22K —
+      overhead the Windows fsync hid completely. The WAL phase is now split (wal_encode/fill/
+      write/sync + bytes and fills per request, printed by apply-profile) so the next sandbox run
+      can attribute it. Known already: a 128 B put hands ~400 B to the WAL (the change-log record
+      rides along, doubling small-write payload); suspects beyond that are the write_all_at shape
+      and the runway fill's own fdatasync on that filesystem. Run `CLIENTS=1 WRITE_BACK=8388608
+      apply-profile` on the sandbox and read the split before changing anything.
 - [ ] **What's still open on the bench front.** durable 64 KiB: bounded by the 2× spill
       amplification (value log + WAL both carry the bytes) and then by the device — the
       persistence-strategy change (WAL referencing value-log extents + value-log fsync in the
