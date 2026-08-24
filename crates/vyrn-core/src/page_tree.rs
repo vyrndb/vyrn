@@ -40,6 +40,18 @@ const EXTERNAL_KEY: u8 = 1;
 const EXTERNAL_VALUE: u8 = 2;
 const DEFAULT_CACHE_PAGES: usize = 4_096;
 
+/// Used bytes below which a page a rewrite just produced merges with a
+/// sibling.
+///
+/// A quarter of the page keeps merging and splitting apart: two threshold
+/// pages combine into one at most half full, so a merge can never emit a page
+/// the next insert immediately splits back into two. Only rewritten pages are
+/// ever measured against this — copy-on-write shrinks the pages it touches
+/// and nothing widens them again between checkpoint compactions, so a
+/// delete-heavy workload otherwise accumulates leaves holding a few entries
+/// each while every descent stays sized for the data that is gone.
+const UNDERFULL_BYTES: usize = PAGE_SIZE / 4;
+
 /// The most entries a leaf page can physically hold.
 ///
 /// Every entry needs at least its cell header inside the page, so a count above
@@ -1469,6 +1481,10 @@ impl PageTree {
             INTERNAL => {
                 let children = self.decode_internal(&page, page_id)?;
                 let mut new_children = Vec::with_capacity(children.len());
+                // Which of `new_children` this batch rewrote, in lockstep with
+                // it: only a rewrite can leave a page underfull, so only these
+                // are measured for merging below.
+                let mut rewritten = Vec::with_capacity(children.len());
                 let mut cursor = 0;
                 for (index, child) in children.iter().enumerate() {
                     // Child 0 owns everything below child 1's minimum, so keys
@@ -1490,15 +1506,18 @@ impl PageTree {
                             existed,
                             depth + 1,
                         )?;
+                        rewritten.resize(rewritten.len() + replacements.len(), true);
                         new_children.extend(replacements);
                     } else {
                         new_children.push(child.clone());
+                        rewritten.push(false);
                     }
                     cursor = end;
                 }
                 if new_children.is_empty() {
                     return Ok(Vec::new());
                 }
+                let new_children = self.merge_underfull_children(new_children, &rewritten)?;
                 // Collapse a root that deletes reduced to a single child, rather
                 // than keeping an internal page that points at just one node.
                 if is_root && new_children.len() == 1 {
@@ -1508,6 +1527,165 @@ impl PageTree {
             }
             page_type => Err(unexpected_type(page_id, page_type)),
         }
+    }
+
+    /// Merges the underfull pages a delete-heavy rewrite leaves behind.
+    ///
+    /// One bounded pass, no cascades: each maximal run of adjacent children
+    /// that this batch rewrote below [`UNDERFULL_BYTES`] is decoded and
+    /// re-emitted once, through the level packers — the only legal rewrite,
+    /// since a run's contents may not fit one version-5 page. A lone
+    /// underfull child instead absorbs at most one neighbor, and only when
+    /// the pair provably fits a single page: merging into a full sibling
+    /// would split straight back apart, rewriting two pages for nothing on
+    /// every batch that leaves a small tail leaf. A merge result is never a
+    /// candidate again within the pass — a candidate's left neighbor in the
+    /// output is always a child that was not underfull, or the pop below
+    /// could chain.
+    ///
+    /// Children the batch did not touch are never measured, so an untouched
+    /// page is only ever read here, never rewritten, unless an underfull
+    /// neighbor absorbs it — which is also how a shrinking page densifies
+    /// the legacy page next to it.
+    fn merge_underfull_children(
+        &mut self,
+        children: Vec<NodeRef>,
+        rewritten: &[bool],
+    ) -> Result<Vec<NodeRef>> {
+        if children.len() < 2 || !rewritten.contains(&true) {
+            return Ok(children);
+        }
+        let mut used = Vec::with_capacity(children.len());
+        for (child, flag) in children.iter().zip(rewritten) {
+            used.push(if *flag {
+                self.page_used_bytes(child.page_id)?
+            } else {
+                None
+            });
+        }
+        let underfull = |bytes: &Option<usize>| bytes.is_some_and(|bytes| bytes < UNDERFULL_BYTES);
+        let mut merged: Vec<NodeRef> = Vec::with_capacity(children.len());
+        let mut index = 0;
+        while index < children.len() {
+            if !underfull(&used[index]) {
+                merged.push(children[index].clone());
+                index += 1;
+                continue;
+            }
+            let mut end = index + 1;
+            while end < children.len() && underfull(&used[end]) {
+                end += 1;
+            }
+            let mut run: Vec<NodeRef> = children[index..end].to_vec();
+            if run.len() == 1 {
+                let own = used[index].expect("an underfull child was measured");
+                if end < children.len() && self.pair_fits(own, &children[end], &children[end])? {
+                    run.push(children[end].clone());
+                    end += 1;
+                } else {
+                    let absorbs_left = match merged.last() {
+                        Some(left) => self.pair_fits(own, left, &children[index])?,
+                        None => false,
+                    };
+                    if absorbs_left {
+                        run.insert(0, merged.pop().expect("a left neighbor exists"));
+                    } else {
+                        // No neighbor can take it without splitting; it stays
+                        // underfull until a sibling shrinks too.
+                        merged.push(children[index].clone());
+                        index = end;
+                        continue;
+                    }
+                }
+            }
+            merged.extend(self.rewrite_siblings(&run)?);
+            index = end;
+        }
+        Ok(merged)
+    }
+
+    /// Whether an underfull page of `own` used bytes and `neighbor` merge
+    /// into one page.
+    ///
+    /// The pair's cells and slots share one header, and an internal merge
+    /// promotes the right page's first child into a body cell keyed by that
+    /// page's minimum — `right` names the pair's right member so that cell
+    /// is priced exactly. For a leaf pair the term is pure slack, erring
+    /// toward keeping the pages apart. A neighbor that cannot be measured
+    /// (a legacy page without a slot directory) never merges; copy-on-write
+    /// converts it the next time a mutation lands on it.
+    fn pair_fits(&self, own: usize, neighbor: &NodeRef, right: &NodeRef) -> Result<bool> {
+        let Some(bytes) = self.page_used_bytes(neighbor.page_id)? else {
+            return Ok(false);
+        };
+        let promoted = internal_cell_size(right.min_key.as_slice()) + SLOT_SIZE;
+        Ok(own + bytes + promoted <= PAGE_SIZE + HEADER_SIZE)
+    }
+
+    /// Decodes a run of adjacent same-level nodes and re-emits their combined
+    /// contents through the level packers, which pack fully and may split.
+    fn rewrite_siblings(&mut self, run: &[NodeRef]) -> Result<Vec<NodeRef>> {
+        let first = run.first().ok_or_else(|| Error::CorruptPage {
+            page_id: 0,
+            reason: "cannot merge an empty run".into(),
+        })?;
+        let page = self.pages.read(first.page_id)?;
+        match page[5] {
+            LEAF => {
+                let mut entries = Vec::new();
+                for node in run {
+                    entries.extend(self.read_leaf(node.page_id)?);
+                }
+                self.write_leaf_level(&entries)
+            }
+            INTERNAL => {
+                let mut grandchildren = Vec::new();
+                for node in run {
+                    grandchildren.extend(self.read_internal_children(node.page_id)?);
+                }
+                self.write_internal_level(&grandchildren)
+            }
+            page_type => Err(unexpected_type(first.page_id, page_type)),
+        }
+    }
+
+    /// A tree page's used bytes — header, cells, and slot directory — or
+    /// `None` for a page that cannot be measured in O(1): a legacy page
+    /// without a directory, or a non-tree page. Cells are laid out
+    /// contiguously in slot order, so the last cell's end is the end of all
+    /// of them. The length fields are on-disk input, but they are only
+    /// summed here, never dereferenced; a forged length reads as a full
+    /// page, which excludes the page from merging rather than corrupting
+    /// anything.
+    fn page_used_bytes(&self, page_id: u64) -> Result<Option<usize>> {
+        let page = self.pages.read(page_id)?;
+        let count = read_u32(page.as_ref(), 20) as usize;
+        let (cell_header, max_count) = match page[5] {
+            LEAF => (LEAF_CELL_HEADER, MAX_LEAF_ENTRIES),
+            INTERNAL => (INTERNAL_CELL_HEADER, MAX_INTERNAL_CHILDREN - 1),
+            _ => return Ok(None),
+        };
+        if count > max_count {
+            return Ok(None);
+        }
+        if count == 0 {
+            // A leaf is never written empty; an internal page with no cells
+            // holds exactly its header-resident first child.
+            return Ok(Some(HEADER_SIZE));
+        }
+        let Some(directory) = slots(&page, count) else {
+            return Ok(None);
+        };
+        let (cell, _) = directory.cell(count - 1, cell_header, page_id)?;
+        let flags = page[cell];
+        let mut end = cell + cell_header;
+        if flags & EXTERNAL_KEY == 0 {
+            end += read_u32(page.as_ref(), cell + 1) as usize;
+        }
+        if page[5] == LEAF && flags & EXTERNAL_VALUE == 0 {
+            end += read_u32(page.as_ref(), cell + 5) as usize;
+        }
+        Ok(Some(end.saturating_add(count * SLOT_SIZE).min(PAGE_SIZE)))
     }
 
     pub(crate) fn prepare_delete(&mut self, key: &[u8]) -> Result<Option<(u64, u64)>> {
@@ -1527,42 +1705,34 @@ impl PageTree {
         if self.root == 0 {
             return Ok(None);
         }
-        let mut path = Vec::new();
-        let leaf_id = self.find_leaf(key, Some(&mut path))?;
-        let mut entries = self.read_leaf(leaf_id)?;
-        let (position, existed) = find_entry(&entries, key);
-        if !existed {
+        // Presence is settled before anything is appended: a delete of an
+        // absent key must leave the page file exactly as it found it, and
+        // the rewrite below appends pages before it can know the key was
+        // there.
+        let leaf_id = self.find_leaf(key, None)?;
+        let leaf = self.pages.read(leaf_id)?;
+        require_type(&leaf, leaf_id, LEAF)?;
+        if self.find_in_leaf(&leaf, leaf_id, key)?.is_none() {
             return Ok(None);
         }
-        entries.remove(position);
-        // Through the level packer, not `write_leaf` directly: rewriting a
-        // legacy page charges each surviving cell its new slot bytes, so a
-        // version-4 leaf packed beyond version 5's capacity must be allowed
-        // to split even though a delete made it smaller.
-        let mut replacements = if entries.is_empty() {
-            Vec::new()
-        } else {
-            self.write_leaf_level(&entries)?
-        };
-        while let Some((parent_id, child_index)) = path.pop() {
-            let mut children = self.read_internal_children(parent_id)?;
-            children.splice(child_index..=child_index, replacements);
-            replacements = if children.is_empty() {
-                Vec::new()
-            } else if path.is_empty() && children.len() == 1 {
-                children
-            } else {
-                self.write_internal_level(&children)?
-            };
+        // Through the batch rewrite rather than a private path splice, for
+        // everything the batch path guarantees: the level packers let a
+        // dense legacy leaf split even though the delete made it smaller,
+        // and `apply_node` merges the underfull pages a delete leaves
+        // behind. Replica apply and redo delete one key at a time, so
+        // without the shared path only `prepare_batch` trees would stay
+        // compact.
+        let mut existed = [true];
+        let prepared = [PreparedMutation {
+            key: key.to_vec(),
+            value: None,
+            index: 0,
+        }];
+        let mut replacements = self.apply_node(self.root, &prepared, true, &mut existed, 0)?;
+        while replacements.len() > 1 {
+            replacements = self.write_internal_level(&replacements)?;
         }
-        // A delete can now SPLIT — rewriting a packed legacy leaf charges
-        // each cell its slot bytes — so more than one replacement needs a
-        // new root above it, exactly as `prepare_put_inner` grows one.
-        let root = match replacements.len() {
-            0 => 0,
-            1 => replacements[0].page_id,
-            _ => self.write_internal(&replacements)?.page_id,
-        };
+        let root = replacements.first().map_or(0, |node| node.page_id);
         Ok(Some((root, self.len - 1)))
     }
 
@@ -3842,6 +4012,160 @@ mod tests {
                     "a forged slot must surface as corruption, got {error:?}"
                 );
             }
+        }
+    }
+
+    /// Every page reachable from the root: the live tree, as opposed to the
+    /// append-only file that also holds every superseded page.
+    fn live_pages(tree: &PageTree, page_id: u64) -> usize {
+        let page = tree.pages.read(page_id).unwrap();
+        match page[5] {
+            LEAF => 1,
+            INTERNAL => {
+                1 + tree
+                    .decode_internal(&page, page_id)
+                    .unwrap()
+                    .iter()
+                    .map(|child| live_pages(tree, child.page_id))
+                    .sum::<usize>()
+            }
+            page_type => panic!("unexpected page type {page_type}"),
+        }
+    }
+
+    fn puts(range: std::ops::Range<u64>) -> Vec<(Vec<u8>, Mutation)> {
+        range
+            .map(|index| {
+                (
+                    format!("key-{index:06}").into_bytes(),
+                    Mutation::Put {
+                        value: vec![7; 64],
+                        revision: index + 1,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Deletes must merge the underfull pages they leave behind. A batch
+    /// that removes most of a tree's keys used to keep every leaf it
+    /// touched, each holding a few entries, so the live page count — and
+    /// the pages every scan reads — stayed sized for data that was gone
+    /// until the next checkpoint compaction.
+    #[test]
+    fn a_delete_heavy_batch_merges_underfull_pages() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+        let outcome = tree.prepare_batch(puts(0..8_000)).unwrap();
+        tree.publish(outcome.root, outcome.len);
+        let before = live_pages(&tree, tree.root_id());
+        // Nine of every ten keys, deleted in one batch: every leaf survives
+        // with a few entries, none empties outright.
+        let deletes: Vec<(Vec<u8>, Mutation)> = (0..8_000u64)
+            .filter(|index| index % 10 != 0)
+            .map(|index| (format!("key-{index:06}").into_bytes(), Mutation::Delete))
+            .collect();
+        let outcome = tree.prepare_batch(deletes).unwrap();
+        tree.publish(outcome.root, outcome.len);
+        tree.sync().unwrap();
+        tree.validate().unwrap();
+        assert_eq!(tree.len(), 800);
+        let after = live_pages(&tree, tree.root_id());
+        assert!(
+            after * 4 <= before,
+            "deleting 90% of the keys left {after} live pages of {before}; \
+             underfull pages did not merge"
+        );
+        for index in (0..8_000u64).step_by(10) {
+            let key = format!("key-{index:06}");
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), Some(vec![7; 64]));
+        }
+        assert_eq!(tree.get(b"key-000001").unwrap(), None);
+        assert_eq!(tree.scan(None, None, 10_000).unwrap().len(), 800);
+    }
+
+    /// The single-key delete path — the shape replica apply and redo drive —
+    /// routes through the same rewrite as `prepare_batch`, so a replica of a
+    /// delete-heavy primary compacts as it applies instead of inflating
+    /// until its next checkpoint.
+    #[test]
+    fn single_key_deletes_keep_the_tree_compact() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+        let outcome = tree.prepare_batch(puts(0..2_000)).unwrap();
+        tree.publish(outcome.root, outcome.len);
+        let before = live_pages(&tree, tree.root_id());
+        for index in 0..2_000u64 {
+            if index % 10 == 0 {
+                continue;
+            }
+            let key = format!("key-{index:06}");
+            let (root, len) = tree.prepare_delete(key.as_bytes()).unwrap().unwrap();
+            tree.publish(root, len);
+        }
+        tree.sync().unwrap();
+        tree.validate().unwrap();
+        assert_eq!(tree.len(), 200);
+        let after = live_pages(&tree, tree.root_id());
+        assert!(
+            after * 4 <= before,
+            "single-key deletes left {after} live pages of {before}; \
+             underfull pages did not merge"
+        );
+        for index in (0..2_000u64).step_by(10) {
+            let key = format!("key-{index:06}");
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), Some(vec![7; 64]));
+        }
+    }
+
+    /// Merging over legacy version-4 pages: the rewritten (version-5)
+    /// runs merge among themselves, an unmeasurable v4 neighbor is never
+    /// absorbed, and the mixed tree stays coherent throughout.
+    #[test]
+    fn legacy_pages_merge_when_deletes_rewrite_them() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, len) = {
+            let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+            let outcome = tree.prepare_batch(puts(0..8_000)).unwrap();
+            tree.publish(outcome.root, outcome.len);
+            tree.sync().unwrap();
+            (outcome.root, outcome.len)
+        };
+        // Rewind every page to version 4, exactly as the compatibility test
+        // above does: cells are identical across the two versions.
+        let page_count = std::fs::metadata(&path).unwrap().len() / PAGE_SIZE as u64;
+        for page_id in 0..page_count {
+            forge_page(&path, page_id, |page| page[4] = LEGACY_VERSION);
+        }
+        let mut tree = PageTree::open(&path, &values, root, len).unwrap();
+        let before = live_pages(&tree, tree.root_id());
+        // 90% of the FIRST half only, so rewritten underfull leaves end up
+        // adjacent to untouched legacy pages a merge must leave alone.
+        let deletes: Vec<(Vec<u8>, Mutation)> = (0..4_000u64)
+            .filter(|index| index % 10 != 0)
+            .map(|index| (format!("key-{index:06}").into_bytes(), Mutation::Delete))
+            .collect();
+        let outcome = tree.prepare_batch(deletes).unwrap();
+        tree.publish(outcome.root, outcome.len);
+        tree.sync().unwrap();
+        tree.validate().unwrap();
+        assert_eq!(tree.len(), 8_000 - 3_600);
+        let after = live_pages(&tree, tree.root_id());
+        assert!(
+            after * 4 <= before * 3,
+            "deleting 90% of half the keys left {after} live pages of {before}; \
+             the rewritten half did not merge"
+        );
+        for index in 0..8_000u64 {
+            let key = format!("key-{index:06}");
+            let expected = (index >= 4_000 || index % 10 == 0).then(|| vec![7; 64]);
+            assert_eq!(tree.get(key.as_bytes()).unwrap(), expected);
         }
     }
 
