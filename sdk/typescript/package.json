@@ -22,11 +22,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/BleedDev/vyrn.git",
+    "url": "git+https://github.com/vyrndb/vyrn.git",
     "directory": "sdk/typescript"
   },
-  "homepage": "https://github.com/BleedDev/vyrn/tree/main/sdk/typescript#readme",
-  "bugs": "https://github.com/BleedDev/vyrn/issues",
+  "homepage": "https://github.com/vyrndb/vyrn/tree/main/sdk/typescript#readme",
+  "bugs": "https://github.com/vyrndb/vyrn/issues",
   "keywords": [
     "vyrn",
     "database",
