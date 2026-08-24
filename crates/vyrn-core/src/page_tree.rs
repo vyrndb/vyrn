@@ -1,10 +1,11 @@
 use crate::{
+    fast_hash::U64Map,
     value_log::{ValueLog, ValueRef},
     Error, Result, MAX_STORED_KEY_SIZE, MAX_VALUE_SIZE,
 };
 use crc32fast::Hasher;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     fs::{File, OpenOptions},
     io::Write,
     path::Path,
@@ -281,7 +282,10 @@ struct PreparedMutation {
 }
 
 struct PageCache {
-    pages: HashMap<u64, CachedPage>,
+    /// Keyed by page id on the crate's multiplicative hasher: this lookup
+    /// runs once per page read on every descent, and SipHash was a
+    /// measurable share of a cached point read.
+    pages: U64Map<CachedPage>,
     clock: VecDeque<u64>,
     hand: usize,
 }
@@ -416,7 +420,7 @@ impl PageManager {
             flushed_count: page_count,
             pending: Mutex::new(Vec::new()),
             cache: Mutex::new(PageCache {
-                pages: HashMap::new(),
+                pages: U64Map::default(),
                 clock: VecDeque::new(),
                 hand: 0,
             }),
@@ -801,6 +805,34 @@ impl PageTree {
                             "leaf claims {count} entries but a page holds at most {MAX_LEAF_ENTRIES}"
                         ),
                     });
+                }
+                // A sparse batch — few wanted keys landing on this leaf, which
+                // is what a many-client commit's pre-state read looks like —
+                // resolves each key by binary search over the slot directory
+                // instead of parsing half the leaf's cells to find it. A dense
+                // batch keeps the merge walk below: k keys at log(count)
+                // probes each overtakes one pass over count cells as k grows.
+                if keys.len() * 4 < count {
+                    if let Some(directory) = slots(&page, count) {
+                        for (index, key) in keys.iter().enumerate() {
+                            let Some((hit, revision)) =
+                                self.find_in_leaf_slots(&directory, page_id, key)?
+                            else {
+                                continue;
+                            };
+                            let value = match (want_values, hit) {
+                                (false, _) => None,
+                                (true, LeafHit::Inline { offset, len }) => {
+                                    Some(page[offset..offset + len].to_vec())
+                                }
+                                (true, LeafHit::External(reference)) => {
+                                    Some(self.values.read(&reference)?)
+                                }
+                            };
+                            results[index] = Some((value, revision));
+                        }
+                        return Ok(());
+                    }
                 }
                 let mut offset = HEADER_SIZE;
                 let mut cursor = 0;

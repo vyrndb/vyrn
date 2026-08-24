@@ -459,6 +459,57 @@ overhead on the descent — a mutex acquisition and a SipHash `HashMap` lookup
 per level in the page cache, and the same pair in the value cache — which is
 the next lever, already queued as such.
 
+### Fixed: commit-path allocation diet, fast cache hashing, honest cache parity
+
+Three follow-ups in one round, found with `apply-profile` at the 1000-op
+batch shape (where the pre-state read was 48% of apply):
+
+- **The pre-state machinery collapsed.** A commit built a `wanted` BTreeSet
+  (a log-depth memcmp walk per insert), cloned every key into an `existing`
+  BTreeMap whose revision values nothing ever read, then cloned every key
+  AGAIN into the presence overlay — and the planning loop cloned each key
+  once more to update overlay entries the map already owned. Now: one
+  sorted-and-deduplicated `Vec`, whose keys move into the overlay, updated
+  in place through `get_mut`. Two maps and roughly four key clones per
+  operation became one map and one.
+- **The internal caches stopped paying SipHash.** The page cache and the
+  value cache are keyed by page ids and log offsets the engine allocates
+  itself, so the DoS defence std's default hasher buys is protection against
+  an adversary who does not exist there — and its cost landed on every page
+  read of every descent. A dependency-free multiply-xor hasher replaces it
+  (with a test pinning that sequential ids spread in both the bucket and
+  control-byte bits, which is the collapse mode a bad mix would hit).
+- **`collect_many` binary-searches sparse leaves.** The commit pre-state
+  read resolves each wanted key by slot-directory binary search when the
+  batch lands few keys on a leaf, and keeps the merge walk when it lands
+  many — k·log(n) against one pass over n, chosen by which is smaller.
+- **The harness's cache parity was under-applied — to vyrn's disadvantage.**
+  sled's 1 GiB default cache covers its whole tree and redb reads through
+  the OS page cache unbounded, but only vyrn's VALUE cache had been raised
+  to 1 GiB: its B-tree page cache still sat at the deliberately frugal
+  16 MiB default, so tree-resident rows (128 B values, and every descent)
+  were measured against engines with two orders of magnitude more tree
+  cache. `VYRN_PAGE_CACHE_PAGES` now gets the same 1 GiB. The two vyrn
+  budgets never fill together — small-value rows live entirely in tree
+  pages, spilled-value rows keep almost nothing in them — so per-row this
+  is parity, not double-counting.
+
+The harness after all three (same host; write rows ±10–15% run to run):
+
+    batch_put 128 B    211 K -> ~268 K ops/s   (was 1.26x behind redb, now
+                                                trading: 268 vs 266 one run,
+                                                267 vs 283 the next)
+    scan_1000 4 KiB    10.2 -> 9.1-11.8 M rows/s (#1 both runs, 2.3-2.8x redb)
+    scan_1000 128 B    8.3-10.2 M rows/s        (trading with redb run to run;
+                                                 both engines swing ~10%
+                                                 together with the host)
+    point_get 128 B    2.1-2.3 M/s              (#1)
+    point_get 4 KiB    now trading: 1.20 vs 1.27 one run, 1.27 vs 1.19 the
+                       next (was 2.1x behind at the start of the read-side
+                       work)
+    point_get 64 KiB   1.82-1.86 M vs redb 1.99-2.07 M (~1.1x behind,
+                       consistently — the one read row still lost)
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and

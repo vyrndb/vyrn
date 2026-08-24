@@ -1,7 +1,7 @@
-use crate::{Error, Result, MAX_VALUE_SIZE};
+use crate::{fast_hash::U64Map, Error, Result, MAX_VALUE_SIZE};
 use crc32fast::Hasher;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -69,7 +69,9 @@ struct CachedValue {
 /// offset — the same replacement design as the page cache, for the same
 /// reason: a scan sweeping the log once must not evict the point-read hot set.
 struct ValueCache {
-    entries: HashMap<u64, CachedValue>,
+    /// Keyed by record offset on the crate's multiplicative hasher — probed
+    /// once per spilled-value read, same reasoning as the page cache.
+    entries: U64Map<CachedValue>,
     clock: VecDeque<u64>,
     bytes: usize,
     budget: usize,
@@ -78,7 +80,7 @@ struct ValueCache {
 impl ValueCache {
     fn new(budget: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: U64Map::default(),
             clock: VecDeque::new(),
             bytes: 0,
             budget,

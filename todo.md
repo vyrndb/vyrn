@@ -165,15 +165,28 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       test mutation-verified. Harness: point_get 4 KiB 624K → 1.18M (2.1× behind redb → 1.14×),
       64 KiB 1.11M → 1.70M (1.8× → 1.19×), scan_1000 4 KiB 10.2M rows/s (#1 by 2.5×), everything
       else held. Write-up in docs/benchmarks.md.
-- [ ] **The remaining contested rows.** point_get 4 KiB/64 KiB (1.14×/1.19× behind redb): the
-      parse is gone; what's left is per-page-read overhead on the descent — the page cache's
-      mutex + SipHash HashMap lookup per level, and the value cache's same pair (a dependency-free
-      fast u64 hasher is the cheap first step, a sharded or lock-free read path the bigger one).
-      batch_put vs redb ~1.2x (per-op allocation diet: change-record staging and WAL encode each
-      clone every value). durable_put 64 KiB vs flushed sled ~1.15x (consistent but fsync-noise
-      adjacent; confirm on Linux first). scan 128 B sits at ~9.8M rows/s, #1 but short of the 20M
-      aspiration — remaining cost is per-row emit (bounds-checked field reads + visitor call),
-      not allocation; diminishing returns until the point_get levers land.
+- [x] **PERF round 9 (commit diet + cache hashing + honest cache parity)** — `apply-profile` at
+      the 1000-op batch shape showed prestate at 48% of apply. (1) The pre-state machinery
+      collapsed: `wanted` BTreeSet → sorted Vec, the `existing` BTreeMap (whose revisions nothing
+      read) deleted, keys MOVE into the presence overlay (now a fast-hash map) and update through
+      `get_mut` — two maps and ~4 key clones per op became one map and one clone. (2) Page cache
+      and value cache left SipHash for a dependency-free multiply-xor u64 hasher (keys are
+      engine-allocated ids; spread-test pinned). (3) `collect_many` binary-searches sparse leaves
+      via the slot directory, merge-walks dense ones. (4) Harness fairness fix: only vyrn's VALUE
+      cache had 1 GiB parity — its page cache sat at the 16 MiB default against sled's 1 GiB
+      tree cache and redb's unbounded mmap; `VYRN_PAGE_CACHE_PAGES` now gets the same 1 GiB.
+      Harness: batch_put 211K → ~268K (now trading with redb), point_get 4 KiB now trading
+      (1.27M vs 1.19M in the confirming run), scan_4KiB #1 by 2.3–2.8×. Write-up in
+      docs/benchmarks.md.
+- [ ] **The remaining contested rows.** point_get 64 KiB: ~1.1× behind redb consistently — the
+      last read row lost; remaining cost is the value-cache probe + Arc round trip vs redb's
+      guard handing out an mmap slice, plus the descent's per-page mutex (a sharded or lock-free
+      read path is the structural fix). durable_put 64 KiB vs flushed sled ~1.15x (consistent but
+      fsync-noise adjacent; confirm on Linux first). scan 128 B trades ±10% with redb run to run;
+      the 20M rows/s aspiration needs per-row emit cost halved (fewer bounds-checked field reads
+      per visit) — diminishing returns, revisit after the mutex work. batch_put now trades with
+      redb; the next step there would be sharing one buffer between the WAL encode and the
+      change-record staging instead of cloning values into each.
 
 ## ⬜ Queued
 

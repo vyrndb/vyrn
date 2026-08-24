@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod change_log;
 pub mod document;
+mod fast_hash;
 mod mvcc;
 mod overlay;
 mod page_tree;
@@ -1973,28 +1974,29 @@ impl Engine {
         // check below: reading the value and revision in a single descent avoids
         // paying three separate root-to-leaf lookups per key, which is what made
         // commits under an open transaction scale with tree depth.
-        let mut wanted: BTreeSet<Vec<u8>> = BTreeSet::new();
+        // A sorted, deduplicated Vec rather than a BTreeSet: one sort over the
+        // batch beats a log-depth memcmp walk per insert, and the keys move on
+        // into the overlay below instead of being cloned into a second map.
+        let mut wanted: Vec<Vec<u8>> = Vec::with_capacity(operations.len() * 2);
         for operation in &operations {
             let key = match operation {
                 BatchOperation::Put(key, _) | BatchOperation::Delete(key) => key,
             };
-            wanted.insert(key.clone());
+            wanted.push(key.clone());
             // A put clears any tombstone, and a delete writes one, so their
             // presence matters too.
             if !key.starts_with(INTERNAL_PREFIX) {
-                wanted.insert(tombstone_key(key));
+                wanted.push(tombstone_key(key));
             }
         }
-        let wanted: Vec<Vec<u8>> = wanted.into_iter().collect();
+        wanted.sort_unstable();
+        wanted.dedup();
         let phase = std::time::Instant::now();
-        // Presence and revision only. The batch needs to know which keys and
-        // tombstones exist, not what they hold, and reading the values here cost
-        // a value-log read per external value while holding the write lock.
-        let existing: BTreeMap<Vec<u8>, Option<u64>> = wanted
-            .iter()
-            .cloned()
-            .zip(self.tree_get_many_revisions(&wanted)?)
-            .collect();
+        // Presence only. The batch needs to know which keys and tombstones
+        // exist, not what they hold — reading the values here cost a value-log
+        // read per external value while holding the write lock, and the
+        // revisions this read also yields go unused.
+        let revisions = self.tree_get_many_revisions(&wanted)?;
         let mut previous = BTreeMap::new();
         if oldest_snapshot.is_some() {
             // Only an active snapshot forces a pre-image, and only the versioned
@@ -2035,9 +2037,13 @@ impl Engine {
         // starts from the pre-batch state read above and tracks what the batch has
         // changed so far. The page rewrites then happen once for the whole batch
         // rather than once per key.
-        let mut overlay: BTreeMap<Vec<u8>, bool> = existing
-            .iter()
-            .map(|(key, entry)| (key.clone(), entry.is_some()))
+        // `wanted`'s keys move in; nothing is cloned. Hash map on the crate's
+        // fast hasher rather than a BTreeMap: the loop below probes it once
+        // or twice per operation and needs membership, never order.
+        let mut overlay: fast_hash::FastMap<Vec<u8>, bool> = wanted
+            .into_iter()
+            .zip(revisions)
+            .map(|(key, revision)| (key, revision.is_some()))
             .collect();
         let mut mutations: Vec<(Vec<u8>, page_tree::Mutation)> =
             Vec::with_capacity(operations.len());
@@ -2054,12 +2060,25 @@ impl Engine {
                     let internal = key.starts_with(INTERNAL_PREFIX);
                     if !internal {
                         let tombstone = tombstone_key(&key);
-                        if present(&overlay, &tombstone) {
-                            mutations.push((tombstone.clone(), page_tree::Mutation::Delete));
-                            overlay.insert(tombstone, false);
+                        // Every key and tombstone the loop probes was seeded
+                        // into the overlay from `wanted`, so updates go
+                        // through `get_mut` — the `insert` this replaces
+                        // cloned the key just to hand the map a spelling it
+                        // already owned.
+                        if let Some(slot) = overlay.get_mut(&tombstone) {
+                            if *slot {
+                                *slot = false;
+                                mutations.push((tombstone, page_tree::Mutation::Delete));
+                            }
                         }
                     }
-                    let existed = present(&overlay, &key);
+                    let existed = match overlay.get_mut(&key) {
+                        Some(slot) => std::mem::replace(slot, true),
+                        None => {
+                            overlay.insert(key.clone(), true);
+                            false
+                        }
+                    };
                     mutations.push((
                         key.clone(),
                         page_tree::Mutation::Put {
@@ -2067,7 +2086,6 @@ impl Engine {
                             revision,
                         },
                     ));
-                    overlay.insert(key.clone(), true);
                     if !internal && !existed {
                         user_delta += 1;
                     }
@@ -2080,24 +2098,31 @@ impl Engine {
                 }
                 BatchOperation::Delete(key) => {
                     validate_key(&key)?;
-                    if !present(&overlay, &key) {
+                    let existed = overlay
+                        .get_mut(&key)
+                        .map(|slot| std::mem::replace(slot, false))
+                        .unwrap_or(false);
+                    if !existed {
                         results.push(BatchResult::Delete { existed: false });
                         continue;
                     }
                     let internal = key.starts_with(INTERNAL_PREFIX);
                     mutations.push((key.clone(), page_tree::Mutation::Delete));
-                    overlay.insert(key.clone(), false);
                     if !internal {
                         user_delta -= 1;
                         let tombstone = tombstone_key(&key);
+                        if let Some(slot) = overlay.get_mut(&tombstone) {
+                            *slot = true;
+                        } else {
+                            overlay.insert(tombstone.clone(), true);
+                        }
                         mutations.push((
-                            tombstone.clone(),
+                            tombstone,
                             page_tree::Mutation::Put {
                                 value: Vec::new(),
                                 revision,
                             },
                         ));
-                        overlay.insert(tombstone, true);
                     }
                     pending.push(PendingCommit {
                         op: OP_DELETE,
@@ -4045,10 +4070,6 @@ fn change_log_sequence(key: &[u8]) -> Result<u64> {
 ///
 /// Every key a batch touches is read before any pages are written, so a missing
 /// entry here means the key was never looked up and cannot be present.
-fn present(overlay: &BTreeMap<Vec<u8>, bool>, key: &[u8]) -> bool {
-    overlay.get(key).copied().unwrap_or(false)
-}
-
 fn tombstone_key(key: &[u8]) -> Vec<u8> {
     let mut tombstone = TOMBSTONE_PREFIX.to_vec();
     tombstone.extend_from_slice(key);
