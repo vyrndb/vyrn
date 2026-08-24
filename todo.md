@@ -1,5 +1,25 @@
 # vyrn — production-readiness TODO
 
+## 🔨 IN PROGRESS: fenced automatic failover (v1.1 wave 2, implementing now)
+
+Design (safety argument goes in docs/replication.md when done): static membership
+`--cluster name=vyrn://url,...` + `--cluster-self <name>`; failover only when set; startup
+refuses N<3 or `min-acks < floor(N/2)` (majority incl. primary → any acked write is on a
+majority → any election majority intersects it → the LSN vote rule makes the winner hold every
+acked write). Epochs persisted crash-safe in `<data>/EPOCH` (current + voted, temp+rename+dir
+sync) — persist BEFORE granting/candidacy. Fencing: new ADDITIVE protocol msgs (tags after 53:
+PrimaryEpoch, VoteRequest{epoch,durable_lsn}, VoteResponse{granted,epoch}) sent only when
+clustered so old nodes never see unknown tags; replica refuses a stream whose PrimaryEpoch <
+its persisted epoch; primary hard-latches step-down (readiness 503, writes refused "deposed at
+epoch E") on seeing a higher epoch. Election: randomized timeout on primary silence → epoch+1
+persisted → votes over the normal authenticated protocol (admin-gated like the replica
+handshake); grant iff epoch > voted (persist first) AND candidate lsn >= own; majority of FULL
+membership → in-place promotion (read_only becomes AtomicBool, replica task stops, node serves
+writes at new epoch); losers re-point their replica loop at the winner via a shared leader
+cell. Old primary rejoin: sees higher epoch → persists, demotes, rejoins via decide_join
+(ReplicaAhead tail → existing rebuild answer). Wiring status if interrupted: check
+crates/vyrn-server/src/{epoch.rs,failover.rs} existence and main.rs `--cluster` flag.
+
 ## 🚢 1.0.0 release gates (2026-08-24)
 
 - [x] WAL record header self-checksum (record format v5) — the last known format defect; the

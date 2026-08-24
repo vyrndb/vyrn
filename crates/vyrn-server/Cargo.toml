@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crc32fast = "1"
 anyhow.workspace = true
 argon2.workspace = true
 clap.workspace = true

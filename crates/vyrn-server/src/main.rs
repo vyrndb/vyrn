@@ -1,4 +1,6 @@
 mod audit;
+mod epoch;
+mod failover;
 mod auth;
 mod replica;
 mod replication;

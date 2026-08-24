@@ -2053,6 +2053,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "clap",
+ "crc32fast",
  "futures-util",
  "proptest",
  "rustls",

@@ -302,6 +302,31 @@ pub enum Message {
     ReplicaDiverged {
         reason: String,
     },
+    /// The primary's fencing epoch, sent on the stream after `ReplicaStream`
+    /// and as an idle heartbeat — only when the cluster is configured for
+    /// automatic failover, so a node without it never sees this tag.
+    ///
+    /// A replica whose persisted epoch is higher refuses the stream: the
+    /// sender was deposed and must not feed anyone.
+    PrimaryEpoch {
+        epoch: u64,
+    },
+    /// A candidate asking for this member's vote in `epoch`.
+    ///
+    /// Admin-gated like the replica handshake. The receiver grants only if it
+    /// has never voted in an epoch this high AND `durable_lsn` is at or past
+    /// its own — the condition that makes an elected leader hold every
+    /// acknowledged write.
+    VoteRequest {
+        epoch: u64,
+        durable_lsn: u64,
+    },
+    /// The answer to a `VoteRequest`. `epoch` is the responder's current
+    /// epoch, so a stale candidate learns what deposed it.
+    VoteResponse {
+        granted: bool,
+        epoch: u64,
+    },
 
     Error {
         code: ErrorCode,
@@ -553,6 +578,20 @@ impl std::fmt::Debug for Message {
                 .debug_struct("ReplicaDiverged")
                 .field("reason", reason)
                 .finish(),
+            Self::PrimaryEpoch { epoch } => formatter
+                .debug_struct("PrimaryEpoch")
+                .field("epoch", epoch)
+                .finish(),
+            Self::VoteRequest { epoch, durable_lsn } => formatter
+                .debug_struct("VoteRequest")
+                .field("epoch", epoch)
+                .field("durable_lsn", durable_lsn)
+                .finish(),
+            Self::VoteResponse { granted, epoch } => formatter
+                .debug_struct("VoteResponse")
+                .field("granted", granted)
+                .field("epoch", epoch)
+                .finish(),
             Self::Error { code, message } => formatter
                 .debug_struct("Error")
                 .field("code", code)
@@ -795,6 +834,20 @@ fn encode_message(message: Message, output: &mut BytesMut) -> Result<(), CodecEr
         Message::ReplicaDiverged { reason } => {
             output.put_u8(54);
             put_string(output, &reason, FieldLimit::ErrorMessage)?;
+        }
+        Message::PrimaryEpoch { epoch } => {
+            output.put_u8(55);
+            output.put_u64(epoch);
+        }
+        Message::VoteRequest { epoch, durable_lsn } => {
+            output.put_u8(56);
+            output.put_u64(epoch);
+            output.put_u64(durable_lsn);
+        }
+        Message::VoteResponse { granted, epoch } => {
+            output.put_u8(57);
+            output.put_u8(u8::from(granted));
+            output.put_u64(epoch);
         }
         Message::Begin => output.put_u8(15),
         Message::Commit => output.put_u8(16),
@@ -1258,6 +1311,17 @@ fn decode_envelope(input: &mut BytesMut) -> Result<Envelope, CodecError> {
         },
         54 => Message::ReplicaDiverged {
             reason: get_string(input, MAX_ERROR_MESSAGE)?,
+        },
+        55 => Message::PrimaryEpoch {
+            epoch: get_u64(input)?,
+        },
+        56 => Message::VoteRequest {
+            epoch: get_u64(input)?,
+            durable_lsn: get_u64(input)?,
+        },
+        57 => Message::VoteResponse {
+            granted: get_u8(input)? != 0,
+            epoch: get_u64(input)?,
         },
         _ => return Err(CodecError::Malformed("unknown message type")),
     };
