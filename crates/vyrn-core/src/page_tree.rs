@@ -14,7 +14,20 @@ use std::{
 pub(crate) const PAGE_SIZE: usize = 4 * 1024;
 const HEADER_SIZE: usize = 40;
 const MAGIC: &[u8; 4] = b"VPGE";
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
+/// The last pre-slot-directory page format, still readable.
+///
+/// Version 5 is purely additive over version 4: cells are laid out exactly
+/// as version 4 laid them out, and the slot directory grows down from the
+/// page tail into bytes version 4 left as slack. Every sequential reader
+/// therefore parses both versions unchanged, and the slot fast paths fall
+/// back to the sequential walk when the page predates the directory.
+/// Writers always write version 5, so a legacy page lasts only until
+/// copy-on-write or checkpoint compaction next rewrites it. Downgrade is
+/// not supported: an older build refuses a version-5 page as corrupt.
+const LEGACY_VERSION: u8 = 4;
+/// One slot-directory entry: the u16 offset of a cell within its page.
+const SLOT_SIZE: usize = 2;
 const SUPER: u8 = 1;
 const LEAF: u8 = 2;
 const INTERNAL: u8 = 3;
@@ -152,6 +165,60 @@ enum EntryValue {
 struct NodeRef {
     page_id: u64,
     min_key: Bytes,
+}
+
+/// The slot directory of a version-5 tree page: one cell offset per cell, in
+/// key order, growing down from the page tail.
+///
+/// What it buys: point lookups binary-search a leaf's cells and an internal
+/// page's separators instead of parsing every cell up to the match, and scans
+/// address each cell directly, reading only the fields a row actually needs —
+/// an inline row's `key_page`, `value_offset`, and (for the visitor scan)
+/// `revision` fields are never touched. Absent on a legacy version-4 page,
+/// where every reader falls back to the sequential walk.
+struct Slots<'a> {
+    page: &'a Page,
+    count: usize,
+    /// First byte of the directory. Cells live in `[HEADER_SIZE, dir_start)`.
+    dir_start: usize,
+}
+
+/// The page's slot directory, when it has one.
+///
+/// `count` must already be validated against the page type's physical
+/// maximum, which keeps `dir_start` above the header by arithmetic alone.
+fn slots(page: &Page, count: usize) -> Option<Slots<'_>> {
+    (page[4] == VERSION).then_some(Slots {
+        page,
+        count,
+        dir_start: PAGE_SIZE - count * SLOT_SIZE,
+    })
+}
+
+impl Slots<'_> {
+    /// Cell `index`'s offset and exclusive upper bound, validated to hold at
+    /// least `header` bytes between the page header and the directory.
+    ///
+    /// The bound is the next slot — the writer lays cells out contiguously in
+    /// slot order — or the directory itself for the last cell. The directory
+    /// is on-disk input like every other field, so a forged slot (out of
+    /// bounds, or non-monotonic, which makes a cell's bound precede its
+    /// offset) is reported as corruption, never dereferenced.
+    fn cell(&self, index: usize, header: usize, page_id: u64) -> Result<(usize, usize)> {
+        let offset = read_u16(self.page, self.dir_start + index * SLOT_SIZE) as usize;
+        let end = if index + 1 < self.count {
+            read_u16(self.page, self.dir_start + (index + 1) * SLOT_SIZE) as usize
+        } else {
+            self.dir_start
+        };
+        if offset < HEADER_SIZE || end > self.dir_start || offset + header > end {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "invalid slot directory entry".into(),
+            });
+        }
+        Ok((offset, end))
+    }
 }
 
 /// Where a leaf cell's value lives, so `get` and `get_shared` can each
@@ -932,10 +999,122 @@ impl PageTree {
         }
     }
 
+    /// Index of the first leaf cell whose key is at or past `target`, by
+    /// binary search over the slot directory.
+    ///
+    /// `slots.count` when every key falls short. Each probe parses only the
+    /// fields a comparison needs: flags and key length, plus the blob read an
+    /// external key has always cost. This is what replaces the sequential
+    /// cell walk for point lookups and for a scan's entry into its first
+    /// leaf — a leaf of small values holds over a hundred cells, and the
+    /// walk parsed half of them on average to find one.
+    fn leaf_lower_bound(&self, slots: &Slots, page_id: u64, target: &[u8]) -> Result<usize> {
+        let page = slots.page;
+        let (mut low, mut high) = (0, slots.count);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let (cell, end) = slots.cell(mid, LEAF_CELL_HEADER, page_id)?;
+            let flags = page[cell];
+            let key_len = read_u32(page, cell + 1) as usize;
+            if key_len == 0
+                || key_len > MAX_STORED_KEY_SIZE
+                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+            {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            let below = if flags & EXTERNAL_KEY != 0 {
+                self.read_blob(read_u64(page, cell + 9), key_len)?.as_slice() < target
+            } else {
+                if cell + LEAF_CELL_HEADER + key_len > end {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: "invalid leaf cell metadata".into(),
+                    });
+                }
+                &page[cell + LEAF_CELL_HEADER..cell + LEAF_CELL_HEADER + key_len] < target
+            };
+            if below {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
+    }
+
+    /// `find_in_leaf`'s slot-directory fast path: binary-search the cell,
+    /// then parse just that one cell into a [`LeafHit`].
+    fn find_in_leaf_slots(
+        &self,
+        slots: &Slots,
+        page_id: u64,
+        key: &[u8],
+    ) -> Result<Option<(LeafHit, u64)>> {
+        let index = self.leaf_lower_bound(slots, page_id, key)?;
+        if index == slots.count {
+            return Ok(None);
+        }
+        let page = slots.page;
+        let (cell, end) = slots.cell(index, LEAF_CELL_HEADER, page_id)?;
+        let flags = page[cell];
+        let key_len = read_u32(page, cell + 1) as usize;
+        let value_len = read_u32(page, cell + 5) as usize;
+        if key_len == 0
+            || key_len > MAX_STORED_KEY_SIZE
+            || value_len > MAX_VALUE_SIZE
+            || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+        {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "invalid leaf cell metadata".into(),
+            });
+        }
+        let external_key = flags & EXTERNAL_KEY != 0;
+        let matched = if external_key {
+            self.read_blob(read_u64(page, cell + 9), key_len)?.as_slice() == key
+        } else {
+            if cell + LEAF_CELL_HEADER + key_len > end {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            &page[cell + LEAF_CELL_HEADER..cell + LEAF_CELL_HEADER + key_len] == key
+        };
+        if !matched {
+            return Ok(None);
+        }
+        let revision = read_u64(page, cell + 25);
+        let hit = if flags & EXTERNAL_VALUE != 0 {
+            LeafHit::External(ValueRef {
+                offset: read_u64(page, cell + 17),
+                len: value_len as u32,
+                revision,
+            })
+        } else {
+            let value_start = cell + LEAF_CELL_HEADER + if external_key { 0 } else { key_len };
+            if value_start + value_len > end {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            LeafHit::Inline {
+                offset: value_start,
+                len: value_len,
+            }
+        };
+        Ok(Some((hit, revision)))
+    }
+
     /// Finds one key's cell inside a leaf page without decoding the page,
     /// reporting WHERE the value is rather than materialising it, so `get`
-    /// can copy it out and `get_shared` can hand it back in place. Cells
-    /// ascend by key, so the walk stops at the first cell past the target.
+    /// can copy it out and `get_shared` can hand it back in place. A page
+    /// with a slot directory is binary-searched; a legacy page walks its
+    /// cells in order, stopping at the first cell past the target.
     fn find_in_leaf(&self, page: &Page, page_id: u64, key: &[u8]) -> Result<Option<(LeafHit, u64)>> {
         let count = read_u32(page, 20) as usize;
         // Same bound and same reasoning as `decode_leaf`: a count past what the
@@ -947,6 +1126,9 @@ impl PageTree {
                     "leaf claims {count} entries but a page holds at most {MAX_LEAF_ENTRIES}"
                 ),
             });
+        }
+        if let Some(slots) = slots(page, count) {
+            return self.find_in_leaf_slots(&slots, page_id, key);
         }
         let mut offset = HEADER_SIZE;
         for _ in 0..count {
@@ -1270,10 +1452,14 @@ impl PageTree {
             return Ok(None);
         }
         entries.remove(position);
+        // Through the level packer, not `write_leaf` directly: rewriting a
+        // legacy page charges each surviving cell its new slot bytes, so a
+        // version-4 leaf packed beyond version 5's capacity must be allowed
+        // to split even though a delete made it smaller.
         let mut replacements = if entries.is_empty() {
             Vec::new()
         } else {
-            vec![self.write_leaf(&entries)?]
+            self.write_leaf_level(&entries)?
         };
         while let Some((parent_id, child_index)) = path.pop() {
             let mut children = self.read_internal_children(parent_id)?;
@@ -1286,7 +1472,14 @@ impl PageTree {
                 self.write_internal_level(&children)?
             };
         }
-        let root = replacements.first().map_or(0, |node| node.page_id);
+        // A delete can now SPLIT — rewriting a packed legacy leaf charges
+        // each cell its slot bytes — so more than one replacement needs a
+        // new root above it, exactly as `prepare_put_inner` grows one.
+        let root = match replacements.len() {
+            0 => 0,
+            1 => replacements[0].page_id,
+            _ => self.write_internal(&replacements)?.page_id,
+        };
         Ok(Some((root, self.len - 1)))
     }
 
@@ -1632,6 +1825,19 @@ impl PageTree {
                         ),
                     });
                 }
+                if let Some(directory) = slots(leaf, count) {
+                    return self.scan_visit_leaf_slots(
+                        leaf,
+                        &directory,
+                        page_id,
+                        start,
+                        end,
+                        limit,
+                        excluded_prefix,
+                        emitted,
+                        visit,
+                    );
+                }
                 /* Rows owed after the first spilled value in range: emitting
                  * eagerly past it would answer out of key order once its
                  * bytes arrive. `None` until then, so the all-inline walk
@@ -1755,16 +1961,9 @@ impl PageTree {
                 }
             }
             INTERNAL => {
-                let children = self.decode_internal(&page, page_id)?;
-                for (index, child) in children.iter().enumerate() {
-                    let child_end = children.get(index + 1).map(|next| next.min_key.as_slice());
-                    if start.is_some_and(|start| child_end.is_some_and(|end| end <= start))
-                        || end.is_some_and(|end| child.min_key.as_slice() >= end)
-                    {
-                        continue;
-                    }
-                    self.scan_visit_node(
-                        child.page_id,
+                self.scan_children(&page, page_id, start, end, &mut |tree, child| {
+                    tree.scan_visit_node(
+                        child,
                         start,
                         end,
                         limit,
@@ -1773,12 +1972,152 @@ impl PageTree {
                         visit,
                         depth + 1,
                     )?;
-                    if *emitted >= limit {
-                        break;
+                    Ok(*emitted >= limit)
+                })?;
+            }
+            page_type => return Err(unexpected_type(page_id, page_type)),
+        }
+        Ok(())
+    }
+
+    /// The visitor scan's slot-directory leaf: entry into the range by
+    /// binary search instead of parsing every cell below `start`, then one
+    /// directly-addressed cell per row, reading only the fields the row
+    /// needs — an inline row touches its flags and two lengths, never the
+    /// `key_page`, `value_offset`, and `revision` fields the sequential walk
+    /// decoded for every cell. The deferral rule is the legacy walk's: from
+    /// the first spilled value onward, rows are owed until the batch
+    /// value-log read, so nothing is emitted out of key order.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_visit_leaf_slots<F: FnMut(&[u8], &[u8])>(
+        &self,
+        leaf: &Page,
+        directory: &Slots,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+        emitted: &mut usize,
+        visit: &mut F,
+    ) -> Result<()> {
+        enum Src {
+            Page { offset: usize, len: usize },
+            Blob(Vec<u8>),
+        }
+        let mut deferred: Option<Vec<(Src, std::result::Result<Src, ValueRef>)>> = None;
+        let first = match start {
+            Some(start) => self.leaf_lower_bound(directory, page_id, start)?,
+            None => 0,
+        };
+        for index in first..directory.count {
+            let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
+            let flags = leaf[cell];
+            let key_len = read_u32(leaf, cell + 1) as usize;
+            let value_len = read_u32(leaf, cell + 5) as usize;
+            if key_len == 0
+                || key_len > MAX_STORED_KEY_SIZE
+                || value_len > MAX_VALUE_SIZE
+                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+            {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            let external_key = flags & EXTERNAL_KEY != 0;
+            let key_start = cell + LEAF_CELL_HEADER;
+            let blob_key = if external_key {
+                Some(self.read_blob(read_u64(leaf, cell + 9), key_len)?)
+            } else {
+                if key_start + key_len > cell_end {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: "invalid leaf cell metadata".into(),
+                    });
+                }
+                None
+            };
+            let cell_key: &[u8] = match &blob_key {
+                Some(key) => key,
+                None => &leaf[key_start..key_start + key_len],
+            };
+            if end.is_some_and(|end| cell_key >= end) {
+                break;
+            }
+            if excluded_prefix.is_some_and(|prefix| cell_key.starts_with(prefix)) {
+                continue;
+            }
+            let value_external = flags & EXTERNAL_VALUE != 0;
+            if value_external {
+                deferred.get_or_insert_with(Vec::new).push((
+                    match blob_key {
+                        Some(key) => Src::Blob(key),
+                        None => Src::Page {
+                            offset: key_start,
+                            len: key_len,
+                        },
+                    },
+                    Err(ValueRef {
+                        offset: read_u64(leaf, cell + 17),
+                        len: value_len as u32,
+                        revision: read_u64(leaf, cell + 25),
+                    }),
+                ));
+            } else {
+                let value_start = if external_key {
+                    key_start
+                } else {
+                    key_start + key_len
+                };
+                if value_start + value_len > cell_end {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: "invalid leaf cell metadata".into(),
+                    });
+                }
+                match &mut deferred {
+                    None => visit(cell_key, &leaf[value_start..value_start + value_len]),
+                    Some(deferred) => deferred.push((
+                        match blob_key {
+                            Some(key) => Src::Blob(key),
+                            None => Src::Page {
+                                offset: key_start,
+                                len: key_len,
+                            },
+                        },
+                        Ok(Src::Page {
+                            offset: value_start,
+                            len: value_len,
+                        }),
+                    )),
+                }
+            }
+            *emitted += 1;
+            if *emitted == limit {
+                break;
+            }
+        }
+        if let Some(deferred) = deferred {
+            let references: Vec<ValueRef> = deferred
+                .iter()
+                .filter_map(|(_, value)| value.as_ref().err().cloned())
+                .collect();
+            let mut resolved = self.values.read_many(&references)?.into_iter();
+            for (key, value) in &deferred {
+                let key: &[u8] = match key {
+                    Src::Page { offset, len } => &leaf[*offset..*offset + *len],
+                    Src::Blob(bytes) => bytes,
+                };
+                match value {
+                    Ok(Src::Page { offset, len }) => visit(key, &leaf[*offset..*offset + *len]),
+                    Ok(Src::Blob(_)) => unreachable!("values are never blobs"),
+                    Err(_) => {
+                        let value = resolved.next().expect("one resolved value per reference");
+                        visit(key, &value);
                     }
                 }
             }
-            page_type => return Err(unexpected_type(page_id, page_type)),
         }
         Ok(())
     }
@@ -1832,6 +2171,18 @@ impl PageTree {
                              {MAX_LEAF_ENTRIES}"
                         ),
                     });
+                }
+                if let Some(directory) = slots(leaf, count) {
+                    return self.scan_leaf_rows_slots(
+                        &page,
+                        &directory,
+                        page_id,
+                        start,
+                        end,
+                        limit,
+                        excluded_prefix,
+                        rows,
+                    );
                 }
                 let mut pending: Vec<(usize, ValueRef)> = Vec::new();
                 let mut offset = HEADER_SIZE;
@@ -1923,16 +2274,9 @@ impl PageTree {
                 }
             }
             INTERNAL => {
-                let children = self.decode_internal(&page, page_id)?;
-                for (index, child) in children.iter().enumerate() {
-                    let child_end = children.get(index + 1).map(|next| next.min_key.as_slice());
-                    if start.is_some_and(|start| child_end.is_some_and(|end| end <= start))
-                        || end.is_some_and(|end| child.min_key.as_slice() >= end)
-                    {
-                        continue;
-                    }
-                    self.scan_node(
-                        child.page_id,
+                self.scan_children(&page, page_id, start, end, &mut |tree, child| {
+                    tree.scan_node(
+                        child,
                         start,
                         end,
                         limit,
@@ -1940,12 +2284,229 @@ impl PageTree {
                         rows,
                         depth + 1,
                     )?;
-                    if rows.len() == limit {
-                        break;
-                    }
-                }
+                    Ok(rows.len() >= limit)
+                })?;
             }
             page_type => return Err(unexpected_type(page_id, page_type)),
+        }
+        Ok(())
+    }
+
+    /// The shared-row scan's slot-directory leaf: the same entry-by-binary-
+    /// search and directly-addressed cells as `scan_visit_leaf_slots`, but
+    /// each row is built as two page-backed `Bytes` plus its revision, and
+    /// spilled values keep the whole-leaf `read_many` batch: placeholders
+    /// now, bytes after one coalesced value-log read.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_leaf_rows_slots(
+        &self,
+        page: &Arc<Page>,
+        directory: &Slots,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        excluded_prefix: Option<&[u8]>,
+        rows: &mut Vec<SharedRow>,
+    ) -> Result<()> {
+        let leaf: &Page = page;
+        let mut pending: Vec<(usize, ValueRef)> = Vec::new();
+        let first = match start {
+            Some(start) => self.leaf_lower_bound(directory, page_id, start)?,
+            None => 0,
+        };
+        for index in first..directory.count {
+            let (cell, cell_end) = directory.cell(index, LEAF_CELL_HEADER, page_id)?;
+            let flags = leaf[cell];
+            let key_len = read_u32(leaf, cell + 1) as usize;
+            let value_len = read_u32(leaf, cell + 5) as usize;
+            if key_len == 0
+                || key_len > MAX_STORED_KEY_SIZE
+                || value_len > MAX_VALUE_SIZE
+                || flags & !(EXTERNAL_KEY | EXTERNAL_VALUE) != 0
+            {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid leaf cell metadata".into(),
+                });
+            }
+            let external_key = flags & EXTERNAL_KEY != 0;
+            let key_start = cell + LEAF_CELL_HEADER;
+            let blob_key = if external_key {
+                Some(self.read_blob(read_u64(leaf, cell + 9), key_len)?)
+            } else {
+                if key_start + key_len > cell_end {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: "invalid leaf cell metadata".into(),
+                    });
+                }
+                None
+            };
+            let cell_key: &[u8] = match &blob_key {
+                Some(key) => key,
+                None => &leaf[key_start..key_start + key_len],
+            };
+            if end.is_some_and(|end| cell_key >= end) {
+                break;
+            }
+            if excluded_prefix.is_some_and(|prefix| cell_key.starts_with(prefix)) {
+                continue;
+            }
+            let revision = read_u64(leaf, cell + 25);
+            let key = match blob_key {
+                Some(key) => Bytes::Owned(key),
+                None => Bytes::paged(page, key_start, key_len),
+            };
+            let value = if flags & EXTERNAL_VALUE != 0 {
+                pending.push((
+                    rows.len(),
+                    ValueRef {
+                        offset: read_u64(leaf, cell + 17),
+                        len: value_len as u32,
+                        revision,
+                    },
+                ));
+                SharedTreeValue::Paged(Bytes::Owned(Vec::new()))
+            } else {
+                let value_start = if external_key {
+                    key_start
+                } else {
+                    key_start + key_len
+                };
+                if value_start + value_len > cell_end {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: "invalid leaf cell metadata".into(),
+                    });
+                }
+                SharedTreeValue::Paged(Bytes::paged(page, value_start, value_len))
+            };
+            rows.push((key, value, revision));
+            if rows.len() == limit {
+                break;
+            }
+        }
+        if !pending.is_empty() {
+            let references: Vec<ValueRef> = pending
+                .iter()
+                .map(|(_, reference)| reference.clone())
+                .collect();
+            for ((slot, _), value) in pending.iter().zip(self.values.read_many(&references)?) {
+                rows[*slot].1 = SharedTreeValue::Log(value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Walks an internal page's children in place, descending into every
+    /// child whose key range can intersect `[start, end)`, in key order.
+    /// `descend` returns whether the scan is satisfied, which stops the walk.
+    ///
+    /// This is the scan paths' replacement for `decode_internal`, which
+    /// allocated an owned `NodeRef` per child and — to recover child 0's
+    /// minimum key, which pruning never needs — walked that child's whole
+    /// leftmost spine down to a leaf, for every internal page a scan
+    /// crossed. Cell `i` holds the separator that ends child `i`'s range and
+    /// begins child `i + 1`'s, so one pass over the cells yields exactly the
+    /// two boundaries the pruning tests use.
+    fn scan_children<F>(
+        &self,
+        page: &Page,
+        page_id: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        descend: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&Self, u64) -> Result<bool>,
+    {
+        let count = read_u32(page, 20) as usize;
+        if count >= MAX_INTERNAL_CHILDREN {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: format!(
+                    "internal page claims {} children but a page holds at most {MAX_INTERNAL_CHILDREN}",
+                    count + 1
+                ),
+            });
+        }
+        let first_id = read_u64(page, 24);
+        if first_id == page_id {
+            return Err(Error::CorruptPage {
+                page_id,
+                reason: "internal page names itself as its own child".into(),
+            });
+        }
+        /* A separator lives in the page or, past INLINE_LIMIT, in a blob;
+         * the blob read is kept alive here so the next iteration can still
+         * compare against it as the current child's minimum. */
+        enum Sep {
+            Page { offset: usize, len: usize },
+            Blob(Vec<u8>),
+        }
+        fn sep_slice<'a>(sep: &'a Sep, page: &'a Page) -> &'a [u8] {
+            match sep {
+                Sep::Page { offset, len } => &page[*offset..*offset + *len],
+                Sep::Blob(bytes) => bytes,
+            }
+        }
+        let mut child_id = first_id;
+        // The current child's minimum key: unbounded below for child 0.
+        let mut child_min: Option<Sep> = None;
+        let mut offset = HEADER_SIZE;
+        for _ in 0..count {
+            require_page(offset, INTERNAL_CELL_HEADER, page_id)?;
+            let flags = page[offset];
+            let key_len = read_u32(page, offset + 1) as usize;
+            let key_page = read_u64(page, offset + 5);
+            let next_child = read_u64(page, offset + 13);
+            if key_len == 0 || key_len > MAX_STORED_KEY_SIZE || flags & !EXTERNAL_KEY != 0 {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "invalid internal cell metadata".into(),
+                });
+            }
+            if next_child == page_id {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "internal page names itself as its own child".into(),
+                });
+            }
+            offset += INTERNAL_CELL_HEADER;
+            let separator = if flags & EXTERNAL_KEY != 0 {
+                Sep::Blob(self.read_blob(key_page, key_len)?)
+            } else {
+                require_page(offset, key_len, page_id)?;
+                let inline = Sep::Page {
+                    offset,
+                    len: key_len,
+                };
+                offset += key_len;
+                inline
+            };
+            // This separator ends the current child's range: skip the child
+            // when its range sits entirely below `start` or at/above `end`.
+            let skip = start.is_some_and(|start| sep_slice(&separator, page) <= start)
+                || end.is_some_and(|end| {
+                    child_min
+                        .as_ref()
+                        .is_some_and(|min| sep_slice(min, page) >= end)
+                });
+            if !skip && descend(self, child_id)? {
+                return Ok(());
+            }
+            child_min = Some(separator);
+            child_id = next_child;
+        }
+        // The last child has no separator after it, so only `end` can prune it.
+        let past_end = end.is_some_and(|end| {
+            child_min
+                .as_ref()
+                .is_some_and(|min| sep_slice(min, page) >= end)
+        });
+        if !past_end {
+            descend(self, child_id)?;
         }
         Ok(())
     }
@@ -2028,6 +2589,57 @@ impl PageTree {
                 page_id,
                 reason: "internal page names itself as its own child".into(),
             });
+        }
+        // A page with a slot directory binary-searches its separators: the
+        // child is the partition point of "separator at or below the key",
+        // reached in log2(fanout) probes where the walk below parses half
+        // the page's cells on average. An internal page of short keys holds
+        // over a hundred separators, and every point read pays this once
+        // per level, so the walk was most of a descent's cost.
+        if let Some(slots) = slots(page, count) {
+            let (mut low, mut high) = (0, count);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                let (cell, end) = slots.cell(mid, INTERNAL_CELL_HEADER, page_id)?;
+                let flags = page[cell];
+                let key_len = read_u32(page, cell + 1) as usize;
+                if key_len == 0 || key_len > MAX_STORED_KEY_SIZE || flags & !EXTERNAL_KEY != 0 {
+                    return Err(Error::CorruptPage {
+                        page_id,
+                        reason: "invalid internal cell metadata".into(),
+                    });
+                }
+                let below = if flags & EXTERNAL_KEY != 0 {
+                    self.read_blob(read_u64(page, cell + 5), key_len)?.as_slice() <= key
+                } else {
+                    if cell + INTERNAL_CELL_HEADER + key_len > end {
+                        return Err(Error::CorruptPage {
+                            page_id,
+                            reason: "invalid internal cell metadata".into(),
+                        });
+                    }
+                    &page[cell + INTERNAL_CELL_HEADER..cell + INTERNAL_CELL_HEADER + key_len]
+                        <= key
+                };
+                if below {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            if low == 0 {
+                return Ok((0, first_id));
+            }
+            let (cell, _) = slots.cell(low - 1, INTERNAL_CELL_HEADER, page_id)?;
+            let child_id = read_u64(page, cell + 13);
+            if child_id == page_id {
+                return Err(Error::CorruptPage {
+                    page_id,
+                    reason: "internal page names itself as its own child".into(),
+                });
+            }
+            // Separator `low - 1` introduces child `low`.
+            return Ok((low, child_id));
         }
         let mut chosen = (0, first_id);
         let mut offset = HEADER_SIZE;
@@ -2167,7 +2779,10 @@ impl PageTree {
         let mut start = 0;
         let mut used = HEADER_SIZE;
         for (index, entry) in entries.iter().enumerate() {
-            let size = leaf_cell_size(entry);
+            // A cell costs its bytes plus its slot in the tail directory, so
+            // budgeting both against PAGE_SIZE is exactly the guarantee the
+            // writer needs: cells end at or before where the directory starts.
+            let size = leaf_cell_size(entry) + SLOT_SIZE;
             if size > PAGE_SIZE - HEADER_SIZE {
                 return Err(Error::CorruptPage {
                     page_id: 0,
@@ -2198,9 +2813,21 @@ impl PageTree {
         })?;
         let mut page = new_page(LEAF, 0);
         write_u32(&mut page, 20, entries.len() as u32);
+        // Each cell's offset is recorded in the slot directory at the page
+        // tail as it is encoded. The level packer already budgeted
+        // `SLOT_SIZE` per entry, so cells provably end at or before
+        // `dir_start` — the two regions cannot collide.
+        let dir_start = PAGE_SIZE - entries.len() * SLOT_SIZE;
         let mut offset = HEADER_SIZE;
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
+            write_u16(&mut page, dir_start + index * SLOT_SIZE, offset as u16);
             offset = self.encode_leaf_cell(&mut page, offset, entry)?;
+        }
+        if offset > dir_start {
+            return Err(Error::CorruptPage {
+                page_id: 0,
+                reason: "leaf cells overlap the slot directory".into(),
+            });
         }
         crate::profile::add(&crate::profile::TREE_ENCODE_NS, started);
         let page_id = self.pages.append(page)?;
@@ -2225,7 +2852,8 @@ impl PageTree {
             // page on its own; `index > start` is the "current page is not
             // empty" guard.
             if index > start {
-                let size = internal_cell_size(child.min_key.as_slice());
+                // Cell bytes plus tail slot, as in `write_leaf_level`.
+                let size = internal_cell_size(child.min_key.as_slice()) + SLOT_SIZE;
                 if used + size > PAGE_SIZE {
                     bounds.push((start, index));
                     start = index;
@@ -2251,9 +2879,19 @@ impl PageTree {
         let mut page = new_page(INTERNAL, 0);
         write_u32(&mut page, 20, (children.len() - 1) as u32);
         write_u64(&mut page, 24, first.page_id);
+        // The directory covers the body cells only; child 0 lives in the
+        // header and needs no slot.
+        let dir_start = PAGE_SIZE - (children.len() - 1) * SLOT_SIZE;
         let mut offset = HEADER_SIZE;
-        for child in children.iter().skip(1) {
+        for (index, child) in children.iter().skip(1).enumerate() {
+            write_u16(&mut page, dir_start + index * SLOT_SIZE, offset as u16);
             offset = self.encode_internal_cell(&mut page, offset, child)?;
+        }
+        if offset > dir_start {
+            return Err(Error::CorruptPage {
+                page_id: 0,
+                reason: "internal cells overlap the slot directory".into(),
+            });
         }
         crate::profile::add(&crate::profile::TREE_ENCODE_NS, started);
         let page_id = self.pages.append(page)?;
@@ -2678,10 +3316,19 @@ fn finalize_page(page: &mut Page) {
 }
 
 fn validate_page(page: &mut Page, page_id: u64) -> Result<()> {
-    if &page[0..4] != MAGIC || page[4] != VERSION || read_u64(page, 8) != page_id {
+    if &page[0..4] != MAGIC || read_u64(page, 8) != page_id {
         return Err(Error::CorruptPage {
             page_id,
             reason: "invalid page header".into(),
+        });
+    }
+    // Version 4 pages remain readable — the slot directory is additive — but
+    // anything else is a format this build does not know, named as such
+    // rather than folded into "invalid header".
+    if page[4] != VERSION && page[4] != LEGACY_VERSION {
+        return Err(Error::CorruptPage {
+            page_id,
+            reason: format!("unsupported page format version {}", page[4]),
         });
     }
     let expected = read_u32(page, 16);
@@ -2724,6 +3371,12 @@ fn excessive_depth(page_id: u64) -> Error {
     }
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
+}
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
@@ -2966,6 +3619,144 @@ mod tests {
             b"zzz".to_vec(),
         ] {
             assert_eq!(tree.get(&missing).unwrap(), None, "phantom hit");
+        }
+    }
+
+    /// A version-4 database — every page predating the slot directory — must
+    /// stay fully readable AND writable: the directory is additive, so the
+    /// sequential readers parse legacy cells unchanged, and copy-on-write
+    /// rewrites them into version-5 pages as it touches them. This is the
+    /// compatibility the format bump promised; it fails if any reader starts
+    /// requiring the directory.
+    #[test]
+    fn a_legacy_tree_without_directories_still_reads_and_rewrites() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, len) = tree_with_internal_root(&path, &values);
+        // Rewind every page to version 4. Cells are identical across the two
+        // versions, so clearing the version byte (and re-checksumming) is
+        // exactly what a database written by the previous build looks like —
+        // the directory bytes it also carries are slack a version-4 reader
+        // never looks at.
+        let page_count = std::fs::metadata(&path).unwrap().len() / PAGE_SIZE as u64;
+        for page_id in 0..page_count {
+            forge_page(&path, page_id, |page| page[4] = LEGACY_VERSION);
+        }
+        let mut tree = PageTree::open(&path, &values, root, len).unwrap();
+        // Point lookups take the sequential fallback on every level.
+        assert_eq!(tree.get(b"key-000000").unwrap(), Some(vec![7; 40]));
+        assert_eq!(tree.get(b"key-000199").unwrap(), Some(vec![7; 40]));
+        assert_eq!(tree.get(b"key-000200").unwrap(), None);
+        // Scans walk legacy leaves and internal pages in place.
+        assert_eq!(
+            tree.scan(Some(b"key-000050"), Some(b"key-000060"), 100)
+                .unwrap()
+                .len(),
+            10
+        );
+        // Writes rewrite legacy pages as version-5 pages mid-tree; the mixed
+        // tree must stay coherent through puts and deletes.
+        let (root, len) = tree.prepare_put(b"key-000100", b"rewritten", 900).unwrap();
+        tree.publish(root, len);
+        let deleted = tree.prepare_delete(b"key-000150").unwrap().unwrap();
+        tree.publish(deleted.0, deleted.1);
+        tree.sync().unwrap();
+        assert_eq!(tree.get(b"key-000100").unwrap(), Some(b"rewritten".to_vec()));
+        assert_eq!(tree.get(b"key-000150").unwrap(), None);
+        assert_eq!(tree.len(), 199);
+        tree.validate().unwrap();
+    }
+
+    /// A legacy leaf can be packed beyond what version 5 fits in one page —
+    /// the directory charges every cell two tail bytes the version-4 packer
+    /// never budgeted — so rewriting one must be allowed to SPLIT, even on a
+    /// delete that made it smaller. `prepare_delete` used to write its leaf
+    /// with `write_leaf` directly, which would overflow the page.
+    #[test]
+    fn a_full_legacy_leaf_splits_when_rewritten() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        // A root leaf to overwrite wholesale.
+        let root = {
+            let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+            let state = tree.prepare_put(b"seed", b"", 1).unwrap();
+            tree.publish(state.0, state.1);
+            tree.sync().unwrap();
+            state.0
+        };
+        // 109 cells of a 4-byte key and empty value: 40 + 109 * 37 = 4073
+        // bytes, legal for version 4, while version 5 needs 109 more slot
+        // bytes than the page has left.
+        const COUNT: usize = 109;
+        forge_page(&path, root, |page| {
+            page.fill(0);
+            page[0..4].copy_from_slice(MAGIC);
+            page[4] = LEGACY_VERSION;
+            page[5] = LEAF;
+            write_u64(page, 8, root);
+            write_u32(page, 20, COUNT as u32);
+            let mut offset = HEADER_SIZE;
+            for index in 0..COUNT {
+                let key = format!("k{index:03}");
+                write_u32(page, offset + 1, 4);
+                write_u64(page, offset + 25, index as u64 + 1);
+                page[offset + LEAF_CELL_HEADER..offset + LEAF_CELL_HEADER + 4]
+                    .copy_from_slice(key.as_bytes());
+                offset += LEAF_CELL_HEADER + 4;
+            }
+        });
+        let mut tree = PageTree::open(&path, &values, root, COUNT as u64).unwrap();
+        let (root, len) = tree.prepare_delete(b"k000").unwrap().unwrap();
+        tree.publish(root, len);
+        tree.sync().unwrap();
+        assert_eq!(len, COUNT as u64 - 1);
+        assert_eq!(tree.get(b"k000").unwrap(), None);
+        assert_eq!(tree.get(b"k001").unwrap(), Some(Vec::new()));
+        assert_eq!(tree.get(b"k108").unwrap(), Some(Vec::new()));
+        tree.validate().unwrap();
+        assert_eq!(tree.scan(None, None, COUNT + 1).unwrap().len(), COUNT - 1);
+    }
+
+    /// The slot directory is on-disk input like every other field: a forged
+    /// slot must be reported as corruption, never dereferenced. Without the
+    /// bounds check a slot of 0 reads the page header as a cell, and a slot
+    /// past the page panics the process on the slice.
+    #[test]
+    fn a_forged_slot_directory_is_reported_not_followed() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("pages.vdb");
+        let values = directory.path().join("values.vlog");
+        let (root, count) = {
+            let mut tree = PageTree::open(&path, &values, 0, 0).unwrap();
+            let mut state = (0, 0);
+            for index in 0..20_u64 {
+                let key = format!("key-{index:02}");
+                state = tree.prepare_put(key.as_bytes(), &[3; 16], index + 1).unwrap();
+                tree.publish(state.0, state.1);
+            }
+            tree.sync().unwrap();
+            state
+        };
+        for forged in [0_u16, (PAGE_SIZE - 1) as u16] {
+            forge_page(&path, root, |page| {
+                let dir_start = PAGE_SIZE - 20 * SLOT_SIZE;
+                for index in 0..20 {
+                    write_u16(page, dir_start + index * SLOT_SIZE, forged);
+                }
+            });
+            let tree = PageTree::open(&path, &values, root, count).unwrap();
+            for error in [
+                tree.get(b"key-05").unwrap_err(),
+                tree.scan(None, None, 20).unwrap_err(),
+                tree.scan(Some(b"key-05"), None, 20).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, Error::CorruptPage { .. }),
+                    "a forged slot must surface as corruption, got {error:?}"
+                );
+            }
         }
     }
 

@@ -408,6 +408,57 @@ naive durability comparisons quote):
 Write rows on this host vary ±10–15% run to run; the read rows are stable and
 the rankings reproduced across runs.
 
+### Fixed: slot-directory pages — binary-search lookups, directly-addressed scans
+
+The page format bump the section above queued. A version-5 tree page carries
+a directory of u16 cell offsets growing down from the page tail, one per
+cell in key order. The change is purely additive: cells are laid out exactly
+as version 4 laid them out, so every sequential reader parses both versions
+unchanged, version-4 pages stay readable forever (they convert to version 5
+as copy-on-write or checkpoint compaction rewrites them), and the whole-page
+CRC covers the directory because it covers the page. The directory is
+on-disk input like every other field: a forged slot — out of bounds, or
+non-monotonic — is reported as corruption, never dereferenced (pinned by a
+test that was mutation-verified by removing the bounds check).
+
+What it buys, and where:
+
+- **Leaf lookups binary-search.** `find_in_leaf` probed half a leaf's cells
+  on average — a leaf of small values holds over a hundred — parsing five
+  fields per cell to compare one key. Now log2(count) probes, each reading
+  flags and a key length.
+- **The descent binary-searches separators.** `child_for_key` paid the same
+  linear walk per internal level on every point read.
+- **Scans address cells directly.** Entry into the first leaf's range is a
+  binary search instead of parse-and-skip, and an inline row's `key_page`,
+  `value_offset`, and (for the visitor scan) `revision` fields are never
+  read at all. The scan paths also stopped calling `decode_internal`, which
+  allocated an owned `NodeRef` per child and walked child 0's whole leftmost
+  spine to a leaf — per internal page crossed — to recover a minimum key the
+  pruning never needs.
+
+Two write-path consequences, both tested: the level packers budget
+`SLOT_SIZE` per cell so cells provably end where the directory begins, and a
+delete may now *split* — a version-4 leaf packed beyond version-5 capacity
+must be splittable when rewritten — which exposed that `prepare_delete`
+silently dropped every replacement after the first (it never had more than
+one before; the packed-legacy-leaf test fails against the old code with real
+data loss).
+
+The 3-engine harness, same host, same run (write rows ±10–15% run to run):
+
+    point_get 4 KiB    624 K/s -> 1.18 M/s   (was 2.1x behind redb, now 1.14x)
+    point_get 64 KiB   1.11 M/s -> 1.70 M/s  (was 1.8x behind redb, now 1.19x)
+    scan_1000 4 KiB    9.7 M -> 10.2 M rows/s (#1, 2.5x over redb)
+    scan_1000 128 B    ~9.8 M rows/s          (#1, trading ±5% with redb)
+    point_get 128 B    ~2.2 M/s               (#1, unchanged)
+    durable_put rows   unchanged rankings
+
+What remains of the point_get gap is no longer parsing: it is per-page-read
+overhead on the descent — a mutex acquisition and a SipHash `HashMap` lookup
+per level in the page cache, and the same pair in the value cache — which is
+the next lever, already queued as such.
+
 ### Fixed: point reads answered on the connection task
 
 A point read against a warm cache is about a microsecond of engine work, and

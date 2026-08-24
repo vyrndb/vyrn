@@ -154,14 +154,26 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       equivalence-tested against `scan` in the model suite, merge fallback covered by the
       buffered engine. scan_1000 4 KiB 9.6–9.7M rows/s (#1, 2.3× redb), 128 B ~9.9M (#1 by a
       nose, trading ±5% with redb's guards run to run).
-- [ ] **The remaining contested rows share one fix: slot-directory pages.** The ~100 ns/row scan
-      floor and the point_get 4 KiB/64 KiB losses to redb's mmap guards are both the per-cell
-      parse of variable-length cells: a page format with a fixed-width cell-offset directory
-      gives leaf lookups binary search and scans branchless emission. Format-version bump —
-      design it, don't bolt it on. Also still open: batch_put vs redb ~1.2x (per-op allocation
-      diet: change-record staging and WAL encode each clone every value), durable_put 64 KiB vs
-      flushed sled ~1.15x (consistent but fsync-noise adjacent; confirm on Linux first), and the
-      page cache's per-level mutex on the descent.
+- [x] **PERF round 8 (slot-directory pages, format v5)** — a u16 cell-offset directory at the
+      page tail, purely additive over v4 (cells identical, sequential readers unchanged, v4 pages
+      readable forever and converted on rewrite, CRC covers the directory for free). Leaf lookups
+      and internal descents binary-search; scans enter their first leaf by binary search, read
+      only the fields a row needs, and stopped calling `decode_internal` (a NodeRef alloc per
+      child + a leftmost-spine walk per internal page). Found real data loss: `prepare_delete`
+      kept only the first replacement — a delete could never split before, now it can (packed
+      legacy leaf + slot bytes), and the new test fails against the old code. Forged-directory
+      test mutation-verified. Harness: point_get 4 KiB 624K → 1.18M (2.1× behind redb → 1.14×),
+      64 KiB 1.11M → 1.70M (1.8× → 1.19×), scan_1000 4 KiB 10.2M rows/s (#1 by 2.5×), everything
+      else held. Write-up in docs/benchmarks.md.
+- [ ] **The remaining contested rows.** point_get 4 KiB/64 KiB (1.14×/1.19× behind redb): the
+      parse is gone; what's left is per-page-read overhead on the descent — the page cache's
+      mutex + SipHash HashMap lookup per level, and the value cache's same pair (a dependency-free
+      fast u64 hasher is the cheap first step, a sharded or lock-free read path the bigger one).
+      batch_put vs redb ~1.2x (per-op allocation diet: change-record staging and WAL encode each
+      clone every value). durable_put 64 KiB vs flushed sled ~1.15x (consistent but fsync-noise
+      adjacent; confirm on Linux first). scan 128 B sits at ~9.8M rows/s, #1 but short of the 20M
+      aspiration — remaining cost is per-row emit (bounds-checked field reads + visitor call),
+      not allocation; diminishing returns until the point_get levers land.
 
 ## ⬜ Queued
 
