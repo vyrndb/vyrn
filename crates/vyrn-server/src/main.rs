@@ -1,8 +1,10 @@
+mod audit;
+mod auth;
 mod replica;
 mod replication;
 
 use anyhow::{bail, Context, Result};
-use argon2::{password_hash::PasswordHashString, Argon2, PasswordVerifier};
+use argon2::password_hash::PasswordHashString;
 use clap::Parser;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -79,8 +81,20 @@ struct Args {
     data: PathBuf,
     #[arg(long, env = "VYRN_USERNAME", default_value = "vyrn")]
     username: String,
+    /// Single-credential mode: one Argon2id verifier for `--username`, with
+    /// every permission. Mutually exclusive with `--users-file`.
     #[arg(long, env = "VYRN_PASSWORD_HASH_FILE")]
-    password_hash_file: PathBuf,
+    password_hash_file: Option<PathBuf>,
+    /// Per-user accounts with prefix ACLs; see docs/security.md for the JSON
+    /// format. Re-checked on every authentication attempt, so edits (adding,
+    /// removing, or re-scoping a user) need no restart. Mutually exclusive
+    /// with `--password-hash-file`.
+    #[arg(long, env = "VYRN_USERS_FILE")]
+    users_file: Option<PathBuf>,
+    /// Append-only audit trail; unset disables it. Reads are included only
+    /// when `VYRN_AUDIT_READS=1`.
+    #[arg(long, env = "VYRN_AUDIT_LOG")]
+    audit_log: Option<PathBuf>,
     #[arg(long, env = "VYRN_DATABASE", default_value = "default")]
     database: String,
     #[arg(long, env = "VYRN_TLS_CERT_FILE", requires = "tls_key_file")]
@@ -1075,8 +1089,11 @@ struct ConnectionTransaction {
 
 struct ServerState {
     writes: mpsc::Sender<WriteRequest>,
-    username: String,
-    password_hash: PasswordHashString,
+    /// The credential store — one shared verifier or the users file — and the
+    /// permission sets sessions are checked against.
+    auth: Arc<auth::Authenticator>,
+    /// The audit trail, absent unless `VYRN_AUDIT_LOG` is set.
+    audit: Option<audit::AuditLog>,
     database: String,
     auth_limit: Arc<Semaphore>,
     /// Per-address failed-authentication throttle; see [`AuthThrottle`].
@@ -1144,7 +1161,31 @@ async fn main() -> Result<()> {
         bail!("TLS certificate and key are required unless --allow-plaintext is explicit");
     }
 
-    let password_hash = load_password_hash(&args.password_hash_file)?;
+    /* Exactly one credential store. Both set is refused rather than picking a
+     * winner: the two modes disagree about who can do what, and a server that
+     * silently ignored one file would enforce a policy nobody wrote down. */
+    let authenticator = match (&args.password_hash_file, &args.users_file) {
+        (Some(_), Some(_)) => bail!(
+            "VYRN_PASSWORD_HASH_FILE and VYRN_USERS_FILE are both set; choose the \
+             single-credential mode or the users file, not both"
+        ),
+        (Some(hash_path), None) => {
+            auth::Authenticator::single(args.username.clone(), load_password_hash(hash_path)?)
+        }
+        (None, Some(users_path)) => auth::Authenticator::users(users_path.clone())?,
+        (None, None) => bail!(
+            "set VYRN_PASSWORD_HASH_FILE (single credential) or VYRN_USERS_FILE \
+             (per-user accounts)"
+        ),
+    };
+    // Failing startup rather than serving without the trail the operator
+    // asked for; ongoing write failures degrade gracefully instead (see
+    // `audit.rs`).
+    let audit_log = args
+        .audit_log
+        .as_deref()
+        .map(audit::AuditLog::open)
+        .transpose()?;
     let tls_acceptor = match (&args.tls_cert_file, &args.tls_key_file) {
         (Some(certificate), Some(key)) => Some(load_tls(certificate, key)?),
         (None, None) => None,
@@ -1357,8 +1398,8 @@ async fn main() -> Result<()> {
     );
     let state = Arc::new(ServerState {
         writes: write_sender,
-        username: args.username,
-        password_hash,
+        auth: Arc::new(authenticator),
+        audit: audit_log,
         database: args.database,
         auth_limit: Arc::new(Semaphore::new(args.max_auth_jobs)),
         auth_throttle: Arc::new(AuthThrottle::new()),
@@ -1637,8 +1678,8 @@ async fn handle_connection(
      * refusing after the hash would leave the expensive work reachable by an
      * unauthenticated peer, which is what the throttle exists to prevent. */
     let locked_out = state.auth_throttle.is_locked_out(peer);
-    let authenticated = if locked_out {
-        false
+    let outcome = if locked_out {
+        auth::AuthOutcome::Refused { known_user: None }
     } else {
         match first.message {
             Message::Authenticate {
@@ -1647,23 +1688,40 @@ async fn handle_connection(
                 database,
             } if password.len() <= 4096 => {
                 let permit = Arc::clone(&state.auth_limit).acquire_owned().await?;
-                let expected_username = state.username.clone();
                 let expected_database = state.database.clone();
-                let password_hash = state.password_hash.clone();
+                let authenticator = Arc::clone(&state.auth);
                 task::spawn_blocking(move || {
                     let _permit = permit;
-                    let verified = Argon2::default()
-                        .verify_password(password.as_bytes(), &password_hash.password_hash())
-                        .is_ok();
-                    verified && username == expected_username && database == expected_database
+                    match authenticator.authenticate(&username, &password) {
+                        outcome if database == expected_database => outcome,
+                        // A wrong database is refused identically to a wrong
+                        // credential, after paying for the same verification.
+                        auth::AuthOutcome::Granted(session) => auth::AuthOutcome::Refused {
+                            known_user: Some(session.user),
+                        },
+                        refused => refused,
+                    }
                 })
                 .await
                 .context("authentication worker failed")?
             }
-            _ => false,
+            _ => auth::AuthOutcome::Refused { known_user: None },
         }
     };
-    if !authenticated {
+    let session = match outcome {
+        auth::AuthOutcome::Granted(session) => Some(session),
+        auth::AuthOutcome::Refused { known_user } => {
+            /* The audit trail names the account only when the attempt named a
+             * real one: an unknown "username" is as likely a mistyped
+             * password, and the trail must never store credentials. */
+            if let Some(audit) = &state.audit {
+                let outcome = if locked_out { "throttled" } else { "rejected" };
+                audit.auth(outcome, known_user.as_deref().unwrap_or("unknown"), &peer);
+            }
+            None
+        }
+    };
+    if session.is_none() {
         /* Counted before the response is written, so a rejection is recorded even
          * if the peer has already gone away and the write fails. */
         state
@@ -1703,9 +1761,13 @@ async fn handle_connection(
         .await?;
         return Ok(());
     }
+    let session = session.expect("refusals returned above");
     state.auth_throttle.record_success(peer);
     // DEBUG: one record per successful connection is per-request-shaped volume.
     log_debug!("vyrnd.auth", "authenticated", peer = peer);
+    if let Some(audit) = &state.audit {
+        audit.auth("success", &session.user, &peer);
+    }
     send_frame(
         &mut framed,
         Envelope::new(first.request_id, Message::Authenticated),
@@ -1735,11 +1797,11 @@ async fn handle_connection(
      * error, failed write, or an early `return` some later edit adds inside the
      * loop — pass through it.
      */
-    let session = run_session(framed, Arc::clone(&state), &mut transaction).await;
+    let served = run_session(framed, Arc::clone(&state), session, &mut transaction).await;
     if let Some(transaction) = transaction {
         release_transaction_snapshot(&state, transaction.sequence).await;
     }
-    session
+    served
 }
 
 /// Serves authenticated requests until the connection ends.
@@ -1750,6 +1812,7 @@ async fn handle_connection(
 async fn run_session(
     mut framed: Framed<BoxedTransport, VyrnCodec>,
     state: Arc<ServerState>,
+    mut session: auth::SessionAuth,
     transaction: &mut Option<ConnectionTransaction>,
 ) -> Result<()> {
     let mut connection_error = None;
@@ -1801,6 +1864,61 @@ async fn run_session(
             .await?;
             continue;
         }
+        /* THE AUTHORIZATION CHOKE POINT. Every decoded request — plain
+         * operations, each statement inside a transaction, subscriptions, the
+         * replica handshake — passes here before it is dispatched, so
+         * enforcement lives in exactly one place. Two checks, in order:
+         *
+         * 1. The session is still current. A users-file reload bumps a
+         *    generation; a stale session re-reads its permissions, and a user
+         *    removed from the file is terminated on this, their next
+         *    operation — revocation without a restart.
+         * 2. The session's grants cover this request. A refusal is its own
+         *    error shape, distinct from AuthenticationFailed: the credential
+         *    is fine, the operation is not allowed. */
+        if let auth::Refresh::Revoked = state.auth.refresh(&mut session) {
+            if let Some(audit) = &state.audit {
+                audit.auth("revoked", &session.user, &"-");
+            }
+            send_error(
+                &mut framed,
+                request_id,
+                ErrorCode::AuthenticationFailed,
+                "user is no longer authorized; session terminated",
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut intent = match auth::authorize(
+            &session.permissions,
+            &request.message,
+            state.audit.is_some(),
+        ) {
+            Ok(intent) => intent,
+            Err(denial) => {
+                state.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .failed_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(audit) = &state.audit {
+                    audit.denied(&session.user, denial.op, &denial.scope);
+                }
+                feed_frame(
+                    &mut framed,
+                    Envelope::new(
+                        request_id,
+                        server_error(
+                            ErrorCode::InvalidRequest,
+                            &format!("permission denied for {} on {}", denial.op, denial.scope),
+                        ),
+                    ),
+                )
+                .await?;
+                unflushed += 1;
+                continue;
+            }
+        };
         let response = match request.message {
             /* A replica converts its authenticated connection into a replication
              * stream. Placed before the ordinary request arms because from here
@@ -1956,6 +2074,7 @@ async fn run_session(
                     framed
                         .send(Envelope::new(request_id, Message::Subscribed))
                         .await?;
+                    record_audit(&state, &session, &mut intent, "ok");
                     stream_changes(&mut framed, state.changes.subscribe(), prefix).await?;
                     return Ok(());
                 }
@@ -1972,6 +2091,7 @@ async fn run_session(
                             framed
                                 .send(Envelope::new(request_id, Message::Subscribed))
                                 .await?;
+                            record_audit(&state, &session, &mut intent, "ok");
                             stream_from_cursor(
                                 &mut framed,
                                 &state,
@@ -1991,6 +2111,7 @@ async fn run_session(
                         framed
                             .send(Envelope::new(request_id, Message::CollectionSubscribed))
                             .await?;
+                        record_audit(&state, &session, &mut intent, "ok");
                         stream_from_cursor(
                             &mut framed,
                             &state,
@@ -2009,6 +2130,7 @@ async fn run_session(
                         framed
                             .send(Envelope::new(request_id, Message::CollectionSubscribed))
                             .await?;
+                        record_audit(&state, &session, &mut intent, "ok");
                         stream_document_changes(
                             &mut framed,
                             state.changes.subscribe(),
@@ -2070,6 +2192,13 @@ async fn run_session(
                 }
             }
         };
+        if intent.is_some() {
+            let result = match &response {
+                Message::Error { code, .. } => format!("error:{code:?}"),
+                _ => "ok".to_owned(),
+            };
+            record_audit(&state, &session, &mut intent, &result);
+        }
         feed_frame(&mut framed, Envelope::new(request_id, response)).await?;
         unflushed += 1;
         /* One non-blocking poll of the stream: decodes a frame the read
@@ -2097,6 +2226,20 @@ async fn run_session(
     match connection_error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// Writes one audit line for a permitted operation, consuming the intent so a
+/// request is recorded exactly once. A no-op without an audit log — the intent
+/// is only built when one is configured.
+fn record_audit(
+    state: &ServerState,
+    session: &auth::SessionAuth,
+    intent: &mut Option<auth::Intent>,
+    result: &str,
+) {
+    if let (Some(audit), Some(intent)) = (&state.audit, intent.take()) {
+        audit.operation(&session.user, &intent, result);
     }
 }
 

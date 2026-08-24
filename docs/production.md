@@ -12,7 +12,7 @@ Use it only when:
 - the data directory is on local persistent storage, not an ephemeral container layer;
 - `durable` mode is used for authoritative records; `async` is limited to reconstructable realtime state and its bounded loss window is accepted;
 - monitoring alerts on readiness, failed requests, disk space, backup age, and write-batch efficiency;
-- the security model in `docs/security.md` matches the deployment's requirements (single shared credential, no ACLs, no audit trail — read it before assuming otherwise), and the upgrade rules in `docs/compatibility.md` are followed (replicas upgrade before primaries; downgrade is unsupported).
+- the security model in `docs/security.md` matches the deployment's requirements (prefix-granularity ACLs at best, a best-effort audit trail, no encryption at rest — read it before assuming otherwise), and the upgrade rules in `docs/compatibility.md` are followed (replicas upgrade before primaries; downgrade is unsupported).
 
 Current observed WSL2/Linux baseline in `durable` mode with 16 persistent clients and 128-byte values, measured 2026-07-27: approximately 83k snapshot reads/s (p50 0.19 ms, p99 0.33 ms), 5.7k durable writes/s (p50 2.8 ms, p99 4.7 ms), 13.8k ops/s in a 70/30 durable mix (p50 0.30 ms, p99 5.3 ms), 50k index lookups/s, and 2.6k four-key transactions/s. See `docs/benchmarks.md` for the full matrix. The async-mode and commit-to-subscription figures previously quoted here were not re-measured and have been removed rather than carried forward stale.
 
@@ -27,7 +27,17 @@ These are development-machine measurements, not deployment guarantees; benchmark
 
 - Run one `vyrnd` process per data directory.
 - Mount `/var/lib/vyrn` on persistent storage.
-- Mount the TLS key and Argon2id verifier as read-only secrets.
+- Mount the TLS key and the credential store — the Argon2id verifier
+  (`VYRN_PASSWORD_HASH_FILE`), or the users file (`VYRN_USERS_FILE`) for
+  per-user accounts with prefix ACLs — as secrets. Keep the users file
+  writable by the operator only: it is re-read on every authentication
+  attempt, which is what makes adding, removing, or re-scoping a user a
+  file edit instead of a restart. The two stores are mutually exclusive;
+  setting both refuses startup.
+- Set `VYRN_AUDIT_LOG` if you need a who-did-what trail, and ship it
+  off-host; it is append-only, best-effort, and never blocks writes (see
+  `docs/security.md` for exactly what that means). `VYRN_AUDIT_READS=1`
+  adds reads, at the cost of one line per read.
 - Expose port 7432 only to application networks.
 - Keep port 7433 on loopback or a private monitoring network.
 - Stop routing traffic when `/health/ready` returns 503.
@@ -79,7 +89,14 @@ Offline backups bound loss to the backup interval. Add continuous archiving to s
 7. Start `vyrnd` against the recovered directory with a **new, empty** `VYRN_WAL_ARCHIVE_DIR`. The recovered database is a new timeline, and archiving it into the old directory would poison the only copy of the old history.
 8. Smoke-test reads of known keys before restoring traffic.
 
-**Windows caveat:** `sync_directory` is a no-op on non-Unix platforms, so archive-directory durability (the rename publishing a copied segment or the index) is not certified on Windows. Windows remains a development-only platform; run archiving in production on Linux ext4/XFS only.
+**Windows directory durability:** `sync_directory` performs a real flush on
+Windows now — the directory is opened with backup semantics and
+`FlushFileBuffers` covers the rename publishing a manifest, an archive
+segment, or a backup, and a failure is reported rather than swallowed (it
+was a silent no-op before). Linux remains the primary production platform:
+the crash soak and power-loss evidence exist there, and Windows durability
+claims should be treated as implemented-and-tested rather than
+soak-certified until an equivalent Windows soak has run.
 
 **Windows caveat, concurrent writes:** on Windows, `FlushFileBuffers` serializes against `WriteFile` on the same file, and `vyrnd`'s write worker appends WAL records eagerly under the engine lock while the flush stage syncs — so group commit degrades toward one commit per fsync there. Linux is unaffected (the production platform). The embedded engine offers the convoy-free shape (`DurabilityMode::Async` + `drain_wal`); teaching the server's flush stage the same split is queued.
 
@@ -154,11 +171,16 @@ The same accounting makes the ceiling scale with the size of a *batch* rather th
 
 Plan around it by keeping values a few kilobytes below 16 MiB, and by keeping the total payload of a single batch under that too. Raising the constant is not the fix — the WAL validator independently enforces the same bound during replay, so a commit that succeeded would fail its own recovery. The fix is to split the change record across several keys, which changes cursor semantics and is tracked in `todo.md`; `crates/vyrn-core/tests/change_log.rs` carries both failing cases as `#[ignore]`d tests, runnable with `--ignored`.
 
-### One shared credential, and no audit trail
+### Access control is prefix-granular, and the audit trail is best-effort
 
-The server authenticates a single username and password against one Argon2id verifier. There are no per-principal accounts, no per-key or per-collection authorization, no revocation short of rotating the one credential and restarting, and no record of which client did what — the log records that authentication failed and from which address, never who succeeded at what.
+Per-user accounts exist (`VYRN_USERS_FILE`: per-user Argon2id verifiers, prefix ACLs with `read`/`write`/`admin`, revocation by editing the file — no restart), and `VYRN_AUDIT_LOG` records who did what. Their limits are what to plan around:
 
-Consequences to plan for: every application sharing a database shares one identity, so a leak anywhere is a leak everywhere and rotation is a coordinated restart of every client. Repeated authentication failures from one address are rate-limited (`vyrn_auth_failures_total`, plus a lockout), but the gateway's own bearer token has no equivalent throttle. Treat network reachability as the real access control: keep port 7432 on application networks only and the admin listener on loopback or a private monitoring network.
+- ACLs stop at key prefixes: no per-key or attribute-level control, and global secondary indexes require whole-keyspace grants because a lookup can return keys from anywhere. Scope applications by prefix, and prefer document collections (whose indexes are collection-scoped) for prefix-scoped users.
+- The audit trail never blocks a commit and is never fsynced: an audit write failure is reported to stderr and the server keeps serving, so the trail can have holes exactly when the disk is in trouble. It records keys and outcomes, never values or credentials.
+- The single-credential mode (`VYRN_PASSWORD_HASH_FILE`) still exists and is all-powerful. A deployment that stays on it keeps the old consequences: every application shares one identity, a leak anywhere is a leak everywhere, and rotation is a coordinated restart of every client.
+- Revocation takes effect at the next authentication attempt (which reloads the file) and, for live sessions, at their next operation. An idle server with no new connections does not re-read the file.
+
+Repeated authentication failures from one address are rate-limited (`vyrn_auth_failures_total`, plus a lockout), but the gateway's own bearer token has no equivalent throttle. Network reachability is still the outer wall: keep port 7432 on application networks only and the admin listener on loopback or a private monitoring network.
 
 ### Windows directory durability is unproven
 
