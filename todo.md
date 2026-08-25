@@ -19,6 +19,26 @@
 
 ## 🎯 Beat single-node ScyllaDB (served path) — measurement first
 
+**Stage-split measured locally (2026-08-25, post-1.1.1, Windows release, c64)**: 20.7K durable
+writes/s served. Budget per request: front 981µs (== previous batch's APPLY + the 200µs
+accumulate window — the flush stage DOES overlap, capped by the deadline), apply 25µs, sync
+26µs, publish 24µs, lock 3.5µs. Batches underfill (23/64 — lockstep clients self-limit; c256
+would fill them). THE CEILING IS APPLY-SERIAL: one engine write lock ⇒ batches/s =
+1/(apply+accumulate) ≈ 29K/s here; Linux apply is cheaper (engine CPU ~7µs/op measured) ⇒
+expect ~40-70K at c256 with full batches on the sandbox — RETEST FIRST with the fixed harness.
+
+**To 100K+ served writes: internal sharding, the designed v1 contract**: `--shards N` opt-in;
+N engines over N subdirs, each with its own lock/WAL/group-commit/write-worker. Routing:
+plain put/get/delete/scan by key hash (scans = N-way ordered merge, scatter-gather); document
+collections hash BY COLLECTION (a collection lives wholly on one shard ⇒ full document+index
+semantics within it); multi-key write_batch/transactions spanning shards REFUSED with a clear
+error (single-shard ones work); global (non-collection) index DDL refused in sharded mode;
+subscriptions ordered per shard (document); replication/failover with --shards>1 REFUSED at
+startup in v1 (per-shard clusters are a v2 design). 4 shards × ~29K measured ≈ 116K before any
+tuning; with full batches and Linux apply, several×. Design pass before code, per house rule.
+Interim tuning knobs that exist today: VYRN_WRITE_BATCH_SIZE (default 64) and
+VYRN_WRITE_BATCH_DELAY_US (200) — raise size at high concurrency.
+
 **First sandbox results (2026-08-25)**: reads at low concurrency vyrn WINS (83K vs 75K @c16;
 p50 68µs vs Scylla's 1,845µs at c256 — latency is ours everywhere). Writes: Scylla 67K vs 357/s
 shipped — diagnosed as the CHECKPOINT STALL (full-tree compaction under the engine write lock);
