@@ -12,7 +12,7 @@ log from the last checkpoint; an exhaustive bit-flip suite asserts that any
 single-bit change to a committed record either fails the open loudly or
 leaves every acknowledged write readable.
 
-Version 1.1.0. Formats are frozen per [docs/compatibility.md](docs/compatibility.md):
+Version 1.1.1. Formats are frozen per [docs/compatibility.md](docs/compatibility.md):
 every 1.x build reads what any earlier build wrote, downgrade is
 unsupported, replicas upgrade before primaries.
 

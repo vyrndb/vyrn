@@ -19,6 +19,18 @@
 
 ## 🎯 Beat single-node ScyllaDB (served path) — measurement first
 
+**First sandbox results (2026-08-25)**: reads at low concurrency vyrn WINS (83K vs 75K @c16;
+p50 68µs vs Scylla's 1,845µs at c256 — latency is ours everywhere). Writes: Scylla 67K vs 357/s
+shipped — diagnosed as the CHECKPOINT STALL (full-tree compaction under the engine write lock);
+with checkpoints deferred: 67K vs 9.6K (~7×). FIXED in 1.1.1: three-phase checkpoint
+(snapshot → unlocked compact → brief delta-replay finish), mutation-verified. Harness
+connect-clock bug fixed (billed serialized Argon2 setup to the workload — vyrn's c256 numbers
+were understated). RETEST on the sandbox. The remaining ~7× at high write concurrency is the
+single engine write lock vs shard-per-core: next levers in order — (1) remeasure post-fix,
+(2) stage-split the served write path with the vyrn_commit_* counters to find the non-fsync
+overhead, (3) if the lock is confirmed dominant: internal sharding (N engines by key range),
+designed not bolted.
+
 bench/served-compare (standalone crate, own stable toolchain — the scylla driver needs >1.87):
 vyrnd vs single-node Scylla, matched durability (the harness REFUSES Scylla in its default
 periodic commitlog mode — the 10s loss window is the sled-async trick again), p50/p99 +

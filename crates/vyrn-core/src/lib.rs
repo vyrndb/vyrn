@@ -880,6 +880,12 @@ impl ReadEngine {
 pub struct Engine {
     path: PathBuf,
     tree: PageTree,
+    /// The files `tree` is actually open on. Checkpoint snapshots read these
+    /// rather than deriving names from the generation counter: after a
+    /// checkpoint that failed post-publish, the counter names a generation
+    /// the engine never adopted, and a snapshot pointed there validates a
+    /// root against the wrong file.
+    tree_paths: (PathBuf, PathBuf),
     /// Committed mutations the tree has not absorbed yet; `None` when
     /// write-back is disabled and every commit rewrites the tree itself.
     /// Reads on this engine merge it over the tree — see [`overlay::Overlay`].
@@ -1086,6 +1092,7 @@ impl Engine {
         Ok(Self {
             path: path.to_owned(),
             tree,
+            tree_paths: (page_path.clone(), value_path.clone()),
             // Recovery replayed the WAL into the tree itself, so the buffer
             // always starts empty: the tree is the whole state at open.
             write_back: (options.write_back_buffer > 0)
@@ -2940,15 +2947,31 @@ impl Engine {
         Arc::clone(&self.wal)
     }
 
+    /// The composed checkpoint, for embedded callers and every existing
+    /// test: identical behavior to running the three phases back to back.
+    /// A server must NOT call this under its engine lock — the compact
+    /// phase rewrites the whole tree, which is the longest thing this
+    /// process does, and holding the write lock across it stalls every
+    /// writer for seconds (measured: it collapsed a served write benchmark
+    /// from thousands of ops/s to hundreds). Use
+    /// [`Engine::begin_checkpoint`], release the lock, run
+    /// [`CheckpointJob::compact`], then re-lock for
+    /// [`Engine::finish_checkpoint`].
     pub fn checkpoint(&mut self) -> Result<()> {
+        let mut job = self.begin_checkpoint()?;
+        job.compact()?;
+        self.finish_checkpoint(job)
+    }
+
+    /// Phase one, under the engine lock and brief: makes every commit
+    /// reachable by the compactor (drains async-buffered WAL records — the
+    /// delta replay reads the WAL, so buffered records must be in the file)
+    /// and snapshots the root the compactor will read. The write-back
+    /// buffer is deliberately NOT flushed: its commits are WAL records, and
+    /// the delta replay delivers them to the compacted tree.
+    pub fn begin_checkpoint(&mut self) -> Result<CheckpointJob> {
         self.ensure_healthy()?;
         self.sync()?;
-        // The tree absorbs the write-back buffer before anything below reads
-        // or copies it: the manifest this checkpoint publishes must name a
-        // root that holds every commit, because segment cleanup then deletes
-        // the WAL records that were those commits' only other copy.
-        self.flush_write_back()?;
-        self.tree.validate()?;
         // The next generation is derived from the published manifest rather than
         // read back from this counter alone. Both belt and braces, because each
         // guards a different failure:
@@ -3006,11 +3029,81 @@ impl Engine {
         let _ = fs::remove_file(&published_revisions);
         let _ = fs::remove_file(&temporary_revision_values);
         let _ = fs::remove_file(&published_revision_values);
-        let (root, len) = self.tree.compact_to(&temporary, &temporary_values)?;
-        let mut compacted_values = value_log::ValueLog::open(&temporary_revision_values)?;
+        // Which LSN the snapshot root reflects. In write-back mode the tree
+        // lags the WAL by design — it only changes at absorbs — so replay
+        // resumes from the absorb watermark; a classic tree reflects every
+        // commit. Replay is idempotent (recovery relies on that), so a
+        // conservative watermark is safe, merely slower.
+        let snapshot_lsn = if self.write_back.is_some() {
+            self.write_back_absorbed
+        } else {
+            self.last_lsn
+        };
+        Ok(CheckpointJob {
+            data_path: self.path.clone(),
+            source_pages: self.tree_paths.0.clone(),
+            source_values: self.tree_paths.1.clone(),
+            snapshot_root: self.tree.root_id(),
+            snapshot_len: self.tree.len(),
+            snapshot_lsn,
+            generation,
+            temporary,
+            published,
+            old,
+            temporary_values,
+            published_values,
+            old_values,
+            temporary_revisions,
+            published_revisions,
+            old_revisions,
+            temporary_revision_values,
+            published_revision_values,
+            old_revision_values,
+            compacted: None,
+        })
+    }
+
+    /// Phase three, under the engine lock and bounded by the write rate
+    /// during the compact phase: replays the WAL tail the compactor had not
+    /// yet seen onto the compacted tree, then publishes and adopts it — the
+    /// same commit point, the same failure semantics, the same janitorial
+    /// tail the one-piece checkpoint had.
+    pub fn finish_checkpoint(&mut self, mut job: CheckpointJob) -> Result<()> {
+        self.ensure_healthy()?;
+        // The tail records must be readable from the segment files; in async
+        // mode they may still sit in the in-memory buffer.
+        self.drain_pending_wal()?;
+        let (mut tree, reached) = job
+            .compacted
+            .take()
+            .ok_or_else(|| Error::Io(io::Error::other("finish_checkpoint before compact")))?;
+        replay_wal_span(&mut tree, &self.path.join("wal"), reached, u64::MAX)?;
+        tree.sync()?;
+        let (root, len) = (tree.root_id(), tree.len());
+        // Closed before the renames: Windows will not rename over an open
+        // file, and the adoption below re-opens the published names exactly
+        // as the one-piece checkpoint always did.
+        drop(tree);
+        let mut compacted_values = value_log::ValueLog::open(&job.temporary_revision_values)?;
         let compacted_mvcc = mvcc::compact(&self.mvcc, &self.mvcc_values, &mut compacted_values)?;
         compacted_values.sync()?;
-        mvcc::write(&temporary_revisions, &compacted_mvcc)?;
+        mvcc::write(&job.temporary_revisions, &compacted_mvcc)?;
+        let generation = job.generation;
+        let CheckpointJob {
+            temporary,
+            published,
+            old,
+            temporary_values,
+            published_values,
+            old_values,
+            temporary_revisions,
+            published_revisions,
+            old_revisions,
+            temporary_revision_values,
+            published_revision_values,
+            old_revision_values,
+            ..
+        } = job;
         fs::rename(&temporary, &published)?;
         fs::rename(&temporary_values, &published_values)?;
         fs::rename(&temporary_revisions, &published_revisions)?;
@@ -3038,9 +3131,19 @@ impl Engine {
         // because the retirement below never runs, and the engine keeps serving
         // from its current tree. The next checkpoint simply tries again.
         self.tree = PageTree::open(&published, &published_values, root, len)?;
-        self.tree.validate()?;
+        self.tree_paths = (published.clone(), published_values.clone());
+        // Validated by the compactor before publish (unlocked); the adoption
+        // re-opens the very files it validated, so only the root check
+        // inside `open` repeats here.
         self.mvcc_values = value_log::ValueLog::open(&published_revision_values)?;
         self.mvcc = compacted_mvcc;
+        // Every buffered commit at or below the manifest's LSN was delivered
+        // to the compacted tree by the WAL replay; the buffer restarts empty
+        // and readers evict by this watermark.
+        if let Some(buffer) = &mut self.write_back {
+            buffer.clear();
+        }
+        self.write_back_absorbed = self.last_lsn;
         self.inject(FailurePoint::AfterTreeAdoption)?;
         self.rotate_segment()?;
         let wal_directory = self.path.join("wal");
@@ -4104,6 +4207,139 @@ pub fn manifest_lsn(path: impl AsRef<Path>) -> Result<u64> {
         None => Err(Error::CorruptManifest(
             "database has no CURRENT manifest".into(),
         )),
+    }
+}
+
+/// A checkpoint between its brief locked phases: everything the compactor
+/// needs to rewrite the tree WITHOUT the engine lock. The copy-on-write
+/// pages reachable from the snapshot root are immutable, so reading them
+/// beside a live writer is exactly what every read handle already does.
+pub struct CheckpointJob {
+    data_path: PathBuf,
+    source_pages: PathBuf,
+    source_values: PathBuf,
+    snapshot_root: u64,
+    snapshot_len: u64,
+    snapshot_lsn: u64,
+    generation: u64,
+    temporary: PathBuf,
+    published: PathBuf,
+    old: PathBuf,
+    temporary_values: PathBuf,
+    published_values: PathBuf,
+    old_values: PathBuf,
+    temporary_revisions: PathBuf,
+    published_revisions: PathBuf,
+    old_revisions: PathBuf,
+    temporary_revision_values: PathBuf,
+    published_revision_values: PathBuf,
+    old_revision_values: PathBuf,
+    /// The compacted tree and the LSN through which it has been caught up,
+    /// set by [`CheckpointJob::compact`].
+    compacted: Option<(PageTree, u64)>,
+}
+
+impl CheckpointJob {
+    /// Phase two, WITHOUT the engine lock: the O(database) work. Validates
+    /// the snapshot, rewrites it into the new generation's files, validates
+    /// the result, and catches up from the WAL as far as it can — so the
+    /// locked finish replays only what committed while this ran.
+    pub fn compact(&mut self) -> Result<()> {
+        let source = PageTree::open(
+            &self.source_pages,
+            &self.source_values,
+            self.snapshot_root,
+            self.snapshot_len,
+        )?;
+        source.validate()?;
+        let (root, len) = source.compact_to(&self.temporary, &self.temporary_values)?;
+        drop(source);
+        let mut tree = PageTree::open(&self.temporary, &self.temporary_values, root, len)?;
+        tree.validate()?;
+        let reached = replay_wal_span(
+            &mut tree,
+            &self.data_path.join("wal"),
+            self.snapshot_lsn,
+            u64::MAX,
+        )?;
+        self.compacted = Some((tree, reached.max(self.snapshot_lsn)));
+        Ok(())
+    }
+
+    /// Removes the temporary files of an abandoned job. Harmless after a
+    /// successful finish (the temporaries were renamed away).
+    pub fn abandon(mut self) {
+        self.compacted = None;
+        for path in [
+            &self.temporary,
+            &self.temporary_values,
+            &self.temporary_revisions,
+            &self.temporary_revision_values,
+        ] {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Replays committed WAL records with LSNs in `(after, until]` onto `tree`,
+/// with exactly the redo rules recovery uses — including the tombstone
+/// bookkeeping, which rides only page mutations and must be re-derived (see
+/// the redo loop in `rebuild_tree`). Returns the highest LSN applied.
+/// Idempotent over overlap, as every replay in this engine must be.
+fn replay_wal_span(
+    tree: &mut PageTree,
+    wal_directory: &Path,
+    after: u64,
+    until: u64,
+) -> Result<u64> {
+    const BATCH_RECORDS: usize = 1_024;
+    const BATCH_BYTES: usize = 32 * 1024 * 1024;
+    let mut reached = after;
+    loop {
+        let records = replication::archived_records_from(
+            wal_directory,
+            reached.saturating_add(1),
+            BATCH_RECORDS,
+            BATCH_BYTES,
+        )?;
+        if records.is_empty() {
+            return Ok(reached);
+        }
+        for record in &records {
+            let header = replication::verify_record(record).map_err(|error| {
+                Error::Io(io::Error::other(format!(
+                    "checkpoint replay met an invalid WAL record: {error}"
+                )))
+            })?;
+            let lsn = header.lsn;
+            if lsn <= reached {
+                continue;
+            }
+            if lsn > until {
+                return Ok(reached);
+            }
+            let payload =
+                &record[RECORD_HEADER_LEN..RECORD_HEADER_LEN + header.payload_len as usize];
+            for (op, key, value) in decode_operations(payload, header.operation_count as usize) {
+                if op == OP_PUT {
+                    let value = value.unwrap_or_default();
+                    let (root, len) = tree.prepare_put(&key, &value, lsn)?;
+                    tree.publish(root, len);
+                    if !key.starts_with(INTERNAL_PREFIX) {
+                        if let Some((root, len)) = tree.prepare_delete(&tombstone_key(&key))? {
+                            tree.publish(root, len);
+                        }
+                    }
+                } else if let Some((root, len)) = tree.prepare_delete(&key)? {
+                    tree.publish(root, len);
+                    if !key.starts_with(INTERNAL_PREFIX) {
+                        let (root, len) = tree.prepare_put(&tombstone_key(&key), &[], lsn)?;
+                        tree.publish(root, len);
+                    }
+                }
+            }
+            reached = lsn;
+        }
     }
 }
 

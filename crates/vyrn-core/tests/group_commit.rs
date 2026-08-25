@@ -116,3 +116,75 @@ fn a_data_directory_survives_a_directory_sync() {
     let engine = Engine::open(directory.path()).unwrap();
     assert_eq!(engine.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
 }
+
+/// The phased checkpoint's whole point: commits that land while the
+/// compactor runs WITHOUT the engine lock must survive the checkpoint —
+/// they reach the compacted tree through the WAL delta replay in
+/// `finish_checkpoint`, and losing them there would be silent data loss at
+/// exactly the moment the WAL segments holding them get retired. Exercised
+/// through the phase API the server uses; the composed `checkpoint()` is
+/// the degenerate case with an empty delta.
+#[test]
+fn writes_during_an_unlocked_compaction_survive_the_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open_with_options(
+        directory.path(),
+        EngineOptions {
+            durability: DurabilityMode::Durable,
+            write_back_buffer: 1 << 20,
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    for index in 0..500_u32 {
+        engine
+            .put(format!("pre/{index:05}").into_bytes(), vec![1; 64])
+            .unwrap();
+    }
+    let mut job = engine.begin_checkpoint().unwrap();
+    // The engine is fully writable between the phases — that is the point.
+    for index in 0..200_u32 {
+        engine
+            .put(format!("during/{index:05}").into_bytes(), vec![2; 64])
+            .unwrap();
+    }
+    engine.delete(b"pre/00000").unwrap();
+    job.compact().unwrap();
+    // And still writable between compact and finish.
+    engine
+        .put(b"after-compact".to_vec(), b"also-here".to_vec())
+        .unwrap();
+    engine.finish_checkpoint(job).unwrap();
+
+    let check = |engine: &Engine| {
+        assert_eq!(
+            engine.get(b"pre/00499").unwrap().as_deref(),
+            Some(&[1; 64][..])
+        );
+        assert_eq!(
+            engine.get(b"pre/00000").unwrap(),
+            None,
+            "the delete must hold"
+        );
+        for index in [0_u32, 137, 199] {
+            assert_eq!(
+                engine
+                    .get(format!("during/{index:05}").as_bytes().to_vec().as_slice())
+                    .unwrap()
+                    .as_deref(),
+                Some(&[2; 64][..]),
+                "a write during compaction vanished"
+            );
+        }
+        assert_eq!(
+            engine.get(b"after-compact").unwrap().as_deref(),
+            Some(&b"also-here"[..])
+        );
+    };
+    check(&engine);
+    // The checkpoint retired the WAL segments; the reopen must answer from
+    // the published generation alone.
+    drop(engine);
+    let engine = Engine::open(directory.path()).unwrap();
+    check(&engine);
+}

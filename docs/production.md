@@ -18,7 +18,7 @@ Current observed WSL2/Linux baseline in `durable` mode with 16 persistent client
 
 Two properties matter more than the averages when sizing a deployment:
 
-- **Write throughput does not scale with client count.** It saturates near 8.6k/s at 64 clients and is *lower* at 256 than at 64, because commits serialise through a single engine write lock. Offering more concurrent writers past that point buys latency, not throughput.
+- **Write throughput does not scale with client count.** Commits serialise through a single engine write lock, so past the group-commit sweet spot more concurrent writers buy latency, not throughput. (Checkpoints no longer stall writes for their duration — the compaction runs without the lock since 1.1.1 — but the per-commit serialisation stands.)
 - **The write tail is unresolved.** At 256 concurrent writers, p99 is roughly 200 ms and the maximum is several seconds, reproducibly. It is not yet established whether that originates in Vyrn or in this host's storage — a bare `fdatasync` on the same filesystem has itself been caught stalling 5.6 seconds. Do not put a latency SLO in front of concurrent durable writes until this is measured on the intended hardware.
 
 These are development-machine measurements, not deployment guarantees; benchmark the actual host and disk.

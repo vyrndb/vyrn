@@ -230,10 +230,17 @@ where
     F: Fn(u64, &mut Lcg) -> Op + Send + Sync + Copy + 'static,
 {
     let per_client = total_ops / clients as u64;
+    // Every client exists BEFORE the clock starts: connection setup includes
+    // an Argon2 handshake on the vyrn side and a free handle clone on the
+    // Scylla side, so timing it both serialized the vyrn setup and billed it
+    // to the workload — understating vyrn at high client counts.
+    let mut ready = Vec::new();
+    for _ in 0..clients {
+        ready.push(backend.client().await?);
+    }
     let started = Instant::now();
     let mut tasks = Vec::new();
-    for client_index in 0..clients {
-        let mut client = backend.client().await?;
+    for (client_index, mut client) in ready.into_iter().enumerate() {
         tasks.push(tokio::spawn(async move {
             let mut rng = Lcg(0xbeef ^ (client_index as u64) << 17);
             let mut latencies = Vec::with_capacity(per_client as usize);

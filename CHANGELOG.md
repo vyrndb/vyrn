@@ -4,6 +4,25 @@ All notable changes to Vyrn are documented here. From 1.0.0 the on-disk
 formats follow the contract in `docs/compatibility.md`: every 1.x build
 reads what any earlier build wrote, and downgrade is unsupported.
 
+## [1.1.1] - 2026-08-25
+
+### Fixed
+
+- **Checkpoints no longer stall writes for their duration.** A checkpoint
+  rewrote the whole tree under the engine write lock — seconds of total
+  write stall per checkpoint, measured collapsing served writes from
+  thousands of ops/s to hundreds. The compaction now runs from a
+  copy-on-write snapshot WITHOUT the lock (`begin_checkpoint` /
+  `CheckpointJob::compact` / `finish_checkpoint`; the server's maintenance
+  task uses the phases, the composed `checkpoint()` is unchanged for
+  embedded callers), and the brief locked finish replays only the WAL delta
+  that committed meanwhile. Writes landing mid-compaction are pinned by a
+  mutation-verified test through checkpoint, segment retirement, and
+  reopen.
+- The served-compare harness no longer bills serialized connection setup
+  (an Argon2 handshake per vyrn client, a free handle clone per Scylla
+  client) to the timed workload.
+
 ## [1.1.0] - 2026-08-25
 
 The "what it is not" release: four of the five 1.0 limitations fell.

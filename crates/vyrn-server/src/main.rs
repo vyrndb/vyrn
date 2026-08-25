@@ -3949,34 +3949,41 @@ fn start_mvcc_gc(
             // during the checkpoint schedule the next one instead of being lost.
             let due = checkpoint_due.swap(false, Ordering::AcqRel);
             let result = task::spawn_blocking(move || {
-                engine
-                    .write()
-                    .map_err(|_| StorageError::Poisoned)
-                    .and_then(|mut engine| {
-                        /* `collect_versions` reports a poisoned shared-snapshot
-                         * registry rather than collecting without consulting it,
-                         * so the failure propagates here and the loop below takes
-                         * readiness down. Swallowing it would collect past a live
-                         * transaction's snapshot, which is the one thing the
-                         * registry exists to prevent. */
-                        let collected = engine.collect_versions()?;
-                        /* Timed around the compaction alone, and reported below.
-                         * A checkpoint rewrites the whole tree, so it is the
-                         * longest thing this process does and the first suspect
-                         * when write latency spikes — and it left no trace at all:
-                         * `vyrn_checkpoints_total` is incremented where the
-                         * checkpoint is SCHEDULED, on the write path, not here
-                         * where it runs, so the counter could not even confirm one
-                         * had happened. */
-                        let compacted = if due || collected >= checkpoint_versions {
-                            let started = Instant::now();
-                            engine.checkpoint()?;
-                            Some(started.elapsed())
-                        } else {
-                            None
-                        };
-                        Ok((collected, compacted))
-                    })
+                /* THE LOCK IS NOT HELD ACROSS THE COMPACTION. A checkpoint
+                 * rewrites the whole tree — the longest thing this process
+                 * does — and holding the write lock across it stalled every
+                 * writer for its full duration (measured in the served
+                 * head-to-head: hundreds of ops/s where thousands run
+                 * between checkpoints). The three-phase split takes the lock
+                 * twice, briefly: snapshot, and delta-replay + publish. */
+                let job = {
+                    let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+                    /* `collect_versions` reports a poisoned shared-snapshot
+                     * registry rather than collecting without consulting it,
+                     * so the failure propagates here and the loop below takes
+                     * readiness down. Swallowing it would collect past a live
+                     * transaction's snapshot, which is the one thing the
+                     * registry exists to prevent. */
+                    let collected = engine.collect_versions()?;
+                    if !(due || collected >= checkpoint_versions) {
+                        return Ok::<(usize, Option<Duration>), StorageError>((collected, None));
+                    }
+                    (collected, engine.begin_checkpoint()?)
+                };
+                let (collected, mut job) = job;
+                let started = Instant::now();
+                if let Err(error) = job.compact() {
+                    job.abandon();
+                    return Err(error);
+                }
+                let finished = {
+                    let mut engine = engine.write().map_err(|_| StorageError::Poisoned)?;
+                    engine.finish_checkpoint(job)
+                };
+                match finished {
+                    Ok(()) => Ok((collected, Some(started.elapsed()))),
+                    Err(error) => Err(error),
+                }
             })
             .await;
             match &result {
