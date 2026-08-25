@@ -4382,6 +4382,13 @@ fn transaction_checksum(
     hasher.finalize()
 }
 
+/// The LSN a framed WAL record carries, for callers that hold verbatim
+/// record bytes (the replication stream, WAL catch-up) and need to know
+/// where they are without a full verify.
+pub fn read_wal_record_lsn(record: &[u8]) -> u64 {
+    read_u64(record, 5)
+}
+
 /// Whether a record header's version is one this build reads.
 pub(crate) fn record_version_known(header: &[u8]) -> bool {
     matches!(header[4], LEGACY_RECORD_VERSION | RECORD_VERSION)

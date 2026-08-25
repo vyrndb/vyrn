@@ -842,6 +842,24 @@ fn failover_trio(dir: &tempfile::TempDir) -> Vec<Node> {
     nodes
 }
 
+/// Dumps every member's captured stderr into the test's own output — a CI
+/// runner's tempdir vanishes with the panic, so a failing election must
+/// carry its diagnosis with it.
+fn dump_member_logs(dir: &tempfile::TempDir, names: &[&str]) {
+    for name in names {
+        let path = dir.path().join(name).join("stderr.log");
+        eprintln!("===== member {name} stderr =====");
+        match std::fs::read_to_string(&path) {
+            Ok(log) => {
+                for line in log.lines().rev().take(60).collect::<Vec<_>>().iter().rev() {
+                    eprintln!("{line}");
+                }
+            }
+            Err(error) => eprintln!("(unreadable: {error})"),
+        }
+    }
+}
+
 /// THE FAILOVER CLAIM, end to end: kill the primary and a follower elects
 /// itself within the timeout, serves writes, and holds every acknowledged
 /// pre-kill write — the safety argument in failover.rs, observed from
@@ -866,10 +884,10 @@ fn a_dead_primary_is_replaced_and_acknowledged_writes_survive() {
     // probes. The election itself is seconds on an idle host.
     let deadline = Instant::now() + Duration::from_secs(150);
     let leader = loop {
-        assert!(
-            Instant::now() < deadline,
-            "no member was elected primary after the kill"
-        );
+        if Instant::now() >= deadline {
+            dump_member_logs(&dir, &["a", "b", "c"]);
+            panic!("no member was elected primary after the kill");
+        }
         let elected: Vec<usize> = (1..3)
             .filter(|index| put(&nodes[*index].url(), "post/probe", "alive").is_ok())
             .collect();

@@ -2189,10 +2189,16 @@ async fn run_session(
                                 ))
                                 .await?;
                             send_primary_epoch(&mut framed, state.failover.as_deref()).await?;
+                            let resume = catch_up_from_wal(
+                                &mut framed,
+                                &state.wal_directory,
+                                oldest_available,
+                            )
+                            .await?;
                             stream_records(
                                 &mut framed,
                                 &state.replication,
-                                oldest_available,
+                                resume,
                                 &replica_id,
                                 state.failover.as_deref(),
                             )
@@ -2214,10 +2220,13 @@ async fn run_session(
                                 ))
                                 .await?;
                             send_primary_epoch(&mut framed, state.failover.as_deref()).await?;
+                            let resume =
+                                catch_up_from_wal(&mut framed, &state.wal_directory, first_lsn)
+                                    .await?;
                             stream_records(
                                 &mut framed,
                                 &state.replication,
-                                first_lsn,
+                                resume,
                                 &replica_id,
                                 state.failover.as_deref(),
                             )
@@ -2466,8 +2475,48 @@ async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
     }
 }
 
-/// Feeds WAL records to a replica and collects its acknowledgements.
+/// Streams the WAL-resident records `[from_lsn, ..]` to a joining replica,
+/// returning the LSN the live broadcast should resume from.
 ///
+/// The live broadcast only carries records shipped AFTER a subscriber
+/// registers, so a replica that is behind by even one record — a fresh
+/// leader whose quorum-failed writes advanced its LSN is the everyday case —
+/// could never catch up from the stream alone and, without a WAL archive,
+/// never at all: the trio test found followers orbiting a leader they could
+/// not join while it demoted for want of them. The records are on this
+/// primary's disk; archives are only needed for what checkpoints pruned.
+/// Archive segments are verbatim WAL segments, so the archive reader parses
+/// the live WAL directory unchanged, runway tails included.
+async fn catch_up_from_wal(
+    framed: &mut Framed<BoxedTransport, VyrnCodec>,
+    wal_directory: &std::path::Path,
+    from_lsn: u64,
+) -> Result<u64> {
+    const BATCH_RECORDS: usize = 1_024;
+    const BATCH_BYTES: usize = 32 * 1024 * 1024;
+    let mut next = from_lsn;
+    loop {
+        let directory = wal_directory.to_path_buf();
+        let records = task::spawn_blocking(move || {
+            vyrn_core::replication::archived_records_from(
+                &directory,
+                next,
+                BATCH_RECORDS,
+                BATCH_BYTES,
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("WAL catch-up task failed: {error}"))??;
+        let Some(last) = records.last() else {
+            return Ok(next);
+        };
+        next = vyrn_core::read_wal_record_lsn(last).saturating_add(1);
+        framed
+            .send(Envelope::new(0, Message::ReplicaRecords { records }))
+            .await?;
+    }
+}
+
 /// The primary's fencing epoch, sent immediately after `ReplicaStream` and
 /// then as the stream's heartbeat — only when automatic failover is
 /// configured, so a node without it never sees the tag.
