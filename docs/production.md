@@ -2,7 +2,7 @@
 
 ## Supported envelope
 
-Vyrn `1.0.0` is a single-node production database for Linux x86-64 on local persistent ext4/XFS storage. It is not highly available. A host or disk failure causes downtime and may require restore.
+Vyrn is a production database for Linux x86-64 on local persistent ext4/XFS storage. A single node is the default deployment; since 1.1.0 a cluster of three or more (`--cluster`) adds synchronous replication with automatic failover and epoch fencing (`docs/replication.md` carries the safety argument). A sharded server (`--shards > 1`) is always single-node — sharding and replication refuse to combine — so a host or disk failure there causes downtime and may require restore.
 
 Use it only when:
 
@@ -221,7 +221,7 @@ When readiness becomes false:
 
 ## Known limitations
 
-These are reviewed, understood, and deliberately not fixed in `1.0.0`. Each one can affect a production deployment, so plan around them rather than discovering them during an incident.
+These are reviewed, understood, and deliberately unfixed as of `1.2.0`. Each one can affect a production deployment, so plan around them rather than discovering them during an incident.
 
 ### The largest value you can actually write is under 16 MiB
 
@@ -244,33 +244,45 @@ Per-user accounts exist (`VYRN_USERS_FILE`: per-user Argon2id verifiers, prefix 
 
 Repeated authentication failures from one address are rate-limited (`vyrn_auth_failures_total`, plus a lockout), but the gateway's own bearer token has no equivalent throttle. Network reachability is still the outer wall: keep port 7432 on application networks only and the admin listener on loopback or a private monitoring network.
 
-### Windows directory durability is unproven
+### Windows is not soak-certified
 
-`sync_directory` is a no-op on non-Unix platforms. On Windows, the directory entry created by a rename — publishing a checkpoint manifest, a copied WAL segment, or an archive index — is not forced to disk, so a power loss can leave a file whose contents are durable but whose name is not. Vyrn's recovery is built to survive a missing rename, but that path is not certified on Windows.
+Since `1.1.0`, directory entries are genuinely flushed on Windows
+(`sync_directory` opens the directory with backup semantics and flushes
+it, where it used to be a no-op), and the durability suites pass there.
+What Windows has not had is the long crash-soak certification Linux gets
+in CI. Windows is a supported development platform; run production on
+Linux ext4/XFS.
 
-Windows is a development platform only. Run production on Linux ext4/XFS.
+### Pre-1.0 WAL records have unchecksummed headers
 
-### A WAL record header carries no checksum of its own
+WAL records written since `1.0.0` (format v5) carry a header self-checksum,
+so a flipped bit in a length field fails the open loudly. Records written
+by pre-1.0 builds (v4) predate it: their headers are trusted as they always
+were, and a corrupted v4 length field silently truncates recovery at that
+record. This only affects databases created before 1.0.0 that still hold
+their original WAL tail; any checkpoint since has retired those segments.
+If you operate one, keep the habit the old procedure taught — after a
+crash, read back a key known to have been acknowledged shortly before the
+failure — until a checkpoint has rewritten the log. `crates/vyrn-core/tests/corruption.rs`
+documents both behaviours.
 
-Record payloads are CRC32-checked, but the header holding `payload_len` is not. A single flipped bit in that field makes the record decode at the wrong length: the record and **everything after it in that segment** are silently discarded as an incomplete tail. Recovery reports success and the database comes up short of acknowledged writes without ever reporting an error.
+### Disk space is reclaimed at checkpoints, not at deletes
 
-This needs a storage-format version bump to fix, so it is deferred. It is why the runbook's failure-handling procedure has you read back a key known to have been acknowledged shortly before the failure (step 5) instead of trusting a clean startup, and why verified off-host backups plus WAL archiving matter more than they would otherwise: a base backup plus an archive gives you a second copy of the history. `crates/vyrn-core/tests/corruption.rs` documents the behaviour.
-
-### B-tree deletes never rebalance
-
-Deleting keys frees space inside pages but never merges underfull pages back together. A delete-heavy or delete-then-reinsert workload therefore grows the page file monotonically and inflates tree height, which shows up as slower point reads as depth increases. Space and depth are only reclaimed by checkpoint compaction, which writes a fresh generation.
-
-Plan for it: size disk for the high-water mark of live data plus churn, not for the current live set, and do not leave `VYRN_CHECKPOINT_WRITES` raised high enough to suppress compaction — a soak run at this repository's own expense grew a data directory to 41 GB that way. Watch data-directory size against the key count you expect.
+Deletes rebalance since `1.1.0` — underfull pages merge during
+copy-on-write rewrites, so a delete-heavy workload no longer inflates tree
+height or grows the page file monotonically (the fix was measured
+recovering ~9× on a delete-churn soak). What remains true is that the page
+file is generational: space freed inside it returns to the filesystem only
+when a checkpoint writes the next compact generation. Size disk for live
+data plus churn between checkpoints, and do not leave
+`VYRN_CHECKPOINT_WRITES` raised high enough to suppress compaction for
+long stretches.
 
 ### Integers above 2^53 lose precision in the TypeScript SDK
 
 The TypeScript SDK decodes document JSON with `JSON.parse`, so every number becomes an IEEE-754 double. An integer written by a Rust client above 2^53 comes back rounded, silently and without error — and a document read, modified, and written back through the SDK persists the rounded value, corrupting data that was previously correct.
 
 Affected values include 64-bit ids, nanosecond timestamps, and monetary amounts in minor units past ~9 quadrillion. Until the protocol carries a decimal or BigInt type, store such values as strings if any TypeScript client touches them. Rust clients are unaffected. The Rust and TypeScript SDKs also disagree on an over-limit scan `limit`: the Rust client clamps silently, the TypeScript SDK throws.
-
-### No automatic failover
-
-Replication is synchronous and acknowledges a commit only once N replicas hold it durably, but there is no automatic failover, leader election, or fencing. Promotion is a manual, documented procedure — see `docs/replication.md`. A primary failure is downtime until an operator acts.
 
 ## Upgrade policy
 
