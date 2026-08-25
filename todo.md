@@ -17,6 +17,20 @@
       loaded Windows host (known, documented; Linux CI is the gate).
 
 
+## 🎯 Beat single-node ScyllaDB (served path) — measurement first
+
+bench/served-compare (standalone crate, own stable toolchain — the scylla driver needs >1.87):
+vyrnd vs single-node Scylla, matched durability (the harness REFUSES Scylla in its default
+periodic commitlog mode — the 10s loss window is the sled-async trick again), p50/p99 +
+throughput, 16/64/256 clients. RUN ON THE LINUX SANDBOX (Scylla is Linux-only); runbook in the
+crate README. Context: our served numbers in production.md are from JULY, before all ten perf
+rounds (row cache, inline reads, pipelining, write-back, commit diet) — remeasure before
+concluding anything. Per-core, embedded vyrn is ~20-40x Scylla per core; the served gap is the
+question. IF Scylla wins high-concurrency writes on many-core hosts, the expected cause is the
+single engine write lock vs shard-per-core, and the answer is sharding vyrnd internally
+(N engines by key-range, one write lock each, single-shard transactions first) — a designed
+change, gated on the numbers, NOT to be bolted on.
+
 ## 🚢 1.0.0 release gates (2026-08-24)
 
 - [x] WAL record header self-checksum (record format v5) — the last known format defect; the
