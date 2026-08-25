@@ -263,6 +263,16 @@ struct Args {
     /// standing for election. Jittered per member to avoid split votes.
     #[arg(long, env = "VYRN_FAILOVER_ELECTION_MS", default_value_t = 6_000)]
     failover_election_ms: u64,
+    /// Number of independent shards, each a full engine with its own write
+    /// lock, WAL, and group commit — the write path parallelizes across
+    /// them. 1 (the default) is byte-identical to the unsharded server.
+    ///
+    /// Fixed at creation: the count is recorded in a SHARDS marker file and
+    /// a mismatch refuses startup, because key placement depends on it.
+    /// Sharded mode restricts cross-shard atomicity — see the Sharding
+    /// section of docs/production.md before enabling it.
+    #[arg(long, env = "VYRN_SHARDS", default_value_t = 1)]
+    shards: usize,
 }
 
 struct Metrics {
@@ -1102,7 +1112,12 @@ enum DocumentWrite {
 }
 
 struct ConnectionTransaction {
-    sequence: u64,
+    /// Snapshot sequences, one per shard, all registered at `Begin` so the
+    /// transaction reads a consistent revision wherever its first key lands.
+    sequences: Vec<u64>,
+    /// The shard the first-touched key hashed to — see [`transaction_shard`].
+    /// `None` until a key arrives; always 0 unsharded.
+    shard: Option<usize>,
     started: tokio::time::Instant,
     read_keys: BTreeMap<Vec<u8>, ()>,
     read_ranges: Vec<ReadRange>,
@@ -1111,8 +1126,83 @@ struct ConnectionTransaction {
     index_updates: Vec<IndexUpdate>,
 }
 
-struct ServerState {
+/// One shard's full serving stack: an engine with its own write lock, WAL
+/// and group commit, its read handles and reader threads, its write
+/// pipeline, and its change ring. With `--shards 1` there is exactly one,
+/// over the data directory itself — the unsharded server IS the one-shard
+/// case, not a separate code path.
+struct Shard {
     writes: mpsc::Sender<WriteRequest>,
+    changes: Arc<ChangeRing>,
+    read_queues: Vec<std::sync::mpsc::SyncSender<ReadRequest>>,
+    readers: Arc<Vec<RwLock<ReadEngine>>>,
+    next_reader: AtomicU64,
+    engine: Arc<RwLock<Engine>>,
+    wal_directory: PathBuf,
+}
+
+/// FNV-1a 64 over the key bytes. AN ON-DISK CONTRACT: a sharded directory's
+/// key placement depends on this exact function forever — changing it
+/// orphans every key it moves. Stated in docs/compatibility.md.
+fn shard_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Records the shard count a data directory was created with, so a restart
+/// with a different `--shards` is refused instead of silently misrouting
+/// every key.
+fn check_shard_marker(data: &Path, shards: usize) -> Result<()> {
+    let marker = data.join("SHARDS");
+    match std::fs::read_to_string(&marker) {
+        Ok(recorded) => {
+            let recorded: usize = recorded
+                .trim()
+                .parse()
+                .with_context(|| format!("{marker:?} is not a shard count"))?;
+            if recorded != shards {
+                bail!(
+                    "this data directory was created with --shards {recorded}, got --shards \
+                     {shards}; the shard count is fixed at creation because key placement \
+                     depends on it"
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if shards > 1 {
+                // Sharding an existing unsharded database would strand its
+                // keys: they live in the root directory, not in any shard.
+                if std::fs::read_dir(data).ok().is_some_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with("pages-"))
+                }) {
+                    bail!(
+                        "this data directory holds an unsharded database; --shards {shards} \
+                         would strand its keys. Export and re-import to shard existing data."
+                    );
+                }
+                std::fs::create_dir_all(data)?;
+                let temp = data.join("SHARDS.tmp");
+                std::fs::write(&temp, format!("{shards}\n"))?;
+                std::fs::rename(&temp, &marker)?;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to read {marker:?}")),
+    }
+}
+
+struct ServerState {
+    /// The serving stacks, one per shard; length 1 by default. Routing
+    /// helpers below pick one by key or collection; paths that only exist
+    /// unsharded (replication, cursors) use `lone_shard`.
+    shards: Vec<Shard>,
     /// The credential store — one shared verifier or the users file — and the
     /// permission sets sessions are checked against.
     auth: Arc<auth::Authenticator>,
@@ -1125,21 +1215,6 @@ struct ServerState {
     /// Bytes of pending write payload allowed in the pipeline; see
     /// [`WRITE_QUEUE_MAX_BYTES`].
     write_budget: Arc<Semaphore>,
-    changes: Arc<ChangeRing>,
-    read_queues: Vec<std::sync::mpsc::SyncSender<ReadRequest>>,
-    /// The read handles themselves, for the point-read fast path: a `try_read`
-    /// on one of these answers a Get on the connection task, skipping the
-    /// queue hop, both thread wakeups, and the response channel. The queue
-    /// path remains for scans, multi-gets, documents, and any moment a handle
-    /// is exclusively held (a publish or refresh in progress).
-    readers: Arc<Vec<RwLock<ReadEngine>>>,
-    next_reader: AtomicU64,
-    engine: Arc<RwLock<Engine>>,
-    /// This node's WAL directory, consulted on a replica join to learn the oldest
-    /// LSN still on disk. Held as a path rather than a cached LSN because
-    /// checkpoints prune segments without announcing it, so anything cached would
-    /// go stale exactly when a joining replica needs it to be right.
-    wal_directory: PathBuf,
     transaction_timeout: Duration,
     metrics: Arc<Metrics>,
     /// Shared with the flush worker: connection handlers register replicas here,
@@ -1160,6 +1235,174 @@ struct ServerState {
     /// static `read_only`, `ReplicaHello` streams only from the primary, and
     /// vote requests are answered — see the safety argument in [`failover`].
     failover: Option<Arc<failover::Failover>>,
+}
+
+impl ServerState {
+    fn shard_for_key(&self, key: &[u8]) -> &Shard {
+        &self.shards[self.shard_index_for_key(key)]
+    }
+
+    fn shard_index_for_key(&self, key: &[u8]) -> usize {
+        if self.shards.len() == 1 {
+            0
+        } else {
+            (shard_hash(key) % self.shards.len() as u64) as usize
+        }
+    }
+
+    /// A collection lives wholly on one shard, chosen by its NAME, so
+    /// document atomicity and collection indexes keep full semantics.
+    fn shard_for_collection(&self, collection: &str) -> &Shard {
+        if self.shards.len() == 1 {
+            &self.shards[0]
+        } else {
+            &self.shards[(shard_hash(collection.as_bytes()) % self.shards.len() as u64) as usize]
+        }
+    }
+
+    /// The one shard of an unsharded server, for paths that are refused in
+    /// sharded mode at startup or dispatch (replication, change cursors,
+    /// global indexes) and therefore only ever run with one.
+    fn lone_shard(&self) -> &Shard {
+        &self.shards[0]
+    }
+
+    fn sharded(&self) -> bool {
+        self.shards.len() > 1
+    }
+}
+
+/// Everything `build_shard` needs that is shared across shards or decided
+/// before any of them exists.
+struct ShardDeps {
+    durability: DurabilityMode,
+    archived_through: Option<Arc<AtomicU64>>,
+    record_sink: Option<Arc<dyn vyrn_core::RecordSink>>,
+    replication: Arc<replication::Replication>,
+    metrics: Arc<Metrics>,
+}
+
+/// Opens one shard's engine over `directory` and starts its whole pipeline:
+/// read workers, write worker, flush stage, MVCC GC, and (in async mode)
+/// the periodic sync. The unsharded server is exactly one of these over the
+/// data directory itself.
+fn build_shard(args: &Args, directory: &Path, deps: &ShardDeps) -> Result<Shard> {
+    let mut engine = Engine::open_with_options(
+        directory,
+        EngineOptions {
+            durability: deps.durability,
+            archived_through: deps.archived_through.clone(),
+            record_sink: deps.record_sink.clone(),
+            write_back_buffer: args.write_back_bytes,
+            ..EngineOptions::default()
+        },
+    )
+    .context("failed to open Vyrn data directory")?;
+    // The read handles are fed from this engine's commits, so every
+    // write-back commit must stage its publication. A no-op in classic mode.
+    engine.enable_write_back_publish();
+    let readers = Arc::new(
+        (0..args.read_handles)
+            .map(|_| {
+                // A handle for a write-back engine must be told so: it keeps
+                // its own overlay copy, fed by the flush stage, and a plain
+                // handle would silently serve only what the tree has absorbed.
+                if args.write_back_bytes > 0 {
+                    ReadEngine::open_with_write_back(directory).map(RwLock::new)
+                } else {
+                    ReadEngine::open(directory).map(RwLock::new)
+                }
+            })
+            .collect::<vyrn_core::Result<Vec<_>>>()?,
+    );
+    // A read handle opens from the checkpoint manifest, which is the last root
+    // whose pages are known complete — it does not replay the WAL. The engine
+    // does, so after a crash it holds commits the manifest does not name, and
+    // until this refresh those reads would answer "not found" for writes that
+    // were acknowledged as durable. Only the next commit's publish used to move
+    // the readers forward, so a database that was killed and then only read from
+    // served a stale snapshot indefinitely.
+    {
+        let (generation, root, len) = engine.committed_root();
+        for reader in readers.iter() {
+            reader
+                .write()
+                .map_err(|_| anyhow::anyhow!("read handle lock poisoned during startup"))?
+                .refresh(generation, root, len)
+                .context("failed to publish the recovered root to a read handle")?;
+        }
+    }
+    let read_queues = start_read_workers(
+        &readers,
+        args.write_queue_capacity,
+        Duration::from_millis(args.statement_deadline_ms),
+    );
+    let engine = Arc::new(RwLock::new(engine));
+    let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
+    let changes = Arc::new(ChangeRing::new(args.write_queue_capacity));
+    if deps.durability == DurabilityMode::Async {
+        start_async_sync(
+            Arc::clone(&engine),
+            Duration::from_millis(args.async_sync_ms),
+            Arc::clone(&deps.metrics),
+        );
+    }
+    let checkpoint_due = Arc::new(AtomicBool::new(false));
+    start_mvcc_gc(
+        Arc::clone(&engine),
+        Duration::from_millis(args.mvcc_gc_ms),
+        args.mvcc_gc_checkpoint_versions,
+        Arc::clone(&deps.metrics),
+        Arc::clone(&checkpoint_due),
+        Arc::clone(&readers),
+    );
+    // The WAL handle is shared so the flush stage can sync without taking the
+    // engine's write lock, which is what lets one barrier cover several batches.
+    let wal = engine
+        .read()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
+        .wal();
+    let (flush_sender, flush_receiver) = mpsc::channel(args.write_queue_capacity);
+    // Shared between the two stages: the write worker grows a batch only while a
+    // barrier is outstanding, and the flush stage tells it when one lands.
+    let in_flight = Arc::new(AtomicU64::new(0));
+    let (flush_completed, _) = watch::channel(0);
+    start_flush_worker(
+        wal,
+        flush_receiver,
+        FlushWorkerConfig {
+            readers: Arc::clone(&readers),
+            changes: Arc::clone(&changes),
+            metrics: Arc::clone(&deps.metrics),
+            engine: Arc::clone(&engine),
+            in_flight: Arc::clone(&in_flight),
+            flush_completed: flush_completed.clone(),
+            replication: Arc::clone(&deps.replication),
+        },
+    );
+    start_write_worker(
+        Arc::clone(&engine),
+        write_receiver,
+        flush_sender,
+        WriteWorkerConfig {
+            maximum_batch: args.write_batch_size,
+            delay: Duration::from_micros(args.write_batch_delay_us),
+            checkpoint_writes: args.checkpoint_writes,
+            metrics: Arc::clone(&deps.metrics),
+            checkpoint_due: Arc::clone(&checkpoint_due),
+            in_flight,
+            flush_completed,
+        },
+    );
+    Ok(Shard {
+        writes: write_sender,
+        changes,
+        read_queues,
+        readers,
+        next_reader: AtomicU64::new(0),
+        engine,
+        wal_directory: directory.join("wal"),
+    })
 }
 
 #[tokio::main]
@@ -1228,6 +1471,33 @@ async fn main() -> Result<()> {
     if durability == DurabilityMode::Async && args.async_sync_ms == 0 {
         bail!("VYRN_ASYNC_SYNC_MS must be greater than zero in async mode");
     }
+    /* SHARDED-MODE SHAPE CHECKS. Everything sharding cannot yet compose with
+     * is refused at startup rather than degraded at runtime: replication
+     * streams exactly one WAL and the archiver archives exactly one, so
+     * either would silently cover 1/N of the data if allowed through. */
+    if args.shards == 0 {
+        bail!("VYRN_SHARDS must be at least 1");
+    }
+    if args.shards > 1 {
+        if args.replica_of.is_some() || args.cluster.is_some() {
+            bail!(
+                "--shards {} cannot be combined with replication or failover: each \
+                 shard keeps its own WAL and LSN sequence, and the replication \
+                 stream carries exactly one",
+                args.shards
+            );
+        }
+        if args.replication_min_acks > 0 {
+            bail!("--replication-min-acks requires an unsharded server (--shards 1)");
+        }
+        if args.wal_archive_dir.is_some() {
+            bail!(
+                "--wal-archive-dir requires an unsharded server (--shards 1): the \
+                 archive format holds one WAL sequence"
+            );
+        }
+    }
+    check_shard_marker(&args.data, args.shards)?;
     if let Some(archive_dir) = &args.wal_archive_dir {
         if args.wal_archive_interval_ms < 100 {
             bail!("VYRN_WAL_ARCHIVE_INTERVAL_MS must be at least 100");
@@ -1323,152 +1593,59 @@ async fn main() -> Result<()> {
              a write-back buffer"
         );
     }
-    let mut engine = Engine::open_with_options(
-        &args.data,
-        EngineOptions {
-            durability,
-            archived_through: archived_through.clone(),
-            record_sink,
-            write_back_buffer: args.write_back_bytes,
-            ..EngineOptions::default()
-        },
-    )
-    .context("failed to open Vyrn data directory")?;
-    // The read handles are fed from this engine's commits, so every
-    // write-back commit must stage its publication. A no-op in classic mode.
-    engine.enable_write_back_publish();
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("failed to bind {}", args.bind))?;
     let admin_listener = TcpListener::bind(&args.admin_bind)
         .await
         .with_context(|| format!("failed to bind admin endpoint {}", args.admin_bind))?;
-    let metrics = Arc::new(Metrics::default());
-    let readers = Arc::new(
-        (0..args.read_handles)
-            .map(|_| {
-                // A handle for a write-back engine must be told so: it keeps
-                // its own overlay copy, fed by the flush stage, and a plain
-                // handle would silently serve only what the tree has absorbed.
-                if args.write_back_bytes > 0 {
-                    ReadEngine::open_with_write_back(&args.data).map(RwLock::new)
-                } else {
-                    ReadEngine::open(&args.data).map(RwLock::new)
-                }
-            })
-            .collect::<vyrn_core::Result<Vec<_>>>()?,
-    );
-    // A read handle opens from the checkpoint manifest, which is the last root
-    // whose pages are known complete — it does not replay the WAL. The engine
-    // does, so after a crash it holds commits the manifest does not name, and
-    // until this refresh those reads would answer "not found" for writes that
-    // were acknowledged as durable. Only the next commit's publish used to move
-    // the readers forward, so a database that was killed and then only read from
-    // served a stale snapshot indefinitely.
-    {
-        let (generation, root, len) = engine.committed_root();
-        for reader in readers.iter() {
-            reader
-                .write()
-                .map_err(|_| anyhow::anyhow!("read handle lock poisoned during startup"))?
-                .refresh(generation, root, len)
-                .context("failed to publish the recovered root to a read handle")?;
-        }
-    }
-    let read_queues = start_read_workers(
-        &readers,
-        args.write_queue_capacity,
-        Duration::from_millis(args.statement_deadline_ms),
-    );
-    let engine = Arc::new(RwLock::new(engine));
-    let (write_sender, write_receiver) = mpsc::channel(args.write_queue_capacity);
-    let change_sender = Arc::new(ChangeRing::new(args.write_queue_capacity));
     if args.transaction_timeout_seconds == 0
         || args.mvcc_gc_ms == 0
         || args.mvcc_gc_checkpoint_versions == 0
     {
         bail!("transaction timeout and MVCC GC interval must be greater than zero");
     }
-    if durability == DurabilityMode::Async {
-        start_async_sync(
-            Arc::clone(&engine),
-            Duration::from_millis(args.async_sync_ms),
-            Arc::clone(&metrics),
-        );
+    let metrics = Arc::new(Metrics::default());
+    let deps = ShardDeps {
+        durability,
+        archived_through: archived_through.clone(),
+        record_sink,
+        replication: Arc::clone(&replication),
+        metrics: Arc::clone(&metrics),
+    };
+    let mut shards = Vec::with_capacity(args.shards);
+    for index in 0..args.shards {
+        // One shard IS the data directory, so `--shards 1` serves exactly
+        // what an older server left there; only a sharded layout introduces
+        // subdirectories.
+        let directory = if args.shards == 1 {
+            args.data.clone()
+        } else {
+            args.data.join(format!("shard-{index}"))
+        };
+        shards.push(build_shard(&args, &directory, &deps)?);
     }
-    let checkpoint_due = Arc::new(AtomicBool::new(false));
-    start_mvcc_gc(
-        Arc::clone(&engine),
-        Duration::from_millis(args.mvcc_gc_ms),
-        args.mvcc_gc_checkpoint_versions,
-        Arc::clone(&metrics),
-        Arc::clone(&checkpoint_due),
-        Arc::clone(&readers),
-    );
     // Started only after the engine is open, so the archiver can never see a
-    // WAL tail that recovery is still truncating.
+    // WAL tail that recovery is still truncating. Unsharded only; the shape
+    // checks above refused the combination.
     if let (Some(archive_dir), Some(watermark)) = (&args.wal_archive_dir, &archived_through) {
         start_wal_archiver(
-            Arc::clone(&engine),
-            args.data.join("wal"),
+            Arc::clone(&shards[0].engine),
+            shards[0].wal_directory.clone(),
             archive_dir.clone(),
             Arc::clone(watermark),
             Duration::from_millis(args.wal_archive_interval_ms),
             Arc::clone(&metrics),
         );
     }
-    // The WAL handle is shared so the flush stage can sync without taking the
-    // engine's write lock, which is what lets one barrier cover several batches.
-    let wal = engine
-        .read()
-        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?
-        .wal();
-    let (flush_sender, flush_receiver) = mpsc::channel(args.write_queue_capacity);
-    // Shared between the two stages: the write worker grows a batch only while a
-    // barrier is outstanding, and the flush stage tells it when one lands.
-    let in_flight = Arc::new(AtomicU64::new(0));
-    let (flush_completed, _) = watch::channel(0);
-    start_flush_worker(
-        wal,
-        flush_receiver,
-        FlushWorkerConfig {
-            readers: Arc::clone(&readers),
-            changes: Arc::clone(&change_sender),
-            metrics: Arc::clone(&metrics),
-            engine: Arc::clone(&engine),
-            in_flight: Arc::clone(&in_flight),
-            flush_completed: flush_completed.clone(),
-            replication: Arc::clone(&replication),
-        },
-    );
-    start_write_worker(
-        Arc::clone(&engine),
-        write_receiver,
-        flush_sender,
-        WriteWorkerConfig {
-            maximum_batch: args.write_batch_size,
-            delay: Duration::from_micros(args.write_batch_delay_us),
-            checkpoint_writes: args.checkpoint_writes,
-            metrics: Arc::clone(&metrics),
-            checkpoint_due: Arc::clone(&checkpoint_due),
-            in_flight,
-            flush_completed,
-        },
-    );
     let state = Arc::new(ServerState {
-        writes: write_sender,
+        shards,
         auth: Arc::new(authenticator),
         audit: audit_log,
-        database: args.database,
+        database: args.database.clone(),
         auth_limit: Arc::new(Semaphore::new(args.max_auth_jobs)),
         auth_throttle: Arc::new(AuthThrottle::new()),
         write_budget: Arc::new(Semaphore::new(WRITE_QUEUE_MAX_BYTES)),
-        changes: change_sender,
-        read_queues,
-        readers: Arc::clone(&readers),
-        next_reader: AtomicU64::new(0),
-        engine: Arc::clone(&engine),
-        wal_directory: args.data.join("wal"),
         transaction_timeout: Duration::from_secs(args.transaction_timeout_seconds),
         metrics: Arc::clone(&metrics),
         replication: Arc::clone(&replication),
@@ -1494,7 +1671,7 @@ async fn main() -> Result<()> {
         // Defaults to the bind address so two replicas are distinguishable in the
         // primary's logs without extra configuration.
         let replica_id = args.replica_id.clone().unwrap_or_else(|| args.bind.clone());
-        let replica_engine = Arc::clone(&engine);
+        let replica_engine = Arc::clone(&state.lone_shard().engine);
         let config = replica::ReplicaConfig {
             primary_url,
             password,
@@ -1503,7 +1680,7 @@ async fn main() -> Result<()> {
             allow_plaintext: args.allow_plaintext,
             wal_archive_dir: args.replica_wal_archive_dir.clone(),
             failover: failover_state.clone(),
-            readers: Arc::clone(&readers),
+            readers: Arc::clone(&state.lone_shard().readers),
         };
         tokio::spawn(async move {
             if let Err(error) = replica::run(replica_engine, config).await {
@@ -1539,20 +1716,22 @@ async fn main() -> Result<()> {
         tokio::spawn(failover::run_coordinator(
             failover,
             Arc::clone(&replication),
-            Arc::clone(&engine),
+            Arc::clone(&state.lone_shard().engine),
             credentials,
         ));
     }
 
     let admin_metrics = Arc::clone(&metrics);
     let admin_replication = Arc::clone(&replication);
-    let admin_engine = Arc::clone(&engine);
+    let admin_engine = Arc::clone(&state.lone_shard().engine);
+    let admin_shards = state.shards.len();
     tokio::spawn(async move {
         serve_admin(
             admin_listener,
             admin_metrics,
             admin_replication,
             admin_engine,
+            admin_shards,
         )
         .await
     });
@@ -1674,31 +1853,33 @@ async fn main() -> Result<()> {
      * rather than ignored: a shutdown that could not make acknowledged writes
      * durable must not exit 0 and let a deploy script conclude all is well.
      */
-    let sync_engine = Arc::clone(&engine);
-    match task::spawn_blocking(move || {
-        sync_engine
-            .write()
-            .map_err(|_| StorageError::Poisoned)?
-            .sync()
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            log_error!(
-                "vyrnd.shutdown",
-                "storage sync failed on shutdown; acknowledged writes may be lost",
-                detail = error
-            );
-            bail!("shutdown could not make acknowledged writes durable: {error}");
-        }
-        Err(error) => {
-            log_error!(
-                "vyrnd.shutdown",
-                "storage sync task failed on shutdown; acknowledged writes may be lost",
-                detail = error
-            );
-            bail!("shutdown could not make acknowledged writes durable");
+    for shard in &state.shards {
+        let sync_engine = Arc::clone(&shard.engine);
+        match task::spawn_blocking(move || {
+            sync_engine
+                .write()
+                .map_err(|_| StorageError::Poisoned)?
+                .sync()
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log_error!(
+                    "vyrnd.shutdown",
+                    "storage sync failed on shutdown; acknowledged writes may be lost",
+                    detail = error
+                );
+                bail!("shutdown could not make acknowledged writes durable: {error}");
+            }
+            Err(error) => {
+                log_error!(
+                    "vyrnd.shutdown",
+                    "storage sync task failed on shutdown; acknowledged writes may be lost",
+                    detail = error
+                );
+                bail!("shutdown could not make acknowledged writes durable");
+            }
         }
     }
     log_info!("vyrnd", "shutdown complete");
@@ -1887,7 +2068,7 @@ async fn handle_connection(
      */
     let served = run_session(framed, Arc::clone(&state), session, &mut transaction).await;
     if let Some(transaction) = transaction {
-        release_transaction_snapshot(&state, transaction.sequence).await;
+        release_transaction_snapshots(&state, transaction.sequences).await;
     }
     served
 }
@@ -2028,6 +2209,7 @@ async fn run_session(
                     ),
                     Some(failover) => {
                         let own_lsn = state
+                            .lone_shard()
                             .engine
                             .read()
                             .map(|engine| engine.last_lsn())
@@ -2105,6 +2287,7 @@ async fn run_session(
                     )
                 } else {
                     let primary_lsn = state
+                        .lone_shard()
                         .engine
                         .read()
                         .map(|engine| engine.last_lsn())
@@ -2124,7 +2307,7 @@ async fn run_session(
                      * answer here becomes a clear error there rather than a
                      * silently holed log. */
                     let oldest_available = task::spawn_blocking({
-                        let wal = state.wal_directory.clone();
+                        let wal = state.lone_shard().wal_directory.clone();
                         move || vyrn_core::replication::oldest_available_lsn(&wal)
                     })
                     .await
@@ -2191,7 +2374,7 @@ async fn run_session(
                             send_primary_epoch(&mut framed, state.failover.as_deref()).await?;
                             let resume = catch_up_from_wal(
                                 &mut framed,
-                                &state.wal_directory,
+                                &state.lone_shard().wal_directory,
                                 oldest_available,
                             )
                             .await?;
@@ -2220,9 +2403,12 @@ async fn run_session(
                                 ))
                                 .await?;
                             send_primary_epoch(&mut framed, state.failover.as_deref()).await?;
-                            let resume =
-                                catch_up_from_wal(&mut framed, &state.wal_directory, first_lsn)
-                                    .await?;
+                            let resume = catch_up_from_wal(
+                                &mut framed,
+                                &state.lone_shard().wal_directory,
+                                first_lsn,
+                            )
+                            .await?;
                             stream_records(
                                 &mut framed,
                                 &state.replication,
@@ -2247,7 +2433,7 @@ async fn run_session(
                         .send(Envelope::new(request_id, Message::Subscribed))
                         .await?;
                     record_audit(&state, &session, &mut intent, "ok");
-                    stream_changes(&mut framed, state.changes.subscribe(), prefix).await?;
+                    stream_changes(&mut framed, subscribe_merged(&state), prefix).await?;
                     return Ok(());
                 }
             }
@@ -2257,8 +2443,19 @@ async fn run_session(
                         ErrorCode::InvalidRequest,
                         "subscription prefix is too large",
                     )
+                } else if state.sharded() {
+                    /* A cursor token names a position in ONE change log, and a
+                     * sharded server has one per shard. Refused rather than
+                     * merged: an interleaved replay could not honor "resume
+                     * exactly where the token says". Collection subscriptions
+                     * still resume — a collection lives on one shard. */
+                    server_error(
+                        ErrorCode::InvalidRequest,
+                        "SubscribeFrom is not available on a sharded server; \
+                         subscribe live, or use collection subscriptions",
+                    )
                 } else {
-                    match resolve_cursor(&state, cursor.as_deref()).await {
+                    match resolve_cursor(state.lone_shard(), cursor.as_deref()).await {
                         Ok(start) => {
                             framed
                                 .send(Envelope::new(request_id, Message::Subscribed))
@@ -2266,7 +2463,7 @@ async fn run_session(
                             record_audit(&state, &session, &mut intent, "ok");
                             stream_from_cursor(
                                 &mut framed,
-                                &state,
+                                state.lone_shard(),
                                 start,
                                 CursorStream::Keys { prefix },
                             )
@@ -2278,7 +2475,11 @@ async fn run_session(
                 }
             }
             Message::SubscribeCollectionFrom { collection, cursor } if transaction.is_none() => {
-                match resolve_cursor(&state, cursor.as_deref()).await {
+                // A collection lives wholly on one shard, so its cursor tokens
+                // all name positions in that shard's change log — resumable
+                // even on a sharded server, unlike key-space SubscribeFrom.
+                let shard = state.shard_for_collection(&collection);
+                match resolve_cursor(shard, cursor.as_deref()).await {
                     Ok(start) => {
                         framed
                             .send(Envelope::new(request_id, Message::CollectionSubscribed))
@@ -2286,7 +2487,7 @@ async fn run_session(
                         record_audit(&state, &session, &mut intent, "ok");
                         stream_from_cursor(
                             &mut framed,
-                            &state,
+                            shard,
                             start,
                             CursorStream::Collection { collection },
                         )
@@ -2305,7 +2506,7 @@ async fn run_session(
                         record_audit(&state, &session, &mut intent, "ok");
                         stream_document_changes(
                             &mut framed,
-                            state.changes.subscribe(),
+                            state.shard_for_collection(&collection).changes.subscribe(),
                             &collection,
                             prefix,
                         )
@@ -2316,10 +2517,11 @@ async fn run_session(
                 }
             }
             Message::Begin if transaction.is_none() => {
-                match register_transaction_snapshot(&state).await {
-                    Ok(sequence) => {
+                match register_transaction_snapshots(&state).await {
+                    Ok(sequences) => {
                         *transaction = Some(ConnectionTransaction {
-                            sequence,
+                            sequences,
+                            shard: None,
                             started: tokio::time::Instant::now(),
                             read_keys: BTreeMap::new(),
                             read_ranges: Vec::new(),
@@ -2335,7 +2537,7 @@ async fn run_session(
             Message::Commit if transaction.is_some() => {
                 let transaction = transaction.take().unwrap();
                 if transaction.started.elapsed() > state.transaction_timeout {
-                    release_transaction_snapshot(&state, transaction.sequence).await;
+                    release_transaction_snapshots(&state, transaction.sequences).await;
                     server_error(
                         ErrorCode::Conflict,
                         "transaction exceeded its lifetime limit",
@@ -2346,7 +2548,7 @@ async fn run_session(
             }
             Message::Rollback if transaction.is_some() => {
                 let transaction = transaction.take().unwrap();
-                release_transaction_snapshot(&state, transaction.sequence).await;
+                release_transaction_snapshots(&state, transaction.sequences).await;
                 Message::RolledBack
             }
             Message::Begin
@@ -2358,7 +2560,7 @@ async fn run_session(
             }
             message => {
                 if let Some(transaction) = transaction.as_mut() {
-                    execute_transaction(&state.engine, transaction, message).await
+                    execute_transaction(&state, transaction, message).await
                 } else {
                     execute(Arc::clone(&state), message).await
                 }
@@ -2415,54 +2617,83 @@ fn record_audit(
     }
 }
 
-/// Registers a transaction's snapshot using only a read lock.
+/// Registers a transaction's snapshot on every shard, using only read locks.
 ///
 /// Beginning a transaction just reads the committed sequence and bumps a
-/// refcount, so taking the write lock here would make every transaction queue
-/// behind the writer before doing any work.
-async fn register_transaction_snapshot(state: &ServerState) -> std::result::Result<u64, String> {
-    let engine = Arc::clone(&state.engine);
-    let sequence = task::spawn_blocking(move || {
-        let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
+/// refcount, so taking write locks here would make every transaction queue
+/// behind the writers before doing any work. All shards are pinned at `Begin`
+/// because the shard the transaction will use is not known until its first
+/// key arrives, and a pin taken later would read a younger revision.
+async fn register_transaction_snapshots(
+    state: &ServerState,
+) -> std::result::Result<Vec<u64>, String> {
+    let mut sequences = Vec::with_capacity(state.shards.len());
+    for shard in &state.shards {
+        let engine = Arc::clone(&shard.engine);
         // Registration itself can fail on a poisoned snapshot registry, and that
         // failure must reach the client as a refused `Begin`: a transaction whose
         // pin was never recorded would read at a revision nothing is retaining.
-        engine.register_snapshot_shared()
-    })
-    .await
-    .map_err(|_| "snapshot registration task failed".to_owned())?
-    .map_err(|error| error.to_string())?;
-    // Counted only once the pin actually exists, so a failed registration cannot
-    // inflate the gauge that is used to detect leaks.
+        let registered = task::spawn_blocking(move || {
+            let engine = engine.read().map_err(|_| StorageError::Poisoned)?;
+            engine.register_snapshot_shared()
+        })
+        .await
+        .map_err(|_| "snapshot registration task failed".to_owned())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        match registered {
+            Ok(sequence) => sequences.push(sequence),
+            Err(message) => {
+                // A Begin that failed on one shard must not leave pins on the
+                // shards registered before it. The gauge was never incremented,
+                // so this path must not decrement it either.
+                release_shard_pins(state, sequences).await;
+                return Err(message);
+            }
+        }
+    }
+    // Counted only once every pin actually exists, so a failed registration
+    // cannot inflate the gauge that is used to detect leaks.
     state
         .metrics
         .active_transaction_snapshots
         .fetch_add(1, Ordering::Relaxed);
-    Ok(sequence)
+    Ok(sequences)
 }
 
-/// Releases a transaction's snapshot.
+/// Releases per-shard pins without touching the transaction gauge — for a
+/// `Begin` that failed partway, before the transaction was ever counted.
+/// Reports whether every pin was really dropped.
+async fn release_shard_pins(state: &ServerState, sequences: Vec<u64>) -> bool {
+    let mut all_released = true;
+    for (index, sequence) in sequences.into_iter().enumerate() {
+        let engine = Arc::clone(&state.shards[index].engine);
+        let released = task::spawn_blocking(move || {
+            // Two ways this can fail to release: the ENGINE lock is poisoned, or
+            // the snapshot REGISTRY's own mutex is. Both leave the revision
+            // pinned, so both report false and leave the gauge saying so.
+            match engine.read() {
+                Ok(engine) => engine.release_snapshot_shared(sequence).is_ok(),
+                Err(_) => false,
+            }
+        })
+        .await;
+        all_released &= matches!(released, Ok(true));
+    }
+    all_released
+}
+
+/// Releases a transaction's snapshots.
 ///
 /// Version collection is deliberately left to the background MVCC task: running
 /// a full history sweep here would put an O(retained versions) scan under the
 /// write lock on every single commit.
-async fn release_transaction_snapshot(state: &ServerState, sequence: u64) {
-    let engine = Arc::clone(&state.engine);
-    let released = task::spawn_blocking(move || {
-        // Two ways this can fail to release: the ENGINE lock is poisoned, or the
-        // snapshot REGISTRY's own mutex is. Both leave the revision pinned, so
-        // both report false and leave the gauge saying so.
-        match engine.read() {
-            Ok(engine) => engine.release_snapshot_shared(sequence).is_ok(),
-            Err(_) => false,
-        }
-    })
-    .await;
-    /* Decremented only when the pin was really dropped. A poisoned lock leaves
-     * the snapshot pinned, and the gauge should keep saying so — that is exactly
-     * the state an operator needs to see, and hiding it would defeat the purpose
-     * of publishing the number. */
-    if matches!(released, Ok(true)) {
+async fn release_transaction_snapshots(state: &ServerState, sequences: Vec<u64>) {
+    let all_released = release_shard_pins(state, sequences).await;
+    /* Decremented only when every pin was really dropped. A poisoned lock
+     * leaves a snapshot pinned, and the gauge should keep saying so — that is
+     * exactly the state an operator needs to see, and hiding it would defeat
+     * the purpose of publishing the number. */
+    if all_released {
         let _ = state.metrics.active_transaction_snapshots.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
@@ -2679,6 +2910,61 @@ async fn stream_records_inner(
     }
 }
 
+/// Capacity of the channel a sharded live subscription is merged into.
+/// Sized like a generous change ring: past this, the subscriber is told it
+/// lagged, exactly as it would be on a single ring.
+const SUBSCRIBE_MERGE_CAPACITY: usize = 4096;
+
+/// One receiver covering every shard's change ring.
+///
+/// Unsharded this is the ring's own receiver: no task, no copy, nothing new
+/// on the default path. Sharded, one forwarder task per shard feeds a fresh
+/// channel. Order holds within a shard — each forwarder reads one ring in
+/// order — but not across shards, which matches the write path's promise:
+/// only same-key order is observable, and a key lives on one shard.
+///
+/// A forwarder that itself misses events (its ring lagged it out) sends one
+/// synthetic elided event with an EMPTY key — a key no client can write, so
+/// it passes every prefix filter — and every subscriber gets the same
+/// "reconnect and resynchronize" ending a lag produces, instead of a silent
+/// gap in one shard's changes. The tasks end with the subscription: once the
+/// receiver drops, their sends fail and they return.
+fn subscribe_merged(state: &ServerState) -> broadcast::Receiver<ChangeEvent> {
+    if !state.sharded() {
+        return state.lone_shard().changes.subscribe();
+    }
+    let (sender, receiver) = broadcast::channel(SUBSCRIBE_MERGE_CAPACITY);
+    for shard in &state.shards {
+        let mut source = shard.changes.subscribe();
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            loop {
+                match source.recv().await {
+                    Ok(event) => {
+                        // A send error means the subscriber is gone; the other
+                        // forwarders notice the same way and the channel dies.
+                        if sender.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = sender.send(ChangeEvent {
+                            sequence: 0,
+                            key: Vec::new(),
+                            value: None,
+                            cursor: None,
+                            elided: true,
+                        });
+                        return;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+    receiver
+}
+
 async fn stream_changes(
     framed: &mut Framed<BoxedTransport, VyrnCodec>,
     mut receiver: broadcast::Receiver<ChangeEvent>,
@@ -2693,7 +2979,7 @@ async fn stream_changes(
              * cannot supply the contents from memory, and the client must reread.
              * Checked before the prefix filter so the guard cannot be skipped. */
             Ok(change) if change.elided => {
-                if change.key.starts_with(&prefix) {
+                if change.key.is_empty() || change.key.starts_with(&prefix) {
                     send_error(
                         framed,
                         0,
@@ -2746,7 +3032,7 @@ async fn stream_document_changes(
             // See `stream_changes`: a payload the ring dropped must not reach a
             // subscriber as `document: None`, which reads as a deletion.
             Ok(change) if change.elided => {
-                if change.key.starts_with(&prefix) {
+                if change.key.is_empty() || change.key.starts_with(&prefix) {
                     send_error(
                         framed,
                         0,
@@ -2802,14 +3088,14 @@ enum CursorStream {
 /// `None` means "live changes only" and resolves to the newest cursor, so a
 /// fresh subscriber does not replay history it never asked for.
 async fn resolve_cursor(
-    state: &ServerState,
+    shard: &Shard,
     cursor: Option<&str>,
 ) -> vyrn_core::Result<change_log::Cursor> {
     match cursor {
         Some("") => Ok(change_log::Cursor::start()),
         Some(token) => change_log::Cursor::parse_token(token),
         None => {
-            let engine = Arc::clone(&state.engine);
+            let engine = Arc::clone(&shard.engine);
             task::spawn_blocking(move || {
                 engine
                     .read()
@@ -2829,15 +3115,15 @@ async fn resolve_cursor(
 /// replayed are then dropped by cursor, so nothing is delivered twice.
 async fn stream_from_cursor(
     framed: &mut Framed<BoxedTransport, VyrnCodec>,
-    state: &ServerState,
+    shard: &Shard,
     start: change_log::Cursor,
     stream: CursorStream,
 ) -> Result<()> {
-    let mut live = state.changes.subscribe();
+    let mut live = shard.changes.subscribe();
     let mut cursor = start;
 
     loop {
-        let engine = Arc::clone(&state.engine);
+        let engine = Arc::clone(&shard.engine);
         let from = cursor;
         let batch = task::spawn_blocking(move || {
             engine
@@ -3441,6 +3727,7 @@ fn read_failure_message(failure: ReadFailure) -> Message {
 }
 
 async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
+    let shard = state.shard_for_key(&key);
     /* THE FAST PATH: answer here, on the connection task.
      *
      * A point read against a warm cache is about a microsecond of work, and
@@ -3458,7 +3745,7 @@ async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
      * inline; that is bounded and small, unlike a scan, which is why scans
      * and multi-gets stay on the workers with their deadline machinery. */
     {
-        if let Ok(reader) = state.readers[next_reader(state)].try_read() {
+        if let Ok(reader) = shard.readers[next_reader(shard)].try_read() {
             return match reader.get(&key) {
                 Ok(value) => Message::Value { value },
                 Err(error) => storage_error_message(error),
@@ -3467,7 +3754,7 @@ async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
     }
     let (response, receiver) = oneshot::channel();
     if let Err(error) =
-        state.read_queues[next_reader(state)].try_send(ReadRequest::Get { key, response })
+        shard.read_queues[next_reader(shard)].try_send(ReadRequest::Get { key, response })
     {
         return read_dispatch_error(error);
     }
@@ -3479,9 +3766,55 @@ async fn submit_get(state: &ServerState, key: Vec<u8>) -> Message {
 }
 
 async fn submit_multi_get(state: &ServerState, keys: Vec<Vec<u8>>) -> Message {
+    if !state.sharded() {
+        return multi_get_on(state.lone_shard(), keys).await;
+    }
+    /* Split by shard, remembering each key's position: the protocol's promise
+     * is positional — values[i] answers keys[i] — and the shards return their
+     * own subsets in their own order. */
+    let mut positions: Vec<Vec<usize>> = vec![Vec::new(); state.shards.len()];
+    let mut split: Vec<Vec<Vec<u8>>> = vec![Vec::new(); state.shards.len()];
+    let total = keys.len();
+    for (at, key) in keys.into_iter().enumerate() {
+        let index = state.shard_index_for_key(&key);
+        positions[index].push(at);
+        split[index].push(key);
+    }
+    // Dispatched to every involved shard before awaiting any, so the shards
+    // work concurrently instead of in sequence.
+    let mut pending = Vec::new();
+    for (index, keys) in split.into_iter().enumerate() {
+        if keys.is_empty() {
+            continue;
+        }
+        let shard = &state.shards[index];
+        let (response, receiver) = oneshot::channel();
+        if let Err(error) =
+            shard.read_queues[next_reader(shard)].try_send(ReadRequest::MultiGet { keys, response })
+        {
+            return read_dispatch_error(error);
+        }
+        pending.push((index, receiver));
+    }
+    let mut values: Vec<Option<Vec<u8>>> = vec![None; total];
+    for (index, receiver) in pending {
+        match receiver.await {
+            Ok(Ok(shard_values)) => {
+                for (at, value) in positions[index].iter().zip(shard_values) {
+                    values[*at] = value;
+                }
+            }
+            Ok(Err(failure)) => return read_failure_message(failure),
+            Err(_) => return server_error(ErrorCode::Storage, "storage reader stopped"),
+        }
+    }
+    Message::Values { values }
+}
+
+async fn multi_get_on(shard: &Shard, keys: Vec<Vec<u8>>) -> Message {
     let (response, receiver) = oneshot::channel();
     if let Err(error) =
-        state.read_queues[next_reader(state)].try_send(ReadRequest::MultiGet { keys, response })
+        shard.read_queues[next_reader(shard)].try_send(ReadRequest::MultiGet { keys, response })
     {
         return read_dispatch_error(error);
     }
@@ -3498,25 +3831,53 @@ async fn submit_scan(
     end: Option<Vec<u8>>,
     limit: usize,
 ) -> Message {
-    let (response, receiver) = oneshot::channel();
-    if let Err(error) = state.read_queues[next_reader(state)].try_send(ReadRequest::Scan {
-        start,
-        end,
-        limit,
-        response,
-    }) {
-        return read_dispatch_error(error);
+    /* Sharded, a range lives everywhere: every shard scans it and the sorted
+     * results merge below. Each shard is asked for the FULL limit because in
+     * the worst case one shard holds the entire range. Dispatched to all
+     * shards before awaiting any, so they scan concurrently. */
+    let mut pending = Vec::with_capacity(state.shards.len());
+    for shard in &state.shards {
+        let (response, receiver) = oneshot::channel();
+        if let Err(error) = shard.read_queues[next_reader(shard)].try_send(ReadRequest::Scan {
+            start: start.clone(),
+            end: end.clone(),
+            limit,
+            response,
+        }) {
+            return read_dispatch_error(error);
+        }
+        pending.push(receiver);
     }
-    match receiver.await {
-        Ok(Ok(rows)) => Message::Rows { rows },
-        Ok(Err(failure)) => read_failure_message(failure),
-        Err(_) => server_error(ErrorCode::Storage, "storage reader stopped"),
+    let mut per_shard = Vec::with_capacity(state.shards.len());
+    for receiver in pending {
+        match receiver.await {
+            Ok(Ok(rows)) => per_shard.push(rows),
+            Ok(Err(failure)) => return read_failure_message(failure),
+            Err(_) => return server_error(ErrorCode::Storage, "storage reader stopped"),
+        }
+    }
+    Message::Rows {
+        rows: merge_scan_rows(per_shard, limit),
     }
 }
 
-/// Dispatches to a reader thread, round-robin across the read handles.
-fn next_reader(state: &ServerState) -> usize {
-    state.next_reader.fetch_add(1, Ordering::Relaxed) as usize % state.read_queues.len()
+/// Merges per-shard scan results — each sorted, keys disjoint across shards
+/// because a key lives on exactly one — into one ordered result of at most
+/// `limit` rows.
+fn merge_scan_rows(mut per_shard: Vec<Rows>, limit: usize) -> Rows {
+    if per_shard.len() == 1 {
+        // The lone shard's worker already ordered and limited it.
+        return per_shard.pop().expect("checked length");
+    }
+    let mut rows: Rows = per_shard.into_iter().flatten().collect();
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    rows.truncate(limit);
+    rows
+}
+
+/// Dispatches to a reader thread, round-robin across the shard's read handles.
+fn next_reader(shard: &Shard) -> usize {
+    shard.next_reader.fetch_add(1, Ordering::Relaxed) as usize % shard.read_queues.len()
 }
 
 fn read_document(reader: &ReadEngine, request: DocumentRead) -> vyrn_core::Result<Message> {
@@ -3539,10 +3900,27 @@ fn read_document(reader: &ReadEngine, request: DocumentRead) -> vyrn_core::Resul
     }
 }
 
+fn document_read_collection(request: &DocumentRead) -> &str {
+    match request {
+        DocumentRead::Get { collection, .. }
+        | DocumentRead::List { collection, .. }
+        | DocumentRead::Query { collection, .. } => collection,
+    }
+}
+
+fn document_write_collection(request: &DocumentWrite) -> &str {
+    match request {
+        DocumentWrite::CreateCollection { collection, .. }
+        | DocumentWrite::Put { collection, .. }
+        | DocumentWrite::Delete { collection, .. } => collection,
+    }
+}
+
 async fn submit_document_read(state: &ServerState, request: DocumentRead) -> Message {
+    let shard = state.shard_for_collection(document_read_collection(&request));
     let (response, receiver) = oneshot::channel();
     if let Err(error) =
-        state.read_queues[next_reader(state)].try_send(ReadRequest::Document { request, response })
+        shard.read_queues[next_reader(shard)].try_send(ReadRequest::Document { request, response })
     {
         return read_dispatch_error(error);
     }
@@ -3559,8 +3937,21 @@ async fn submit_index_lookup(
     value: Vec<u8>,
     limit: usize,
 ) -> Message {
+    /* A global index would need every shard's updates in one tree — exactly
+     * the cross-shard atomicity sharding gives up. Refused at creation, so a
+     * lookup could never find anything anyway; refusing it too keeps the
+     * error at the operation the client actually got wrong. Collection
+     * indexes still work — they live with their collection's shard. */
+    if state.sharded() {
+        return server_error(
+            ErrorCode::InvalidRequest,
+            "global indexes are not available on a sharded server; collection \
+             indexes work — a collection lives on one shard",
+        );
+    }
+    let shard = state.lone_shard();
     let (response, receiver) = oneshot::channel();
-    if let Err(error) = state.read_queues[next_reader(state)].try_send(ReadRequest::IndexLookup {
+    if let Err(error) = shard.read_queues[next_reader(shard)].try_send(ReadRequest::IndexLookup {
         index,
         value,
         limit,
@@ -3612,8 +4003,16 @@ fn storage_error_message(error: StorageError) -> Message {
 }
 
 async fn submit_create_index(state: &Arc<ServerState>, name: Vec<u8>, unique: bool) -> Message {
+    if state.sharded() {
+        return server_error(
+            ErrorCode::InvalidRequest,
+            "global indexes are not available on a sharded server; collection \
+             indexes work — a collection lives on one shard",
+        );
+    }
     let (sender, receiver) = oneshot::channel();
     if state
+        .lone_shard()
         .writes
         .send(WriteRequest::CreateIndex {
             name,
@@ -3633,8 +4032,16 @@ async fn submit_create_index(state: &Arc<ServerState>, name: Vec<u8>, unique: bo
 }
 
 async fn submit_drop_index(state: &Arc<ServerState>, name: Vec<u8>) -> Message {
+    if state.sharded() {
+        return server_error(
+            ErrorCode::InvalidRequest,
+            "global indexes are not available on a sharded server; collection \
+             indexes work — a collection lives on one shard",
+        );
+    }
     let (sender, receiver) = oneshot::channel();
     if state
+        .lone_shard()
         .writes
         .send(WriteRequest::DropIndex {
             name,
@@ -3673,6 +4080,7 @@ async fn submit_document(state: &Arc<ServerState>, request: DocumentWrite) -> Me
     let _budget = WriteBudget::acquire(&state.write_budget, document_write_bytes(&request)).await;
     let (sender, receiver) = oneshot::channel();
     if state
+        .shard_for_collection(document_write_collection(&request))
         .writes
         .send(WriteRequest::Document {
             request,
@@ -3698,6 +4106,7 @@ async fn submit_write(state: &Arc<ServerState>, operation: BatchOperation) -> Me
     let _budget = WriteBudget::acquire(&state.write_budget, operation_bytes(&operation)).await;
     let (sender, receiver) = oneshot::channel();
     if state
+        .shard_for_key(operation_key(&operation))
         .writes
         .send(WriteRequest::Operation {
             operation,
@@ -3717,21 +4126,51 @@ async fn submit_write(state: &Arc<ServerState>, operation: BatchOperation) -> Me
     }
 }
 
+/// The shard a transaction runs against, pinned by its first key.
+///
+/// Every later key must land on the same shard: reads are validated and
+/// writes committed against ONE shard's snapshot at commit, so an operation
+/// quietly routed to another shard's engine would escape conflict detection
+/// entirely. Unsharded every key hashes to shard 0 and nothing is refused.
+fn transaction_shard(
+    state: &ServerState,
+    transaction: &mut ConnectionTransaction,
+    key: &[u8],
+) -> std::result::Result<usize, Message> {
+    let index = state.shard_index_for_key(key);
+    match transaction.shard {
+        None => {
+            transaction.shard = Some(index);
+            Ok(index)
+        }
+        Some(pinned) if pinned == index => Ok(index),
+        Some(_) => Err(server_error(
+            ErrorCode::InvalidRequest,
+            "cross-shard transaction: this key lives on a different shard than \
+             the transaction's earlier keys; commit and use a second transaction",
+        )),
+    }
+}
+
 async fn execute_transaction(
-    engine: &Arc<RwLock<Engine>>,
+    state: &Arc<ServerState>,
     transaction: &mut ConnectionTransaction,
     request: Message,
 ) -> Message {
     match request {
         Message::Get { key } => {
+            let shard = match transaction_shard(state, transaction, &key) {
+                Ok(shard) => shard,
+                Err(refusal) => return refusal,
+            };
             transaction.read_keys.insert(key.clone(), ());
             if let Some(value) = transaction.writes.get(&key) {
                 return Message::Value {
                     value: value.clone(),
                 };
             }
-            let revision = transaction.sequence;
-            execute_engine_shared(engine, move |engine| {
+            let revision = transaction.sequences[shard];
+            execute_engine_shared(&state.shards[shard].engine, move |engine| {
                 Ok(Message::Value {
                     value: engine.get_at(&key, revision)?,
                 })
@@ -3739,16 +4178,23 @@ async fn execute_transaction(
             .await
         }
         Message::Put { key, value } => {
+            if let Err(refusal) = transaction_shard(state, transaction, &key) {
+                return refusal;
+            }
             transaction.writes.insert(key, Some(value));
             Message::Written
         }
         Message::Delete { key } => {
+            let shard = match transaction_shard(state, transaction, &key) {
+                Ok(shard) => shard,
+                Err(refusal) => return refusal,
+            };
             let existed = if let Some(value) = transaction.writes.get(&key) {
                 value.is_some()
             } else {
-                let revision = transaction.sequence;
+                let revision = transaction.sequences[shard];
                 let lookup_key = key.clone();
-                match execute_engine_shared(engine, move |engine| {
+                match execute_engine_shared(&state.shards[shard].engine, move |engine| {
                     Ok(Message::Value {
                         value: engine.get_at(&lookup_key, revision)?,
                     })
@@ -3761,6 +4207,14 @@ async fn execute_transaction(
             };
             transaction.writes.insert(key, None);
             Message::Deleted { existed }
+        }
+        // Global indexes are refused at creation on a sharded server, so
+        // inside a transaction the answer is the same.
+        Message::IndexUpdate { .. } | Message::IndexLookup { .. } if state.sharded() => {
+            server_error(
+                ErrorCode::InvalidRequest,
+                "global indexes are not available on a sharded server",
+            )
         }
         Message::IndexUpdate {
             index,
@@ -3785,11 +4239,11 @@ async fn execute_transaction(
                 return server_error(ErrorCode::InvalidRequest, "index limit is out of range");
             }
             transaction.index_reads.push((index.clone(), value.clone()));
-            let revision = transaction.sequence;
+            let revision = transaction.sequences[0];
             let fetch_limit = limit as usize + transaction.index_updates.len();
             let lookup_index = index.clone();
             let lookup_value = value.clone();
-            let keys = match execute_engine_shared(engine, move |engine| {
+            let keys = match execute_engine_shared(&state.lone_shard().engine, move |engine| {
                 Ok(Message::Keys {
                     keys: engine.lookup_index_at(
                         &lookup_index,
@@ -3820,6 +4274,15 @@ async fn execute_transaction(
                 keys: keys.into_keys().take(limit as usize).collect(),
             }
         }
+        /* Hash placement makes every range cross-shard, and a transaction
+         * validates its reads against ONE shard's snapshot at commit — a
+         * merged scan would return rows no single snapshot can vouch for.
+         * Scans outside a transaction still merge across shards. */
+        Message::Scan { .. } if state.sharded() => server_error(
+            ErrorCode::InvalidRequest,
+            "range scans inside a transaction are not available on a sharded \
+             server; scan outside the transaction",
+        ),
         Message::Scan { start, end, limit } => {
             if limit == 0 || limit > MAX_SCAN_LIMIT {
                 return server_error(ErrorCode::InvalidRequest, "scan limit is out of range");
@@ -3832,11 +4295,11 @@ async fn execute_transaction(
                 return server_error(ErrorCode::InvalidRequest, "scan start must not exceed end");
             }
             transaction.read_ranges.push((start.clone(), end.clone()));
-            let revision = transaction.sequence;
+            let revision = transaction.sequences[0];
             let fetch_limit = limit as usize + transaction.writes.len();
             let scan_start = start.clone();
             let scan_end = end.clone();
-            let rows = match execute_engine_shared(engine, move |engine| {
+            let rows = match execute_engine_shared(&state.lone_shard().engine, move |engine| {
                 Ok(Message::Rows {
                     rows: engine.scan_at(
                         scan_start.as_deref(),
@@ -3879,13 +4342,27 @@ async fn commit_transaction(
     state: &Arc<ServerState>,
     transaction: ConnectionTransaction,
 ) -> Message {
-    let snapshot_sequence = transaction.sequence;
-    if transaction.writes.is_empty() && transaction.index_updates.is_empty() {
-        release_transaction_snapshot(state, snapshot_sequence).await;
+    let ConnectionTransaction {
+        sequences,
+        shard,
+        read_keys,
+        read_ranges,
+        index_reads,
+        writes,
+        index_updates,
+        ..
+    } = transaction;
+    if writes.is_empty() && index_updates.is_empty() {
+        release_transaction_snapshots(state, sequences).await;
         return Message::Committed;
     }
-    let operations: Vec<_> = transaction
-        .writes
+    // Everything the transaction touched was pinned to one shard (index
+    // updates only exist unsharded, where every shard index is 0), so the
+    // commit is one shard's atomic batch, validated against that shard's
+    // snapshot.
+    let shard_index = shard.unwrap_or(0);
+    let snapshot_sequence = sequences[shard_index];
+    let operations: Vec<_> = writes
         .into_iter()
         .map(|(key, value)| match value {
             Some(value) => BatchOperation::Put(key, value),
@@ -3902,22 +4379,22 @@ async fn commit_transaction(
     )
     .await;
     let (sender, receiver) = oneshot::channel();
-    if state
+    if state.shards[shard_index]
         .writes
         .send(WriteRequest::Transaction {
-            snapshot_sequence: transaction.sequence,
-            read_keys: transaction.read_keys.into_keys().collect(),
-            read_ranges: transaction.read_ranges,
-            index_reads: transaction.index_reads,
+            snapshot_sequence,
+            read_keys: read_keys.into_keys().collect(),
+            read_ranges,
+            index_reads,
             operations,
-            index_updates: transaction.index_updates,
+            index_updates,
             response: sender,
             queued: Instant::now(),
         })
         .await
         .is_err()
     {
-        release_transaction_snapshot(state, snapshot_sequence).await;
+        release_transaction_snapshots(state, sequences).await;
         return server_error(ErrorCode::Storage, "storage writer is unavailable");
     }
     let response = match receiver.await {
@@ -3928,7 +4405,7 @@ async fn commit_transaction(
         Ok(Err(message)) => server_error(ErrorCode::Storage, &message),
         Err(_) => server_error(ErrorCode::Storage, "storage writer stopped"),
     };
-    release_transaction_snapshot(state, snapshot_sequence).await;
+    release_transaction_snapshots(state, sequences).await;
     response
 }
 
@@ -5451,6 +5928,7 @@ async fn serve_admin(
     metrics: Arc<Metrics>,
     replication: Arc<replication::Replication>,
     engine: Arc<RwLock<Engine>>,
+    shards: usize,
 ) {
     loop {
         let Ok((mut stream, _)) = listener.accept().await else {
@@ -5485,7 +5963,7 @@ async fn serve_admin(
                     "200 OK",
                     "text/plain; version=0.0.4",
                     format!(
-                        "vyrn_ready {}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\nvyrn_auth_failures_total {}\nvyrn_active_transaction_snapshots {}\nvyrn_commit_batches_total {}\nvyrn_commit_requests_total {}\n{}",
+                        "vyrn_ready {}\nvyrn_shards {shards}\nvyrn_storage_failed {}\nvyrn_active_connections {}\nvyrn_requests_total {}\nvyrn_requests_failed_total {}\nvyrn_reads_total {}\nvyrn_writes_total {}\nvyrn_checkpoints_total {}\nvyrn_write_batches_total {}\nvyrn_batched_writes_total {}\nvyrn_wal_flushes_total {}\nvyrn_flushed_batches_total {}\nvyrn_mvcc_gc_runs_total {}\nvyrn_mvcc_versions_collected_total {}\nvyrn_wal_archive_lag_segments {}\nvyrn_wal_archived_total {}\nvyrn_wal_archive_failures_total {}\nvyrn_auth_failures_total {}\nvyrn_active_transaction_snapshots {}\nvyrn_commit_batches_total {}\nvyrn_commit_requests_total {}\n{}",
                         u8::from(ready),
                         u8::from(metrics.storage_failed.load(Ordering::Relaxed)),
                         metrics.active_connections.load(Ordering::Relaxed),
@@ -5945,6 +6423,41 @@ mod tests {
         assert_eq!(Histogram::default().quantile(500), 0);
     }
 
+    /// A one-shard server state around an already-open engine, enough for the
+    /// transaction path. The write channel's receiver is dropped — these tests
+    /// never commit through the queue.
+    fn transaction_test_state(engine: Engine) -> Arc<ServerState> {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        let (writes, _closed) = mpsc::channel(1);
+        let salt = SaltString::from_b64("dGVzdHNhbHQ").unwrap();
+        let hash = argon2::Argon2::default()
+            .hash_password(b"pw", &salt)
+            .unwrap()
+            .serialize();
+        Arc::new(ServerState {
+            shards: vec![Shard {
+                writes,
+                changes: Arc::new(ChangeRing::new(4)),
+                read_queues: Vec::new(),
+                readers: Arc::new(Vec::new()),
+                next_reader: AtomicU64::new(0),
+                engine: Arc::new(RwLock::new(engine)),
+                wal_directory: PathBuf::new(),
+            }],
+            auth: Arc::new(auth::Authenticator::single("vyrn".into(), hash)),
+            audit: None,
+            database: "default".into(),
+            auth_limit: Arc::new(Semaphore::new(1)),
+            auth_throttle: Arc::new(AuthThrottle::new()),
+            write_budget: Arc::new(Semaphore::new(WRITE_QUEUE_MAX_BYTES)),
+            transaction_timeout: Duration::from_secs(30),
+            metrics: Arc::new(Metrics::default()),
+            replication: replication::Replication::new(0, Duration::from_secs(1)),
+            read_only: false,
+            failover: None,
+        })
+    }
+
     #[tokio::test]
     async fn transaction_reads_persisted_snapshot_and_its_writes() {
         let directory = tempdir().unwrap();
@@ -5953,9 +6466,10 @@ mod tests {
         engine.put(b"b".to_vec(), b"two".to_vec()).unwrap();
         let sequence = engine.register_snapshot();
         engine.put(b"a".to_vec(), b"current".to_vec()).unwrap();
-        let engine = Arc::new(RwLock::new(engine));
+        let state = transaction_test_state(engine);
         let mut transaction = ConnectionTransaction {
-            sequence,
+            sequences: vec![sequence],
+            shard: None,
             started: tokio::time::Instant::now(),
             read_keys: BTreeMap::new(),
             read_ranges: Vec::new(),
@@ -5965,7 +6479,7 @@ mod tests {
         };
         assert_eq!(
             execute_transaction(
-                &engine,
+                &state,
                 &mut transaction,
                 Message::Get { key: b"a".to_vec() }
             )
@@ -5976,7 +6490,7 @@ mod tests {
         );
         assert_eq!(
             execute_transaction(
-                &engine,
+                &state,
                 &mut transaction,
                 Message::Put {
                     key: b"a".to_vec(),
@@ -5988,7 +6502,7 @@ mod tests {
         );
         assert_eq!(
             execute_transaction(
-                &engine,
+                &state,
                 &mut transaction,
                 Message::Get { key: b"a".to_vec() }
             )
@@ -5999,7 +6513,7 @@ mod tests {
         );
         assert_eq!(
             execute_transaction(
-                &engine,
+                &state,
                 &mut transaction,
                 Message::Delete { key: b"b".to_vec() }
             )
@@ -6008,7 +6522,7 @@ mod tests {
         );
         assert_eq!(
             execute_transaction(
-                &engine,
+                &state,
                 &mut transaction,
                 Message::Get { key: b"b".to_vec() }
             )
@@ -6017,7 +6531,7 @@ mod tests {
         );
         assert_eq!(
             execute_transaction(
-                &engine,
+                &state,
                 &mut transaction,
                 Message::Scan {
                     start: None,

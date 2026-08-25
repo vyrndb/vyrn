@@ -27,6 +27,15 @@ would fill them). THE CEILING IS APPLY-SERIAL: one engine write lock ⇒ batches
 1/(apply+accumulate) ≈ 29K/s here; Linux apply is cheaper (engine CPU ~7µs/op measured) ⇒
 expect ~40-70K at c256 with full batches on the sandbox — RETEST FIRST with the fixed harness.
 
+**SHIPPED 1.2.0 (2026-08-25): internal sharding per the v1 contract below.** Implemented in
+main.rs (Shard struct, build_shard, FNV-1a routing, SHARDS marker, scatter-gather scans with
+merge, positional multi-get, pinned transactions with per-shard snapshot registration, merged
+live subscriptions, per-collection cursor subscriptions, vyrn_shards gauge, CLI sharded-root
+refusals). tests/sharding.rs: 8 tests, scan-merge + tx-pin + multi-get-positions all
+MUTATION-VERIFIED. Full suite green. REMAINING: sandbox retest toward 100K (4 shards ×
+~29K measured ceiling ≈ 116K theoretical), per-shard replication clusters (v2), resharding
+via export/import only. Original contract for reference:
+
 **To 100K+ served writes: internal sharding, the designed v1 contract**: `--shards N` opt-in;
 N engines over N subdirs, each with its own lock/WAL/group-commit/write-worker. Routing:
 plain put/get/delete/scan by key hash (scans = N-way ordered merge, scatter-gather); document

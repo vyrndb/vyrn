@@ -4,6 +4,29 @@ All notable changes to Vyrn are documented here. From 1.0.0 the on-disk
 formats follow the contract in `docs/compatibility.md`: every 1.x build
 reads what any earlier build wrote, and downgrade is unsupported.
 
+## [1.2.0] - 2026-08-25
+
+### Added
+
+- **`--shards N` (`VYRN_SHARDS`): internal sharding of the write path.**
+  N independent engines — each with its own B+tree, WAL, group commit,
+  read handles, and change ring — behind one server, with keys routed by
+  FNV-1a 64 (an on-disk contract, see `docs/compatibility.md`) and
+  document collections placed whole by collection name. The single engine
+  write lock was the measured served-write ceiling; shards multiply it.
+  The default (1) is byte-identical to the unsharded server. The count is
+  fixed at creation (`SHARDS` marker; mismatches refuse startup), and
+  everything sharding cannot compose with is refused loudly: cross-shard
+  transactions (pinned to the first-touched shard), transactional range
+  scans, global indexes, key-space cursor subscriptions, replication,
+  failover, and WAL archiving. Cross-shard scans merge in key order;
+  multi-gets scatter and reassemble positionally; live subscriptions merge
+  with per-shard ordering. `/metrics` gains `vyrn_shards`. See the
+  Sharding section of `docs/production.md` for the operational contract.
+- `vyrn backup`/`export`/`wal-prune` refuse the root of a sharded
+  directory with instructions to run per shard, instead of exporting an
+  empty database.
+
 ## [1.1.1] - 2026-08-25
 
 ### Fixed

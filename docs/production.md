@@ -18,7 +18,7 @@ Current observed WSL2/Linux baseline in `durable` mode with 16 persistent client
 
 Two properties matter more than the averages when sizing a deployment:
 
-- **Write throughput does not scale with client count.** Commits serialise through a single engine write lock, so past the group-commit sweet spot more concurrent writers buy latency, not throughput. (Checkpoints no longer stall writes for their duration — the compaction runs without the lock since 1.1.1 — but the per-commit serialisation stands.)
+- **Write throughput does not scale with client count on one shard.** Commits serialise through an engine write lock, so past the group-commit sweet spot more concurrent writers buy latency, not throughput. (Checkpoints no longer stall writes for their duration — the compaction runs without the lock since 1.1.1.) `--shards N` (1.2.0) runs N independent engines and parallelises the write path across them; read the Sharding section below for what it costs before enabling it.
 - **The write tail is unresolved.** At 256 concurrent writers, p99 is roughly 200 ms and the maximum is several seconds, reproducibly. It is not yet established whether that originates in Vyrn or in this host's storage — a bare `fdatasync` on the same filesystem has itself been caught stalling 5.6 seconds. Do not put a latency SLO in front of concurrent durable writes until this is measured on the intended hardware.
 
 These are development-machine measurements, not deployment guarantees; benchmark the actual host and disk.
@@ -41,6 +41,68 @@ These are development-machine measurements, not deployment guarantees; benchmark
 - Expose port 7432 only to application networks.
 - Keep port 7433 on loopback or a private monitoring network.
 - Stop routing traffic when `/health/ready` returns 503.
+
+## Sharding
+
+`--shards N` (`VYRN_SHARDS`, default 1) splits the keyspace across N
+independent engines inside one server process. Each shard has its own
+B+tree, WAL, group commit, read handles, and change ring; the write path —
+the engine write lock that bounds single-shard throughput — parallelises
+across them. The default is byte-identical to the unsharded server: one
+shard IS the data directory, not a special case of it.
+
+Keys route by FNV-1a 64 of the key bytes, modulo N (an on-disk contract —
+see `docs/compatibility.md`). A document collection lives WHOLLY on one
+shard, chosen by hashing the collection's name, so document atomicity,
+collection indexes, and collection subscriptions keep their full semantics
+at any shard count.
+
+**The count is fixed at creation.** It is recorded in a `SHARDS` marker
+file and a restart with a different `--shards` refuses startup, because key
+placement depends on it. There is no resharding: to change the count,
+export and re-import. Turning sharding on for an EXISTING unsharded
+database is refused for the same reason — its keys live where no shard
+would look.
+
+What sharding costs, all refused loudly rather than degraded:
+
+- **Cross-shard atomicity.** A transaction pins itself to the shard of the
+  first key it touches; an operation on a key from another shard is refused
+  at that operation with a `cross-shard transaction` error. Range scans
+  inside a transaction are refused entirely (hash placement makes every
+  range cross-shard). Non-transactional scans still work — every shard
+  scans and the results merge in key order.
+- **Global secondary indexes.** `CreateIndex`/`DropIndex`/`IndexLookup`
+  need every shard's updates in one tree. Use collection indexes, which
+  live with their collection's shard.
+- **Replication, failover, and WAL archiving.** Each shard has its own WAL
+  and LSN sequence; the replication stream and the archive format carry
+  exactly one. `--replica-of`, `--cluster`, `--replication-min-acks > 0`,
+  and `--wal-archive-dir` all refuse startup when `--shards > 1`. A sharded
+  server is therefore a SINGLE-NODE configuration: no synchronous
+  replication and no PITR. Do not shard data you cannot afford to serve
+  from one host.
+- **Key-space cursor subscriptions.** `SubscribeFrom` resumes from a
+  position in one change log and a sharded server has one per shard;
+  refused. Live `Subscribe` works (per-shard order is preserved; cross-shard
+  interleaving is not, which matches the write path's promise), and
+  collection cursor subscriptions work — a collection is one shard.
+
+Operations: the data directory becomes `SHARDS` + `shard-0/ .. shard-N-1/`,
+each subdirectory a complete ordinary Vyrn database. Offline tools
+(`vyrn backup`, `export`, `wal-prune`) refuse the sharded root and are run
+per shard; back up every `shard-*` directory (server stopped, as always)
+and keep the `SHARDS` marker with the set — a restore is only complete with
+all N shards and the marker. `/metrics` reports `vyrn_shards`; the other
+counters aggregate across shards.
+
+Sizing: shards multiply the apply-serial write ceiling, not the disk. They
+share one device and one fsync path, so the win is real for lock-bound
+workloads (many concurrent small writes) and absent for device-bound ones
+(large values saturating the drive). Start with the number of physical
+cores you can give the write path, measure, and prefer the smallest count
+that meets the target — every shard adds read handles, reader threads, and
+its own WAL runway.
 
 ## Backup policy
 

@@ -106,6 +106,25 @@ enum Command {
     },
 }
 
+/// Refuses to treat a sharded data directory's ROOT as a database.
+///
+/// The root of a `--shards N` directory holds only the SHARDS marker and the
+/// shard subdirectories; opening it as an engine would create a fresh empty
+/// database there, and an export of that would be silently empty — the worst
+/// possible answer for a migration tool. Each `shard-N/` subdirectory is a
+/// complete ordinary database, so every offline tool works per shard.
+fn refuse_sharded_root(data: &std::path::Path, operation: &str) -> Result<()> {
+    if data.join("SHARDS").exists() {
+        anyhow::bail!(
+            "{} is a sharded data directory; run `{operation}` against each \
+             shard-N subdirectory instead (each is a complete database), and \
+             keep the SHARDS marker file with them",
+            data.display()
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -135,6 +154,7 @@ async fn main() -> Result<()> {
     let command = args.command.context("a command is required")?;
     match command {
         Command::Backup { data, output } => {
+            refuse_sharded_root(&data, "backup")?;
             // Backup and restore are the operations an operator most needs a
             // durable record of: `docs/production.md` asks them to alert on
             // backup age, and a cron entry that redirects stdout to /dev/null
@@ -172,6 +192,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::Export { data, output } => {
+            refuse_sharded_root(&data, "export")?;
             let engine = vyrn_core::Engine::open(&data)?;
             let started = Instant::now();
             let outcome = vyrn_core::portable::export(&engine, &output);
@@ -287,6 +308,7 @@ async fn main() -> Result<()> {
             archive,
             through,
         } => {
+            refuse_sharded_root(&data, "wal-prune")?;
             let started = Instant::now();
             let outcome = vyrn_core::wal_archive::prune_wal(&data, &archive, through);
             report_outcome("wal-prune", &data, started, &outcome, None);

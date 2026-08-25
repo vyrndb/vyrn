@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "vyrn-client"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "futures-util",
  "rustls",
@@ -1182,11 +1182,11 @@ dependencies = [
 
 [[package]]
 name = "vyrn-log"
-version = "1.1.0"
+version = "1.2.0"
 
 [[package]]
 name = "vyrn-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytes",
  "thiserror",

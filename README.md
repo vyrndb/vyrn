@@ -12,7 +12,7 @@ log from the last checkpoint; an exhaustive bit-flip suite asserts that any
 single-bit change to a committed record either fails the open loudly or
 leaves every acknowledged write readable.
 
-Version 1.1.1. Formats are frozen per [docs/compatibility.md](docs/compatibility.md):
+Version 1.2.0. Formats are frozen per [docs/compatibility.md](docs/compatibility.md):
 every 1.x build reads what any earlier build wrote, downgrade is
 unsupported, replicas upgrade before primaries.
 
@@ -143,8 +143,12 @@ mutation-verified: revert the fix, watch the test fail.
 
 ## What it is not
 
-No SQL, by intent. One writer per keyspace: synchronous replication with
-quorum acknowledgement, and — for clusters of three or more — automatic
+No SQL, by intent. One writer per shard — `--shards N` splits the keyspace
+across N independent engines when one write lock is the ceiling, at the
+cost of cross-shard transactions, global indexes, and replication (the
+trade is spelled out in the Sharding section of
+[docs/production.md](docs/production.md)). Unsharded: synchronous
+replication with quorum acknowledgement, and — for clusters of three or more — automatic
 failover with epoch fencing, where an elected leader provably holds every
 acknowledged write (the safety argument is in
 [docs/replication.md](docs/replication.md)). Per-user accounts with
