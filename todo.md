@@ -1,5 +1,38 @@
 # vyrn — production-readiness TODO
 
+## ✅ Server crate split out of the main.rs god-file (2026-09-02)
+
+`crates/vyrn-server/src/main.rs` was 6,707 lines — 71% of the crate in one
+file, while auth/replica/failover/epoch/audit already lived in their own
+modules. It is now **2,829**, with nine modules lifted out as pure code
+motion (no logic reordered, no behaviour changed):
+
+| module | lines | what |
+| --- | ---: | --- |
+| `write.rs` | 1,253 | write worker, flush stage, commit validation |
+| `stream.rs` | 572 | replica record streams, change feeds, cursor replay |
+| `tests.rs` | 545 | the inline `mod tests` block |
+| `read.rs` | 468 | read-handle workers, point reads, scans |
+| `tasks.rs` | 246 | MVCC GC, WAL archiver, async sync |
+| `metrics.rs` | 236 | counters, histograms, write-stage profiling |
+| `cli.rs` | 207 | the clap `Args` surface |
+| `limits.rs` | 202 | write-payload byte budget, auth throttling |
+| `admin.rs` | 187 | health/readiness/metrics listener |
+| `changes.rs` | 109 | change ring and change events |
+
+Each extraction was applied one module at a time by an idempotent script
+(exact line-range slicing, newline-agnostic, refuses to run twice), then
+`cargo build` + `cargo fix` + `cargo fmt` + the full suite before the next.
+Green at every step: 28 unit, 9 sharding, 7 correctness, 10 replication,
+5 core group-commit. Zero warnings.
+
+REMAINING: `ServerState`/`Shard` are interleaved with the connection
+handling in main.rs and need a real design pass rather than a line cut —
+`shard.rs` is the obvious next module but the split point is not mechanical.
+Splitting `write.rs` further into worker/flush would make the
+`publish_commit` reader-lock hypothesis (see docs/benchmarks.md) directly
+instrumentable.
+
 ## ✅ v1.1.0 — "fix all of these" wave (2026-08-25)
 
 - [x] **Per-user accounts, prefix ACLs, audit trail** (agent; mutation-verified; 50 server tests)
@@ -34,7 +67,9 @@ live subscriptions, per-collection cursor subscriptions, vyrn_shards gauge, CLI 
 refusals). tests/sharding.rs: 8 tests, scan-merge + tx-pin + multi-get-positions all
 MUTATION-VERIFIED. Full suite green. REMAINING: sandbox retest toward 100K (4 shards ×
 ~29K measured ceiling ≈ 116K theoretical), per-shard replication clusters (v2), resharding
-via export/import only. Original contract for reference:
+via export/import only. Async × shards refused at startup since 2026-09-01 (one WAL per
+shard vs async's pre-barrier ack — a sharded server is fully ACID in durable mode).
+Original contract for reference:
 
 **To 100K+ served writes: internal sharding, the designed v1 contract**: `--shards N` opt-in;
 N engines over N subdirs, each with its own lock/WAL/group-commit/write-worker. Routing:
@@ -47,6 +82,36 @@ startup in v1 (per-shard clusters are a v2 design). 4 shards × ~29K measured �
 tuning; with full batches and Linux apply, several×. Design pass before code, per house rule.
 Interim tuning knobs that exist today: VYRN_WRITE_BATCH_SIZE (default 64) and
 VYRN_WRITE_BATCH_DELAY_US (200) — raise size at high concurrency.
+
+**SHIPPED (2026-08-28): the served write path stopped touching files under the engine lock.**
+Four changes toward the multi-node-Scylla target, none carrying a local timing claim (Windows
+write timings do not travel; the sandbox retest below is the gate):
+(1) **Flush stage learned the Async+drain_wal split** — the queued post-1.0 item. New
+`EngineOptions::buffered_appends` (server sets it): a deferred durable commit buffers its WAL
+record in memory under the lock; the flush stage drains (`drain_wal`, brief engine lock, once
+per coalesced group) then syncs OUTSIDE the lock, barrier target = the drained LSN. Kills the
+Windows convoy (FlushFileBuffers vs WriteFile) on the served path the way round 11 killed it
+embedded, and moves wal_write out of apply's lock budget everywhere. Immediate-barrier commits
+(index/document) self-drain in `commit_batch`. `sync_through` now debug_asserts a caller never
+asks it to cover an undrained LSN — the silent-data-loss shape a missing drain would have.
+MUTATION-VERIFIED TWICE: engine crash-copy test (`group_commit.rs`, eager-append revert fails
+the "must NOT survive before drain" arm) and flush-stage drain removal (6 of 7 correctness
+tests fail). No accumulate-loop defect found, for the record: the 200µs window is already
+purely barrier-driven (`in_flight` gate + `flush_completed` watch); the measured full window
+was group commit engaging, as designed.
+(2) **Write-worker clone diet**: batch payloads MOVE into the commit; a new `WriteResponder`
+(response channel + per-transaction result count) rides `PendingFlush` instead of the whole
+request — the old path cloned every key and value (twice for transactions), and the new type
+makes a misrouted request in the flush stage unrepresentable (the D2 direction).
+(3) **shards × write-back compose proven**: new `sharding.rs` test — 4 shards + 4 KiB write-back,
+read-your-write on all shards, kill, per-shard WAL-only recovery incl. an overwrite. The
+served-compare runbook now runs the sharded write-back arm headline (`VYRN_SHARDS` matched to
+Scylla's `--smp`, fresh dir per config, `VYRN_WRITE_BATCH_SIZE=256` at c256) and its stale
+"one engine write lock" note is gone.
+(4) **TS SDK pipeline API** (agent, sdk/typescript only): `pipeline()` on connection/session/
+client mirroring `Client::pipeline` — one socket write per burst, in-order answers, refused op
+consumes its own slot; 22 → 25 tests, ordering + refused-slot both mutation-verified; README'd.
+RETEST ON THE SANDBOX with the sharded write-back arm before quoting anything.
 
 **First sandbox results (2026-08-25)**: reads at low concurrency vyrn WINS (83K vs 75K @c16;
 p50 68µs vs Scylla's 1,845µs at c256 — latency is ours everywhere). Writes: Scylla 67K vs 357/s
@@ -326,12 +391,11 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
 - [ ] **What's still open on the bench front.** durable 64 KiB: bounded by the 2× spill
       amplification (value log + WAL both carry the bytes) and then by the device — the
       persistence-strategy change (WAL referencing value-log extents + value-log fsync in the
-      barrier) buys at most 2× and costs recovery complexity; decide deliberately. The served
-      path should expose the same group-commit shape the harness now proves embedded (the server
-      already has the flush stage; check whether its worker appends eagerly under the engine lock
-      — if so it convoys on Windows exactly as the harness did; Linux unaffected, write() and
-      fsync don't serialize there). scan 128 B trades ±10% with redb; batch_put trades on good
-      runs. Linux paired runs still queued and now cover group commit too.
+      barrier) buys at most 2× and costs recovery complexity; decide deliberately. ~~The served
+      path should expose the same group-commit shape the harness now proves embedded~~ — done
+      2026-08-28 (`buffered_appends` + flush-stage drain; the worker DID append eagerly under
+      the engine lock and DID convoy on Windows). scan 128 B trades ±10% with redb; batch_put
+      trades on good runs. Linux paired runs still queued and now cover group commit too.
 
 ## ⬜ Queued
 
@@ -342,10 +406,9 @@ Living checklist for the fix fleet. Baseline commit: `ac4c506`.
       should coalesce and the 256-client saturation should lift), inline reads vs parent (read
       mode), and a pipelined-client run vs lockstep (needs a `MODES=pipeline` arm in the harness;
       the client API exists). No served-path claim goes in benchmarks.md until these run.
-- [ ] **TypeScript SDK pipeline API** — the server side already serves any client that writes
-      several frames before reading; the SDK just cannot express it yet. Mirror
-      `Client::pipeline`: one write per burst, per-operation answers, refused ops consume their
-      own slot.
+- [x] **TypeScript SDK pipeline API** — done in the 2026-08-28 round (see the ScyllaDB section):
+      `pipeline()` mirrors `Client::pipeline`, one write per burst, per-operation answers,
+      refused ops consume their own slot; 25/25 SDK tests, mutation-verified.
 
 - [ ] **Split the change record so a commit is not charged for its own bookkeeping.** Reported as
       a batch-only problem; it is worse than that. Measured: a *single* put of exactly

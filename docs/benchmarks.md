@@ -1068,3 +1068,61 @@ Measurements on a host with faster durable writes than WSL2 would shift all of
 these ratios.
 
 Treat the included matrix as the in-memory baseline. For larger-than-memory testing, prefill both databases to the target size, restart them to remove warm process caches, and run the same binaries against datasets sized to 1×, 4×, and 10× host RAM. Record host CPU, RSS, disk bytes, and database-directory growth alongside the CSV; those measurements are host-specific and intentionally are not guessed by the client harness.
+
+## The load generator addressed one key
+
+Every `read`, `multi-read`, and `mixed` row above this section was produced by
+a client that fetched **one key** — `load/hot`, written once by `prepare()` —
+on every operation. `vyrn-load.rs` built a unique per-operation key and then
+discarded it on the read paths. So those rows measure a row-cache hit and a
+socket round trip: no tree descent, no page-cache miss, no leaf search, no
+value-log read. The comparison figure they were quoted against (PostgreSQL
+doing real buffer-manager work) is not the same workload.
+
+The write rows have the mirror defect: `write` and the served-compare
+`durable_put` both append a fresh ascending key every operation. That is
+copy-on-write's best case — the pre-state read always misses, inserts land on
+the same hot rightmost leaf, no interior page is rewritten at random, and MVCC
+never retains a prior version. The repo caught this confound once already
+(the killed value-materialisation experiment above notes "the load generator
+writes a unique key per operation, so the value read never fires") and did not
+propagate it to the rows themselves.
+
+`vyrn-load` now carries keyspace-addressing modes, all sharing one `key_at()`
+helper with the prefill so the two cannot drift again:
+
+- `random-read`, `random-multi-read` — uniform over `--keyspace`.
+- `zipf-read` — zipfian by `--zipf-theta` (0.99 default, the YCSB skew).
+- `overwrite`, `zipf-overwrite` — puts over the **existing** keyspace, so the
+  append-only fast path stops applying.
+- `zipf-mixed` — 70/30 over the same distribution.
+
+`--keyspace` (default 10M) must be sized so `keyspace × value_size` exceeds the
+server's page and value cache budgets, or the run is the old measurement with
+more steps. `--seed` makes a run reproducible (per-client generators are seeded
+`seed ^ client_id`); `--skip-prefill` reuses a populated directory.
+
+First measurement, and the point is the direction rather than the magnitude —
+this was a deliberately tiny 50,000-key (6.4 MB) keyspace that still fits
+entirely in cache, 4 clients, plaintext loopback, debug build:
+
+| Mode | req/s | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| `read` (one key) | 17,407 | 226 µs | 409 µs |
+| `random-read` | 14,159 | 261 µs | 532 µs |
+| `zipf-read` | 17,768 | 215 µs | 398 µs |
+| `write` (append) | 1,590 | 2,456 µs | 3,512 µs |
+| `overwrite` | 1,441 | 2,708 µs | 3,722 µs |
+| `zipf-overwrite` | 1,483 | 2,613 µs | 4,174 µs |
+
+Addressing 50,000 keys instead of one already costs 19% of read throughput and
+30% of the read p99. Overwriting instead of appending costs 9% of write
+throughput, and skewed overwrite costs 19% of the write p99 — that is the
+MVCC and pre-state work an append-only load never triggers. `zipf-read` ties
+the single-key row because a 0.99 skew *is* a hot key, which is the reason both
+knobs exist rather than one.
+
+None of these are the numbers to quote. They are a debug build on loopback
+against a keyspace chosen to fit in cache, and their only job is to show the
+axis is real. The figures worth publishing need `--keyspace` sized past the
+cache budget, a release build, and the paired-round protocol above.
