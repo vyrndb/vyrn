@@ -100,8 +100,11 @@ export function parseConnectionUrl(url: string, passwordOverride?: string): Pars
 }
 
 interface Pending {
-  requestId: number;
-  resolve: (message: Message) => void;
+  /** Request IDs still awaiting answers, in the order their frames were written. */
+  expected: number[];
+  /** Answers received so far; `expected[responses.length]` is the next due ID. */
+  responses: Message[];
+  resolve: (messages: Message[]) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 }
@@ -185,26 +188,57 @@ export class Connection {
   }
 
   async request(message: Message): Promise<Message> {
+    const [response] = await this.pipeline([message]);
+    return response as Message;
+  }
+
+  /**
+   * Writes a batch of requests as one burst — a single socket write, so no
+   * frame waits behind a read — then collects the answers in order. The server
+   * drains every buffered request and answers in submission order, so the
+   * returned messages line up with `messages` by index: the whole batch costs
+   * one network round trip. An `error` response fills its own slot rather
+   * than failing the batch; only connection-level faults reject.
+   */
+  async pipeline(messages: Message[]): Promise<Message[]> {
     if (this.#closed) throw this.#closed;
     if (this.#pending) {
       throw new VyrnConnectionError("a request is already in flight on this connection");
     }
-    const requestId = this.#nextRequestId;
-    this.#nextRequestId = requestId >= Number.MAX_SAFE_INTEGER ? 1 : requestId + 1;
+    if (messages.length === 0) return [];
 
-    return new Promise<Message>((resolve, reject) => {
+    const expected: number[] = [];
+    const frames: Uint8Array[] = [];
+    let burstLength = 0;
+    for (const message of messages) {
+      const requestId = this.#nextRequestId;
+      this.#nextRequestId = requestId >= Number.MAX_SAFE_INTEGER ? 1 : requestId + 1;
+      expected.push(requestId);
+      const frame = encodeEnvelope({ version: PROTOCOL_VERSION, requestId, message });
+      frames.push(frame);
+      burstLength += frame.length;
+    }
+    const burst = new Uint8Array(burstLength);
+    let offset = 0;
+    for (const frame of frames) {
+      burst.set(frame, offset);
+      offset += frame.length;
+    }
+
+    return new Promise<Message[]>((resolve, reject) => {
       const timer = setTimeout(() => {
-        // #fail rejects the in-flight request and clears it; clearing #pending
+        // #fail rejects the in-flight batch and clears it; clearing #pending
         // here first would leave the caller waiting forever. The server never
         // answered, so tear the socket down instead of leaving a half-open
-        // connection behind.
+        // connection behind. (Which operations already ran is unknown, exactly
+        // as for a single lost response.)
         this.#fail(new VyrnConnectionError("request timed out"));
         this.#socket.destroy();
       }, this.#timeoutMs);
       timer.unref?.();
-      this.#pending = { requestId, resolve, reject, timer };
+      this.#pending = { expected, responses: [], resolve, reject, timer };
       try {
-        this.#socket.write(encodeEnvelope({ version: PROTOCOL_VERSION, requestId, message }));
+        this.#socket.write(burst);
       } catch (error) {
         clearTimeout(timer);
         this.#pending = null;
@@ -258,14 +292,23 @@ export class Connection {
     }
     const pending = this.#pending;
     if (pending) {
-      if (envelope.requestId !== pending.requestId) {
+      // Answers must arrive strictly in submission order; anything else is a
+      // skew between requests and responses that no caller can recover from.
+      if (envelope.requestId !== pending.expected[pending.responses.length]) {
         this.#fail(new ProtocolError("response request ID did not match"));
         this.#socket.destroy();
         return;
       }
-      clearTimeout(pending.timer);
-      this.#pending = null;
-      pending.resolve(envelope.message);
+      pending.responses.push(envelope.message);
+      if (pending.responses.length === pending.expected.length) {
+        clearTimeout(pending.timer);
+        this.#pending = null;
+        pending.resolve(pending.responses);
+        return;
+      }
+      // More answers are due: each gets a fresh window, the same allowance a
+      // single request has, so a large batch is not raced against one timer.
+      pending.timer.refresh();
       return;
     }
     if (this.#streamHandler) {

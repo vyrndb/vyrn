@@ -473,11 +473,13 @@ pub struct EngineOptions {
     /// this size); and the buffer itself holds up to this many bytes in
     /// memory.
     ///
-    /// EMBEDDED USE ONLY for now: [`ReadEngine`] handles opened on the same
-    /// directory read the tree, not the writer's buffer, so a server built on
-    /// separate read handles must leave this at `0` until those handles learn
-    /// to see the buffer. Same-`Engine` reads — everything on this type — see
-    /// every committed write immediately, exactly as without the buffer.
+    /// [`ReadEngine`] handles opened on the same directory read the tree, not
+    /// the writer's buffer; a server built on separate read handles must feed
+    /// each one its overlay copy per durable commit ([`Engine::
+    /// take_write_back_publish`] + [`ReadEngine::publish_write_back`], which
+    /// is what `vyrnd --write-back-bytes` does). Same-`Engine` reads —
+    /// everything on this type — see every committed write immediately,
+    /// exactly as without the buffer.
     pub write_back_buffer: usize,
     /// Whether commits append durable change records for subscriptions.
     ///
@@ -494,6 +496,23 @@ pub struct EngineOptions {
     /// change history for the disabled stretches, which subscribers see as
     /// silence rather than an error.
     pub change_log: bool,
+    /// Whether durable-mode commits buffer their WAL record in memory instead
+    /// of handing it to the kernel at append time. `false` — the default —
+    /// keeps the eager append every embedded caller of
+    /// [`Engine::write_batch_deferred`] + [`Wal::sync_through`] relies on.
+    ///
+    /// With `true`, a deferred-barrier commit touches no file at all under the
+    /// engine lock: the record waits in memory until the caller runs
+    /// [`Engine::drain_wal`] (brief, under the lock) and then
+    /// [`Wal::sync_through`] for the returned LSN (outside it) before
+    /// acknowledging — the group-commit shape the server's flush stage uses.
+    /// On Windows this is what lets a group commit group at all:
+    /// `FlushFileBuffers` serializes against `WriteFile` on the same file, so
+    /// an eager append under the engine lock blocks behind the in-flight
+    /// barrier and convoys writers to one commit per fsync.
+    /// Immediate-barrier commits are unaffected observably: they drain and
+    /// sync before returning, exactly as strong as the eager path.
+    pub buffered_appends: bool,
 }
 
 /// Receives WAL records as the engine appends them.
@@ -532,6 +551,7 @@ impl Default for EngineOptions {
             record_sink: None,
             write_back_buffer: 0,
             change_log: true,
+            buffered_appends: false,
         }
     }
 }
@@ -904,11 +924,15 @@ pub struct Engine {
     indexes: BTreeMap<Vec<u8>, bool>,
     active_snapshots: BTreeMap<u64, usize>,
     user_len: usize,
-    /// Async-mode records awaiting their flush, each paired with the LSN it was
-    /// issued at. The LSN travels with the record because `last_lsn` names only
-    /// the newest one; stamping it onto every drained append would let a
-    /// concurrent barrier declare records durable that were never written.
+    /// Records awaiting their hand-off to the kernel — async mode's, and
+    /// durable mode's when `buffered_appends` is set — each paired with the
+    /// LSN it was issued at. The LSN travels with the record because
+    /// `last_lsn` names only the newest one; stamping it onto every drained
+    /// append would let a concurrent barrier declare records durable that
+    /// were never written.
     pending_wal: Vec<(u64, Vec<u8>)>,
+    /// See [`EngineOptions::buffered_appends`].
+    buffered_appends: bool,
     failure: Option<FailureInjector>,
     /// Change records published by the most recent commit, so subscribers can be
     /// notified without re-reading the change log.
@@ -1111,6 +1135,7 @@ impl Engine {
             active_snapshots: BTreeMap::new(),
             user_len,
             pending_wal: Vec::new(),
+            buffered_appends: options.buffered_appends,
             failure: None,
             last_published: Vec::new(),
             write_back_publish: Vec::new(),
@@ -2942,7 +2967,11 @@ impl Engine {
     /// A handle for flushing the WAL without holding the engine's write lock.
     ///
     /// Pair with [`Engine::write_batch_deferred`]: the returned LSN is durable
-    /// once `sync_through` has been called for it.
+    /// once `sync_through` has been called for it — with eager appends. With
+    /// [`EngineOptions::buffered_appends`] the record is still in memory, so
+    /// [`Engine::drain_wal`] must run first and the barrier target is the LSN
+    /// it returns; `sync_through` asked to cover an undrained LSN returns Ok
+    /// without covering it (asserted in debug builds).
     pub fn wal(&self) -> Arc<Wal> {
         Arc::clone(&self.wal)
     }
@@ -3374,6 +3403,13 @@ impl Engine {
     fn commit_batch(&mut self, operations: &[PendingCommit], root: u64, len: u64) -> Result<()> {
         let lsn = self.append_batch(operations, root, len)?;
         if self.durability == DurabilityMode::Durable {
+            // A no-op unless `buffered_appends` parked the record in memory.
+            // It must run before the barrier: `sync_through` covers only what
+            // was handed to the kernel before the flush began, and returns Ok
+            // for an LSN it could not cover — skipping the drain here would
+            // acknowledge a commit whose record exists nowhere but this
+            // process.
+            self.drain_pending_wal()?;
             self.wal.sync_through(lsn)?;
         }
         Ok(())
@@ -3419,7 +3455,7 @@ impl Engine {
         if let Some(sink) = &self.record_sink {
             sink.record(lsn, &record);
         }
-        if self.durability == DurabilityMode::Durable {
+        if self.durability == DurabilityMode::Durable && !self.buffered_appends {
             // Only the WAL is written here. Pages and historical values are left
             // for the background flush: redo recovery reapplies logged mutations
             // when the committed root's pages did not survive, so a commit no
@@ -3431,6 +3467,12 @@ impl Engine {
             self.inject(FailurePoint::AfterWalWrite)?;
             self.inject(FailurePoint::BeforeWalSync)?;
         } else {
+            // Async mode, or durable with buffered appends: the record waits
+            // in memory for the drain. In buffered-durable mode nothing may be
+            // acknowledged until `drain_wal` has handed it to the kernel AND
+            // `sync_through` has covered its LSN — `commit_batch` below does
+            // both for immediate barriers; a deferred barrier leaves them to
+            // the caller.
             self.wal_len += record.len() as u64;
             self.pending_wal.push((lsn, record));
         }

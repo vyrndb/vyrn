@@ -575,3 +575,111 @@ fn documents_live_with_their_collection() {
     .expect("list documents");
     assert_eq!(listed.len(), 12, "orders must all be on one shard");
 }
+
+/// `--shards N` composed with `--write-back-bytes`: the two persistence
+/// strategies have to hold together, per shard, across a kill.
+///
+/// RECONSTRUCTED 2026-09-02 after the original was lost before it was
+/// committed. Same contract, rewritten against the same helpers.
+///
+/// WHY A KILL AND NOT A CLEAN SHUTDOWN: with write-back on, a commit's
+/// durability is its WAL record alone — the mutations sit in an in-memory
+/// buffer that the tree only absorbs at the byte threshold or a checkpoint.
+/// A clean shutdown would flush that buffer and prove nothing. Killing the
+/// process leaves every shard with a tree that is behind its WAL, so the
+/// reopen exercises the redo path on all four independently. The threshold
+/// is deliberately small (4 KiB) so the run crosses it on some shards and
+/// not others: both the absorbed and the WAL-only shapes appear in one test.
+#[test]
+fn sharded_write_back_serves_reads_and_survives_a_kill() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let hash = directory.path().join("password.phc");
+    write_password_hash(&hash);
+    let data = directory.path().join("data");
+
+    let mut environment = shards_env(SHARDS);
+    environment.push(("VYRN_WRITE_BACK_BYTES", "4096".to_owned()));
+
+    let mut node = spawn(&data, &hash, &environment);
+    let url = node.url();
+
+    // Every shard gets keys: `keys_by_shard` asserts none is near-empty, so a
+    // recovery that lost one shard's buffer cannot hide behind an empty one.
+    let by_shard = keys_by_shard();
+    for keys in by_shard.iter() {
+        for key in keys {
+            put(&url, key, &format!("v1-{key}")).expect("put");
+            // Read-your-write THROUGH the buffer: the value is not in the tree
+            // yet, so this only answers if the read handles merge the overlay.
+            assert_eq!(
+                get(&url, key).expect("get"),
+                Some(format!("v1-{key}")),
+                "{key} was not readable from its own shard's write-back buffer"
+            );
+        }
+    }
+
+    // An overwrite of an already-buffered key. Recovery has to replay the
+    // records in order and land on the second value, not the first.
+    let overwritten = by_shard[0].first().expect("shard 0 has keys").clone();
+    put(&url, &overwritten, "v2-overwritten").expect("overwrite");
+    assert_eq!(
+        get(&url, &overwritten).expect("get"),
+        Some("v2-overwritten".to_owned())
+    );
+
+    node.kill();
+
+    // The buffer must actually have engaged, or this test would pass with
+    // write-back OFF and prove nothing about it. A write-back commit names
+    // WRITE_BACK_ROOT (u64::MAX) instead of a real root, so that sentinel
+    // appears in the WAL bytes of a shard that took one; a classic commit
+    // never writes it. Checked per shard directory, so the assertion cannot
+    // be satisfied by some unrelated part of the layout.
+    let sentinel = u64::MAX.to_le_bytes();
+    let buffered = (0..SHARDS)
+        .filter(|shard| {
+            let wal = data.join(format!("shard-{shard}")).join("wal");
+            let Ok(entries) = std::fs::read_dir(&wal) else {
+                return false;
+            };
+            entries.filter_map(|entry| entry.ok()).any(|entry| {
+                std::fs::read(entry.path())
+                    .map(|bytes| bytes.windows(8).any(|window| window == sentinel))
+                    .unwrap_or(false)
+            })
+        })
+        .count();
+    assert!(
+        buffered > 0,
+        "no shard WAL carried a write-back record: the buffer never engaged, \
+         so the recovery below is not exercising the write-back path"
+    );
+
+    // Reopen: no clean shutdown ran, so each shard rebuilds its buffer from
+    // its own WAL. A shard whose redo was skipped answers None here.
+    let node = spawn(&data, &hash, &environment);
+    let url = node.url();
+    for keys in by_shard.iter() {
+        for key in keys {
+            let expected = if key == &overwritten {
+                "v2-overwritten".to_owned()
+            } else {
+                format!("v1-{key}")
+            };
+            assert_eq!(
+                get(&url, key).expect("get"),
+                Some(expected),
+                "{key} did not survive the kill on its shard"
+            );
+        }
+    }
+
+    // The recovered server still writes: recovery left each shard's buffer and
+    // WAL in a state that accepts new commits rather than a read-only husk.
+    put(&url, "after/recovery", "fresh").expect("put after recovery");
+    assert_eq!(
+        get(&url, "after/recovery").expect("get"),
+        Some("fresh".to_owned())
+    );
+}

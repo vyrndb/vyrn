@@ -76,6 +76,23 @@ await db.use(async (session) => {
 
 Forgetting `commit` or `rollback` cannot poison the pool: when a session with an open transaction is returned, the client rolls the transaction back before leasing the session again (and retires the session entirely if that rollback fails).
 
+### Pipelining
+
+`pipeline` submits a batch of independent get/put/delete operations in one socket write and collects their answers in order, so the whole burst costs one network round trip instead of one per operation. The server executes and answers in submission order — the same semantics as issuing the operations one at a time, minus the waiting:
+
+```ts
+const results = await db.pipeline([
+  { type: "put", key: "counts/a", value: "1" },
+  { type: "get", key: "counts/a" },
+  { type: "delete", key: "counts/b" },
+]);
+// results[0]: { type: "written" }
+// results[1]: { type: "value", value: Uint8Array | null }
+// results[2]: { type: "deleted", existed: boolean }
+```
+
+Results line up with the operations by index. A refused operation (for example an invalid key) fills its own slot as `{ type: "error", error: VyrnServerError }` without derailing the answers around it, and the connection stays usable. Connection-level faults reject the whole call instead, because the outcome of every operation in flight is unknown. Unlike a transaction the operations are independent — each commits on its own — and a session refuses `pipeline` while it has an active transaction.
+
 ### Pooling
 
 Each native connection handles one request at a time, so every call leases a connection and concurrent calls use separate ones, up to `maxConnections` (default 10). Additional callers queue until a connection is returned. Dead connections are discarded rather than reused, and their capacity is reclaimed immediately: after a backend restart the pool reconnects on demand instead of silently shrinking, and callers queued while every pooled connection was dead receive the connection error rather than waiting forever. Closing the client rejects queued callers the same way.

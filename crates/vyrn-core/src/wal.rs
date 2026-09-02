@@ -209,6 +209,16 @@ impl Wal {
         // Read before flushing, never after: a record appended once the flush is
         // already running may not be included in it.
         let covered = self.appended_lsn.load(Ordering::Acquire);
+        // A caller asking for an LSN that was never handed to the kernel has
+        // skipped a drain: this flush cannot cover it, but the Ok below would
+        // still be returned — an acknowledgement for a record that exists
+        // nowhere but process memory. Loud in tests, because the release-mode
+        // consequence is silent data loss at the next crash.
+        debug_assert!(
+            covered >= lsn,
+            "sync_through({lsn}) asked to cover an LSN beyond the appended {covered}: \
+             a buffered record was not drained before its barrier"
+        );
         let sync_started = std::time::Instant::now();
         syncer.sync_data()?;
         crate::profile::add(&crate::profile::WAL_SYNC_NS, sync_started);

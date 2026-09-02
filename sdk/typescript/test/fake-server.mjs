@@ -260,6 +260,7 @@ export class FakeVyrnServer {
       route({
         socket,
         requestId,
+        payload,
         reply: (message) => this.send(socket, message, requestId),
       });
       return;

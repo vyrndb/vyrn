@@ -93,6 +93,24 @@ export interface ScanOptions {
   limit?: number;
 }
 
+/** One operation of a `pipeline` batch. */
+export type PipelineOperation =
+  | { type: "get"; key: VyrnBytes }
+  | { type: "put"; key: VyrnBytes; value: VyrnBytes }
+  | { type: "delete"; key: VyrnBytes };
+
+/**
+ * One operation's answer from a `pipeline` batch, in submission order.
+ *
+ * A refused operation surfaces as `{ type: "error" }` in its own slot: one
+ * refused write does not hide the outcomes of the operations around it.
+ */
+export type PipelineResult =
+  | { type: "value"; value: Uint8Array | null }
+  | { type: "written" }
+  | { type: "deleted"; existed: boolean }
+  | { type: "error"; error: VyrnServerError };
+
 export interface DocumentQueryOptions {
   limit?: number;
 }
@@ -337,6 +355,54 @@ export class Session extends Operations {
     });
     if (response.type !== "documents") throw unexpected(response);
     return response.documents.map(([id, document]) => ({ id, document: decodeJson(document) as T }));
+  }
+
+  /**
+   * Runs a batch of independent operations as one pipelined burst: every
+   * request is written before any response is awaited, so the whole batch
+   * costs one network round trip instead of one per operation. The server
+   * executes them in order and answers in order — the same semantics as
+   * issuing them one at a time, minus the waiting.
+   *
+   * Results line up with `operations` by index. A refused operation consumes
+   * exactly its own slot as `{ type: "error" }`; the connection stays usable.
+   * Connection-level faults reject the whole call instead, because the
+   * outcome of every operation in flight is unknown.
+   */
+  async pipeline(operations: PipelineOperation[]): Promise<PipelineResult[]> {
+    // Refused rather than silently absorbing the batch into the transaction's
+    // snapshot; `begin` enforces its discipline the same way.
+    if (this.transactionActive) {
+      throw new VyrnConnectionError("cannot pipeline while a transaction is active on this session");
+    }
+    const responses = await this.connection.pipeline(
+      operations.map((operation): Message => {
+        switch (operation.type) {
+          case "get":
+            return { type: "get", key: bytes(operation.key) };
+          case "put":
+            return { type: "put", key: bytes(operation.key), value: bytes(operation.value) };
+          case "delete":
+            return { type: "delete", key: bytes(operation.key) };
+        }
+      }),
+    );
+    return responses.map((response, index): PipelineResult => {
+      if (response.type === "error") {
+        return { type: "error", error: new VyrnServerError(response.code, response.message) };
+      }
+      const operation = operations[index] as PipelineOperation;
+      if (operation.type === "get" && response.type === "value") {
+        return { type: "value", value: response.value };
+      }
+      if (operation.type === "put" && response.type === "written") {
+        return { type: "written" };
+      }
+      if (operation.type === "delete" && response.type === "deleted") {
+        return { type: "deleted", existed: response.existed };
+      }
+      throw unexpected(response);
+    });
   }
 
   async begin(): Promise<Transaction> {
@@ -608,6 +674,14 @@ export class VyrnClient {
     options: DocumentQueryOptions = {},
   ): Promise<Array<VyrnDocument<T>>> {
     return this.use((session) => session.queryDocuments<T>(collection, field, value, options));
+  }
+
+  /**
+   * Runs a batch of independent get/put/delete operations as one pipelined
+   * burst on a single leased connection; see `Session.pipeline`.
+   */
+  pipeline(operations: PipelineOperation[]): Promise<PipelineResult[]> {
+    return this.use((session) => session.pipeline(operations));
   }
 
   /** Runs a serializable transaction on one pinned connection, retrying conflicts. */

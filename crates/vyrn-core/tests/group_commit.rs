@@ -78,6 +78,74 @@ fn drained_commits_survive_a_crash_and_undrained_ones_do_not() {
     );
 }
 
+/// The served shape: `DurabilityMode::Durable` with `buffered_appends`, where
+/// applying a batch touches no file and the flush stage owns both hand-offs.
+/// A deferred commit is volatile until `drain_wal` + `sync_through` have run
+/// — a crash copy taken in between must lose it — and an immediate-barrier
+/// commit (an index change, a document write) must self-drain: it is durable
+/// with no caller drain at all. Both directions, so the copy provably models
+/// a crash and the drain provably carries the durability.
+#[test]
+fn buffered_durable_commits_survive_only_after_drain_and_sync() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open_with_options(
+        directory.path(),
+        EngineOptions {
+            durability: DurabilityMode::Durable,
+            buffered_appends: true,
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let wal = engine.wal();
+
+    // Immediate barrier: `commit_batch` drains and syncs before returning.
+    engine
+        .put(b"immediate".to_vec(), b"self-drained".to_vec())
+        .unwrap();
+
+    // Deferred barrier: the server's write path. Applied, visible to this
+    // engine, and owed a drain and a barrier before anyone may be told so.
+    let (_, lsn) = engine
+        .write_batch_deferred(vec![vyrn_core::BatchOperation::Put(
+            b"deferred".to_vec(),
+            b"needs-the-flush-stage".to_vec(),
+        )])
+        .unwrap();
+    let lsn = lsn.expect("a durable deferred commit owes a flush");
+
+    let crashed_before_drain = crash_copy(directory.path());
+    let owed = engine.drain_wal().unwrap();
+    assert!(
+        owed >= lsn,
+        "the drain must cover every record buffered before it ran"
+    );
+    wal.sync_through(owed).unwrap();
+    let crashed_after_sync = crash_copy(directory.path());
+    drop(engine); // AFTER the copies: neither may see drop's clean sync.
+
+    let lost = Engine::open(crashed_before_drain.path()).unwrap();
+    assert_eq!(
+        lost.get(b"immediate").unwrap().as_deref(),
+        Some(&b"self-drained"[..]),
+        "an immediate-barrier commit must be durable with no caller drain"
+    );
+    assert_eq!(
+        lost.get(b"deferred").unwrap(),
+        None,
+        "a deferred commit must NOT survive a crash before its drain — if it \
+         does, applying a batch is touching the file and the Windows convoy \
+         is back"
+    );
+
+    let recovered = Engine::open(crashed_after_sync.path()).unwrap();
+    assert_eq!(
+        recovered.get(b"deferred").unwrap().as_deref(),
+        Some(&b"needs-the-flush-stage"[..]),
+        "a deferred commit must survive once drained and synced"
+    );
+}
+
 /// The barrier splits cleanly: `drain_wal` twice with nothing new buffered
 /// owes the same LSN, and `sync_through` at or below the watermark returns
 /// without work — the group-commit fast path followers take.

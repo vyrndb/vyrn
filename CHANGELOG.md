@@ -4,6 +4,41 @@ All notable changes to Vyrn are documented here. From 1.0.0 the on-disk
 formats follow the contract in `docs/compatibility.md`: every 1.x build
 reads what any earlier build wrote, and downgrade is unsupported.
 
+## [Unreleased]
+
+### Changed
+
+- **The served write path touches no file under the engine lock.** A commit's
+  WAL record now waits in memory (`EngineOptions::buffered_appends`, set by
+  the server; embedded default unchanged) until the flush stage hands the
+  whole coalesced group to the kernel and runs one barrier for it, off the
+  lock. Nothing is acknowledged before its record is drained and synced —
+  pinned by a crash-copy test in both directions and by the correctness
+  suite failing when the drain is removed. On Windows this removes the
+  convoy where `FlushFileBuffers` serialized against the commit's own
+  `WriteFile` and collapsed group commit to one commit per fsync; on every
+  platform it moves the WAL write out of the apply stage's lock budget.
+  On-disk formats are unchanged.
+- The write worker no longer clones each batched operation (twice, for a
+  transaction's vector) on the way to the engine: payloads move into the
+  commit, and the flush stage holds only response channels — a stage that
+  could previously receive a misrouted request now cannot represent one.
+
+### Added
+
+- **TypeScript SDK: `pipeline()`** — submit a batch of independent
+  get/put/delete operations in one socket write and collect their answers in
+  order; a refused operation consumes its own slot without derailing the
+  rest. Mirrors the Rust client's `Client::pipeline`.
+- The `--shards` × `--write-back-bytes` composition is now pinned by an
+  integration test (read-your-write on every shard, kill, per-shard WAL-only
+  recovery), and the served-compare runbook benchmarks the sharded
+  write-back configuration as the headline durable arm.
+- `--shards > 1` combined with `--durability async` is refused at startup:
+  async acknowledges writes before a WAL barrier and a sharded server has
+  one WAL per shard, so a crash could lose acknowledged writes. Sharded
+  servers are fully ACID; run them in `durable` mode.
+
 ## [1.2.0] - 2026-08-25
 
 ### Added

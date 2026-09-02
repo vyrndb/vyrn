@@ -34,15 +34,29 @@ docker run --name scylla-bench -d --network host \
 # wait for: docker exec scylla-bench nodetool status  ->  UN
 ```
 
-vyrnd (release build, its shipped fast config):
+vyrnd (release build, its shipped fast config — write-back is the headline
+durable arm on purpose: its durability claim is identical to classic mode's,
+WAL-record-then-fsync before any acknowledgement, and it is how the server
+should be run for write-heavy work):
 
 ```bash
 cargo build --release -p vyrnd -p vyrn
 target/release/vyrn --hash-password /tmp/bench.phc --password-input <(echo benchpass)
 VYRN_PASSWORD_HASH_FILE=/tmp/bench.phc VYRN_ALLOW_PLAINTEXT=true \
 VYRN_WRITE_BACK_BYTES=8388608 \
+VYRN_SHARDS=4 \
   target/release/vyrnd --data /tmp/vyrn-bench --bind 127.0.0.1:7432
 ```
+
+Match `VYRN_SHARDS` to what Scylla's `--smp` gets — that is the like-for-like
+row (shard-per-core against shard-per-core). Run an unsharded arm too, so the
+single-engine number stays on record. The shard count is fixed at directory
+creation, so use a fresh `--data` per configuration.
+
+At 256 clients also raise the batch ceiling: `VYRN_WRITE_BATCH_SIZE=256`
+(default 64). Lockstep clients underfill batches at high concurrency —
+measured 23/64 at c64 — and the cap binds exactly when the offered load could
+finally fill a batch.
 
 The harness (its own toolchain; the Scylla driver needs a newer rustc than
 the repo pin):
@@ -61,7 +75,9 @@ medians of three runs; write rows vary.
 - vyrn's `durable_put` acknowledges after its own group-commit fsync;
   Scylla's (in batch mode) after the commitlog barrier — comparable
   promises.
-- Scylla schedules per-core with shard-aware drivers; vyrnd currently
-  serializes commits through one engine write lock. If Scylla wins the
-  high-concurrency write rows on many-core hosts, that architectural gap is
-  the expected cause — measure before building the answer to it.
+- Scylla schedules per-core with shard-aware drivers; vyrnd answers with
+  `--shards N` — N engines, each with its own write lock, WAL, and group
+  commit. The unsharded arm measures one engine's apply-serial ceiling; the
+  sharded arm is the architectural like-for-like. Keys route by hash on both
+  sides, so neither harness client is shard-aware and neither side gets the
+  routing discount.
