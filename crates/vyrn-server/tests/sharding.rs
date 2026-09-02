@@ -419,6 +419,13 @@ fn sharding_refuses_what_it_cannot_compose_with() {
             directory.path().join("archive").display().to_string(),
         )],
     );
+    with(
+        "async",
+        vec![
+            ("VYRN_DURABILITY", "async".to_owned()),
+            ("VYRN_ASYNC_SYNC_MS", "50".to_owned()),
+        ],
+    );
 
     // Dispatch refusals on a healthy sharded server.
     let node = spawn(&directory.path().join("data"), &hash, &shards_env(SHARDS));

@@ -10,7 +10,7 @@ Use it only when:
 - automated verified backups exist outside the host;
 - TLS 1.3 is enabled and the admin listener remains private;
 - the data directory is on local persistent storage, not an ephemeral container layer;
-- `durable` mode is used for authoritative records; `async` is limited to reconstructable realtime state and its bounded loss window is accepted;
+- `durable` mode is used for authoritative records; `async` is limited to reconstructable realtime state and its bounded loss window is accepted — and `async` combined with `--shards > 1` is refused at startup (a sharded server is fully ACID in `durable` mode; see Sharding);
 - monitoring alerts on readiness, failed requests, disk space, backup age, and write-batch efficiency;
 - the security model in `docs/security.md` matches the deployment's requirements (prefix-granularity ACLs at best, a best-effort audit trail, no encryption at rest — read it before assuming otherwise), and the upgrade rules in `docs/compatibility.md` are followed (replicas upgrade before primaries; downgrade is unsupported).
 
@@ -82,6 +82,12 @@ What sharding costs, all refused loudly rather than degraded:
   server is therefore a SINGLE-NODE configuration: no synchronous
   replication and no PITR. Do not shard data you cannot afford to serve
   from one host.
+- **Async durability.** `--durability async` refuses startup when
+  `--shards > 1`: async mode deliberately acknowledges writes before a WAL
+  barrier, and a sharded server has one WAL per shard — a crash could then
+  lose acknowledged writes the operator believed were durable. Sharded
+  servers are fully ACID; run them in `durable` mode. Async remains
+  available on a single shard for reconstructable realtime state.
 - **Key-space cursor subscriptions.** `SubscribeFrom` resumes from a
   position in one change log and a sharded server has one per shard;
   refused. Live `Subscribe` works (per-shard order is preserved; cross-shard
@@ -160,7 +166,7 @@ the crash soak and power-loss evidence exist there, and Windows durability
 claims should be treated as implemented-and-tested rather than
 soak-certified until an equivalent Windows soak has run.
 
-**Windows caveat, concurrent writes:** on Windows, `FlushFileBuffers` serializes against `WriteFile` on the same file, and `vyrnd`'s write worker appends WAL records eagerly under the engine lock while the flush stage syncs — so group commit degrades toward one commit per fsync there. Linux is unaffected (the production platform). The embedded engine offers the convoy-free shape (`DurabilityMode::Async` + `drain_wal`); teaching the server's flush stage the same split is queued.
+**Windows, concurrent writes (fixed):** on Windows, `FlushFileBuffers` serializes against `WriteFile` on the same file, and `vyrnd`'s write worker used to append WAL records eagerly under the engine lock while the flush stage synced — group commit degraded toward one commit per fsync there. The server's flush stage now uses the same split the embedded engine proved (`buffered_appends`: records buffered in memory under the lock, drained and synced by the flush stage before anything is acknowledged), so no file is written under the engine lock while a barrier is in flight. Linux was never affected and remains the production platform.
 
 ## Logs
 

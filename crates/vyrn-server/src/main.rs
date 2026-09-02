@@ -1496,6 +1496,18 @@ async fn main() -> Result<()> {
                  archive format holds one WAL sequence"
             );
         }
+        if durability == DurabilityMode::Async {
+            bail!(
+                "--shards {} cannot be combined with async durability: async \
+                 mode deliberately acknowledges writes before a WAL barrier, and \
+                 a sharded server has one WAL per shard — a crash could then \
+                 lose acknowledged writes the operator believed were durable. \
+                 Sharded servers are fully ACID; run them in durable mode. \
+                 Async remains available on a single shard for reconstructable \
+                 realtime state.",
+                args.shards
+            );
+        }
     }
     check_shard_marker(&args.data, args.shards)?;
     if let Some(archive_dir) = &args.wal_archive_dir {
